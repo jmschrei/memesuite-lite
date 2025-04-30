@@ -15,6 +15,7 @@ from tangermeme.predict import predict
 
 from memelite.fimo import _pwm_to_mapping
 from memelite.fimo import fimo
+from memelite.io import read_meme
 
 from numpy.testing import assert_raises
 from numpy.testing import assert_array_equal
