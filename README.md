@@ -12,7 +12,7 @@ The goal of memesuite-lite is twofold: (1) to scale these algorithms to millions
 
 ### TOMTOM
 
-[tutorial](https://github.com/jmschrei/memesuite-lite/blob/main/tutorials/Tutorial_TOMTOM.ipynb)
+[[tutorial](https://github.com/jmschrei/memesuite-lite/blob/main/tutorials/Tutorial_TOMTOM.ipynb)]
 
 TOMTOM is an algorithm for calculating similarity scores between two sets of PWMs. Importantly, TOMTOM is not a similarity score itself, but rather the procedure for faithfully calculating p-values given a similarity score. Accordingly, it has two steps. First, consider all possible alignments between each query motif and the target motif and record the best score across all alignments. Second, convert this score to a p-value using the appropriate background distribution. This algorithm will be immensely useful in annotating the genome because these PWMs do not have to be frequency-based matrices like those we see in JASPAR. Rather, they can even be one-hot encoded sequences, allowing you to compare seqlets identified using a machine learning model against a database of known motifs and annotate them automatically. Or, they can be the attribution scores themselves at these seqlets being compared against a database of CWMs identified via a method like TF-MoDISco.
 
@@ -44,7 +44,7 @@ Note that, in addition to the matrices of alignment statistics as before, this w
 
 ### FIMO
 
-[tutorial](https://github.com/jmschrei/memesuite-lite/blob/main/tutorials/Tutorial_FIMO.ipynb)
+[[tutorial](https://github.com/jmschrei/memesuite-lite/blob/main/tutorials/Tutorial_FIMO.ipynb)]
 
 FIMO is an algorithm for scanning a set of PWMs against one or more one-hot encoded sequences and finding the statistically significant hits. The algorithm is composed of two steps: scanning the PWMs just like one would apply a convolution, and converting these scores to p-values using a background distribution calculated exactly from the PWM. Although FIMO and TOMTOM both involve comparing a PWM against some other entity, they differ in the assumptions that they make about this second entity. TOMTOM assumes that the entity is short and that overhangs are not only likely but critically important to score correctly. FIMO assumes that the entity is long and so overhangs do not matter and, accordingly, does not care too much about scoring them correctly. See the TOMTOM tutorial for a more in-depth description of the two algorithms.
 
