@@ -1,5 +1,8 @@
 # memesuite-lite
 
+> **Note**
+> The tools in memesuite-lite used to live in `tangermeme.tools` but have been sliced out to remove the PyTorch dependency and make them easier to work with. This means that you do not need PyTorch to install or run these tools. However, because the code was originally written without these restrictions in mind, the unit tests and the tutorials still use PyTorch and tangermeme.
+
 The tools in the [MEME suite](https://meme-suite.org/meme/) are foundational for many sequence-based analyses; MEME itself for discovering repeating patterns in sequences, FIMO for scanning these patterns against long sequences, and TOMTOM for scoring these patterns against each other. As we enter an age of large-scale and machine learning-based analyses, these tools can continue to be critical components because they answer fundamental questions but can be challenging to use in practice. Specifically, these tools require the use of intermediary text files (MEME-formatted for PWMs and FASTA formatted for sequences) followed by either using a command-line tool or a web portal.
 
 memesuite-lite is a re-implementation of some of the algorithms in the MEME suite as Python functions that can be easily plugged into existing notebooks and code-bases. These implementations are well documented, multi-threaded, fast, and simple to use because they are implemented using numba. As an example of the speed, the TOMTOM implementation can be thousands of times faster than the MEME suite command-line tool due to severe inefficiencies in the code. 
