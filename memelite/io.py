@@ -89,7 +89,7 @@ def write_meme(filename, motifs):
 
 		for name, pwm in zip(motif_names, motif_pwms):
 			outfile.write("MOTIF {}\n".format(name))
-			outfile.write("letter-probability matrix: alength= {} w={} nsites= 1 E= 0\n".format(*pwm.shape))
+			outfile.write("letter-probability matrix: alength= {} w= {} nsites= 1 E= 0\n".format(*pwm.shape))
 
 			for col in pwm.T:
 				outfile.write("{} {} {} {}\n".format(*col))

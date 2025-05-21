@@ -11,7 +11,7 @@ from numba import prange
 from numpy import uint64
 
 
-@njit
+@njit(cache=True)
 def _binned_median(x, bins, x_min, x_max, counts):
 	"""An internal function for calculating medians quickly.
 
@@ -49,7 +49,7 @@ def _binned_median(x, bins, x_min, x_max, counts):
 	return -99999
 
 
-@njit
+@njit(cache=True)
 def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians, 
 	median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins):
 	"""An internal function for integerized scores and the histogram.
@@ -112,7 +112,7 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	return uint64(offset)
 
 
-@njit
+@njit(cache=True)
 def _pairwise_max(x, y, y_csum, z, n):
 	"""An internal function for the pdf of the maximum of two pdfs.
 
@@ -137,7 +137,7 @@ def _pairwise_max(x, y, y_csum, z, n):
 			z[i] = x[i] * y_csum[i] + y[i] * x_csum - x[i] * y[i]
 
  
-@njit
+@njit(cache=True)
 def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 	"""An internal function that calculates the backgrounds for p-values.
 
@@ -211,7 +211,7 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 			B[i, j] = 1 - B[i, j]
 			
 
-@njit
+@njit(cache=True)
 def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results):
 	"""An internal function for calculating the best match and p-values.
 
@@ -264,7 +264,7 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results):
 		total_offset += nt
 
 
-@njit
+@njit(cache=True)
 def _merge_rc_results(results):
 	"""An internal method for taking the best across two strands."""
 
@@ -285,9 +285,9 @@ def _merge_rc_results(results):
 			results[i, 4] = 1
 			
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
-	n_score_bins, n_median_bins, n_cache, reverse_complement):
+	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement):
 	"""An internal function implementing the TOMTOM algorithm.
 
 	This internal function is necessary to handle the numba component of the
@@ -309,21 +309,20 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 
 	# Re-usable workspace for each thread instead of re-allocating
 	# and freeing large arrays for each example.
-	n = numba.get_num_threads()
 	n_len = Q_max*n_score_bins + Q_max*n_cache
 	
-	_gamma = numpy.empty((n, nt, Q_max), dtype='float64')
-	_gamma_int = numpy.empty((n, nt, Q_max), dtype='int8')
-	_f = numpy.empty((n, Q_max, n_score_bins+1), dtype='float64')
+	_gamma = numpy.empty((n_threads, nt, Q_max), dtype='float64')
+	_gamma_int = numpy.empty((n_threads, nt, Q_max), dtype='int8')
+	_f = numpy.empty((n_threads, Q_max, n_score_bins+1), dtype='float64')
 
-	_A = numpy.empty((n, Q_max, Q_max, n_len), dtype='float64')
-	_B = numpy.empty((n, T_max+1, n_len), dtype='float64')
-	_A_csum = numpy.empty((n, Q_max, Q_max, n_len), dtype='float64')
+	_A = numpy.empty((n_threads, Q_max, Q_max, n_len), dtype='float64')
+	_B = numpy.empty((n_threads, T_max+1, n_len), dtype='float64')
+	_A_csum = numpy.empty((n_threads, Q_max, Q_max, n_len), dtype='float64')
 
-	_medians = numpy.empty((n, Q_max), dtype='float64')
-	_median_bins = numpy.empty((n, n_median_bins, 2), dtype='float64')
+	_medians = numpy.empty((n_threads, Q_max), dtype='float64')
+	_median_bins = numpy.empty((n_threads, n_median_bins, 2), dtype='float64')
 
-	_results = numpy.empty((n, len(T_lens), 5), dtype='float64')
+	_results = numpy.empty((n_threads, len(T_lens), 5), dtype='float64')
 	results = numpy.empty((len(Q_lens), n_out_targets, n_outputs), 
 		dtype='float64') 
 
@@ -464,6 +463,8 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	if n_jobs != -1:
 		_n_jobs = numba.get_num_threads()
 		numba.set_num_threads(n_jobs)
+	else:
+		n_jobs = _n_jobs = numba.get_num_threads()
 
 	if n_nearest is None:
 		n_nearest = -1
@@ -508,7 +509,7 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	###
 	
 	results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, 
-		n_nearest, n_score_bins, n_median_bins, n_cache, 
+		n_nearest, n_score_bins, n_median_bins, n_cache, n_jobs, 
 		int(reverse_complement))
 
 	if n_jobs != -1:
