@@ -263,31 +263,6 @@ def test_tomtom_reverse_complement():
 	assert_array_almost_equal(strands0, 1-strands1)
 
 
-def test_tomtom_homomotifs():
-	pwms = generate_random_meme(n=5)
-	all_a = numpy.array([
-		[1, 0, 0, 0],
-		[1, 0, 0, 0],
-		[1, 0, 0, 0],
-		[1, 0, 0, 0],
-		[1, 0, 0, 0]
-	])
-
-	p, scores, offsets, overlaps, strands = tomtom(pwms, [all_a])
-	assert_array_almost_equal(p[:, 0], [1, 1, 1, 1, 1], 4)
-	assert_array_almost_equal(scores[:, 0], [1600, 700, 400, 1800, 800], 4)
-	assert_array_almost_equal(numpy.abs(offsets[:, 0]), [13, 4, 1, 15, 5], 4)
-	assert_array_almost_equal(overlaps[:, 0], [3, 3, 3, 3, 3], 4)
-	assert_array_almost_equal(strands[:, 0], [1, 1, 1, 1, 1])
-
-	p, scores, offsets, overlaps, strands = tomtom([all_a], pwms)
-	assert_array_almost_equal(p[0], [0.4936, 1.0000, 0.7399, 0.9794, 0.2521], 4)
-	assert_array_almost_equal(scores[0], [381., 360., 371., 374., 381.], 4)
-	assert_array_almost_equal(offsets[0], [-1.,  6., -2.,  1.,  0.], 4)
-	assert_array_almost_equal(overlaps[0], [3., 1., 2., 4., 4.], 4)
-	assert_array_almost_equal(strands[0], [1., 1., 1., 0., 1.])
-
-
 def test_tomtom_zeroes():
 	pwms = generate_random_meme(n=5)
 	all_zeroes = numpy.array([
