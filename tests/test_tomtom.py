@@ -5,8 +5,6 @@ import numpy
 import pytest
 import pandas
 
-from tangermeme.utils import random_one_hot
-
 from memelite.io import read_meme
 from memelite.tomtom import _binned_median
 from memelite.tomtom import _pairwise_max
@@ -30,6 +28,35 @@ def generate_random_meme(n=5, min_len=4, max_len=20, random_state=0):
 		pwms.append(pwm.T)
 	
 	return pwms
+
+
+def random_one_hot(shape, probs=None, dtype='int8', random_state=None):
+	if not isinstance(shape, tuple) or len(shape) != 3:
+		raise ValueError("Shape must be a tuple with 3 dimensions.")
+
+	if not isinstance(random_state, numpy.random.RandomState):
+		random_state = numpy.random.RandomState(random_state)
+
+	if isinstance(probs, list):
+		probs = numpy.array(probs)
+		
+	n = shape[1]
+	ohe = numpy.zeros(shape, dtype=dtype)
+
+	for i in range(ohe.shape[0]):
+		if probs is None:
+			probs_ = None
+		elif probs.ndim == 1:
+			probs_ = probs
+		elif probs.shape[0] == 1:
+			probs_ = probs[0]
+		else:
+			probs_ = probs[i] 
+
+		choices = random_state.choice(n, size=shape[2], p=probs_)
+		ohe[i, choices, numpy.arange(shape[2])] = 1 
+
+	return one
 
 
 ###
