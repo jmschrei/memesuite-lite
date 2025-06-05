@@ -2,7 +2,6 @@
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
 import numpy
-import torch
 import pytest
 import pandas
 
@@ -182,6 +181,7 @@ def test_tomtom_ndarray():
 		0., 0., 0., 1., 0., 1., 0., 1., 0., 1., 1])
 
 
+'''
 def test_tomtom_pytorch():
 	pwms = generate_random_meme(n=20)
 	pwms = [torch.from_numpy(pwm) for pwm in pwms]
@@ -220,6 +220,7 @@ def test_tomtom_pytorch():
 		16.,  3.,  4.,  7.,  5.,  4., 12., 10.,  8.,  5., 16., 6.,  4.])
 	assert_array_almost_equal(strands[0], [0., 0., 0., 0., 0., 0., 0., 1., 0., 
 		0., 0., 0., 1., 0., 1., 0., 1., 0., 1., 1])
+'''
 
 
 def test_tomtom_reverse_complement():

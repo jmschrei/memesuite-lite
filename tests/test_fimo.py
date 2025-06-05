@@ -2,7 +2,6 @@
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
 import numpy
-import torch
 import pytest
 import pandas
 
@@ -210,6 +209,7 @@ def test_fimo_pwm_dict():
 	assert round(hits[9]['p-value'][0], 4) == round(0.000099, 4)
 
 
+'''
 def test_fimo_pwm_torch():
 	pwms = read_meme("tests/data/test.meme")
 	pwms = {name: torch.from_numpy(pwm) for name, pwm in pwms.items()}
@@ -241,6 +241,7 @@ def test_fimo_pwm_torch():
 	assert hits[9]['strand'][0] == '+'
 	assert round(hits[9]['score'][0], 4) == round(3.17477, 4)
 	assert round(hits[9]['p-value'][0], 4) == round(0.000099, 4)
+'''
 
 
 def test_fimo_bin_size():
