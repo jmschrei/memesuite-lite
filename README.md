@@ -2,6 +2,8 @@
 
 [![Downloads](https://pepy.tech/badge/memelite)](https://pepy.tech/project/memelite) [![Python package](https://github.com/jmschrei/memesuite-lite/actions/workflows/pytest-ci.yml/badge.svg)](https://github.com/jmschrei/memesuite-lite/actions/workflows/pytest-ci.yml)
 
+[[tomtom-lite](https://www.biorxiv.org/content/10.1101/2025.05.27.656386v1)]
+
 > **Note**
 > The tools in memesuite-lite used to live in `tangermeme.tools` but have been sliced out to remove the PyTorch dependency and make them easier to work with. This means that you do not need PyTorch to install or run these tools. However, because the code was originally written without these restrictions in mind, the unit tests and the tutorials still use PyTorch and tangermeme.
 
