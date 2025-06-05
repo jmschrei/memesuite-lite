@@ -6,7 +6,7 @@ setup(
     author='Jacob Schreiber',
     author_email='jmschreiber91@gmail.com',
     packages=['memelite'],
-    #scripts=[''],
+    scripts=['ttl'],
     url='https://github.com/jmschrei/memesuite-lite',
     license='LICENSE.txt',
     description='Biological sequence analysis for the modern age.',
