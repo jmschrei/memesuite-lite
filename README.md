@@ -30,7 +30,7 @@ from memelite import tomtom
 from memelite.io import read_meme
 from memelite.utils import one_hot_encode
 
-q = [one_hot_encode("ACGTGT").double()]
+q = [one_hot_encode("ACGTGT")]
 
 targets = read_meme("../../../common/JASPAR2024_CORE_non-redundant_pfms_meme.txt")
 target_pwms = [pwm for pwm in targets.values()]
