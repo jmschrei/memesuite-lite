@@ -4,7 +4,7 @@
 
 [[tomtom-lite](https://www.biorxiv.org/content/10.1101/2025.05.27.656386v1)]
 
-> **Note**
+> [!Note]
 > The tools in memesuite-lite used to live in `tangermeme.tools` but have been sliced out to remove the PyTorch dependency and make them easier to work with. This means that you do not need PyTorch to install or run these tools.
 
 The tools in the [MEME suite](https://meme-suite.org/meme/) are foundational for many sequence-based analyses; MEME itself for discovering repeating patterns in sequences, FIMO for scanning these patterns against long sequences, and Tomtom for scoring these patterns against each other. As we enter an age of large-scale and machine learning-based analyses, these tools can continue to be critical components because they answer fundamental questions but can be challenging to use in practice. Specifically, these tools require the use of intermediary text files (MEME-formatted for PWMs and FASTA formatted for sequences) followed by either using a command-line tool or a web portal.
