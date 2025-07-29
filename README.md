@@ -19,6 +19,9 @@ The goal of memesuite-lite is twofold: (1) to scale these algorithms to millions
 
 ### Tomtom
 
+> [!Important]
+> If you have used this implementation of Tomtom in your work, please consider citing [the tomtom-lite preprint](https://www.biorxiv.org/content/10.1101/2025.05.27.656386v1) in addition to the Tomtom paper. Citations make it possible for me to continue to develop software.
+
 [[tutorial](https://github.com/jmschrei/memesuite-lite/blob/main/tutorials/Tutorial_TOMTOM.ipynb)]
 
 Tomtom is an algorithm for calculating similarity scores between two sets of PWMs. Importantly, Tomtom is not a similarity score itself, but rather the procedure for faithfully calculating p-values given a similarity score. Accordingly, it has two steps. First, consider all possible alignments between each query motif and the target motif and record the best score across all alignments. Second, convert this score to a p-value using the appropriate background distribution. This algorithm will be immensely useful in annotating the genome because these PWMs do not have to be frequency-based matrices like those we see in JASPAR. Rather, they can even be one-hot encoded sequences, allowing you to compare seqlets identified using a machine learning model against a database of known motifs and annotate them automatically. Or, they can be the attribution scores themselves at these seqlets being compared against a database of CWMs identified via a method like TF-MoDISco.
