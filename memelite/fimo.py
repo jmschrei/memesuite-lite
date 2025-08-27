@@ -433,17 +433,17 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 
 	if dim == 1:
 		if verbose:
-			with tqdm(total=1, desc="Reorganizing by sequence", unit="step", leave=False) as pbar:
-				hits = pandas.concat(hits)
-				_names = numpy.unique(hits['sequence_name'])
-				hits = [hits[hits['sequence_name'] == name].reset_index(drop=True) 
-					for name in _names]
+			with tqdm(total=2, desc="Reorganizing by sequence", unit="step", leave=False) as pbar:
+				pbar.set_description("Concatenating DataFrames")
+				combined = pandas.concat(hits, ignore_index=True)
+				pbar.update(1)
+	
+				pbar.set_description("Grouping by sequence")
+				hits = [group.reset_index(drop=True) for _, group in combined.groupby('sequence_name', sort=True)]
 				pbar.update(1)
 		else:
-			hits = pandas.concat(hits)
-			_names = numpy.unique(hits['sequence_name'])
-			hits = [hits[hits['sequence_name'] == name].reset_index(drop=True) 
-				for name in _names]
+			combined = pandas.concat(hits, ignore_index=True)
+			hits = [group.reset_index(drop=True) for _, group in combined.groupby('sequence_name', sort=True)]
 
 	return hits
 
