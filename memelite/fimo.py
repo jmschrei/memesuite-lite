@@ -348,8 +348,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		for i, idx in enumerate(alpha_idxs):
 			one_hot_mapping[idx] = i
 		
-			for name, chrom in tqdm(fasta.items(), desc="Loading sequences", 
-				unit="seq", leave=False, disable=not verbose):
+		for name, chrom in tqdm(fasta.items(), desc="Loading sequences", 
+			unit="seq", leave=False, disable=not verbose):
 			chrom = chrom[:].seq.upper()
 			lengths.append(lengths[-1] + len(chrom))
 			
