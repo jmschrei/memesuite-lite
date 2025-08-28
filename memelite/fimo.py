@@ -322,12 +322,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	_score_to_pvals_lengths = [0]
 	_score_thresholds = numpy.empty(n_motifs, dtype=numpy.float32)
 
-	motif_iterator = range(n_motifs)
-	if verbose:
-		motif_iterator = tqdm(motif_iterator, desc="Processing motifs", 
-			unit="motif", leave=False)
-	
-	for i in motif_iterator:	
+	for i in tqdm(range(n_motifs), desc="Processing motifs", 
+			unit="motif", leave=False, disable=not verbose):	
 		_score_to_pvals_lengths.append(len(_score_to_pvals[i]))
 
 		idx = numpy.where(_score_to_pvals[i] < log_threshold)[0]
@@ -352,12 +348,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		for i, idx in enumerate(alpha_idxs):
 			one_hot_mapping[idx] = i
 		
-		fasta_iterator = fasta.items()
-		if verbose:
-			fasta_iterator = tqdm(fasta_iterator, desc="Loading sequences", 
-				unit="seq", leave=False)
-		
-		for name, chrom in fasta_iterator:
+			for name, chrom in tqdm(fasta.items(), desc="Loading sequences", 
+				unit="seq", leave=False, disable=not verbose):
 			chrom = chrom[:].seq.upper()
 			lengths.append(lengths[-1] + len(chrom))
 			
@@ -399,20 +391,13 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 
 	if return_counts == True:
 		counts = numpy.zeros(n_, dtype='int32')
-		count_iterator = range(n_)
-		if verbose:
-			count_iterator = tqdm(count_iterator, desc="Counting hits", 
-				unit="motif", leave=False)
-		for i in count_iterator:
+		for i in tqdm(range(n_), desc="Counting hits", 
+				unit="motif", leave=False, disable=not verbose):
 			counts[i] = len(hits[i]) + len(hits[i+n_])
 		return counts
 
-	results_iterator = range(n_)
-	if verbose:
-		results_iterator = tqdm(results_iterator, desc="Processing results", 
-			unit="motif", leave=False)
-
-	for i in results_iterator:
+	for i in tqdm(range(n_), desc="Processing results", 
+			unit="motif", leave=False, disable=not verbose):
 		if reverse_complement:
 			hits_ = pandas.DataFrame(hits[i] + hits[i + n_], columns=names)
 			hits_['strand'] = ['+'] * len(hits[i]) + ['-'] * len(hits[i+n_])
