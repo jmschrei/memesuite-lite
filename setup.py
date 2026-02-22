@@ -11,7 +11,7 @@ setup(
     license='LICENSE.txt',
     description='Biological sequence analysis for the modern age.',
     install_requires=[
-        "numpy >= 1.14.2, <= 2.0.1",
+        "numpy >= 1.14.2",
 		"numba >= 0.55.1",
         "pandas >= 1.3.3",
         "pyfaidx >= 0.7.2.1",

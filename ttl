@@ -13,7 +13,7 @@ from memelite.io import read_meme
 from memelite.utils import characters
 from memelite.utils import one_hot_encode
 
-from memelite import tomtom
+from memelite.tomtom import tomtom
 
 
 def _check_download_targets(targets):
