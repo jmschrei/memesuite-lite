@@ -5,7 +5,7 @@ name: Python package
 
 on:
   push:
-    branches: [ "main", "fix/numpy_version" ]
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
