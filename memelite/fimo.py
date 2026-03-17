@@ -12,7 +12,7 @@ from .io import read_meme
 
 from tqdm import tqdm
 
-@numba.njit('float64(float64, float64)', fastmath=True, cache=True)
+@numba.njit('float64(float64, float64)', cache=True)
 def logaddexp2(x, y):
 	"""Calculate the logaddexp in a numerically stable manner in base 2.
 
