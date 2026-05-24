@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/christian728504/memesuite-lite"
+Homepage = "https://github.com/jmschrei/memesuite-lite"
 
 [project.scripts]
 ttl = "memelite.cli:main"
