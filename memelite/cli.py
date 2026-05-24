@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # tomtom-lite command line tool
 # Author: Jacob Schreiber <jmschreiber91@gmail.com>
 
@@ -20,8 +19,8 @@ def _check_download_targets(targets):
 	"""An internal function for downloading JASPAR if no target database is set."""
 	
 	if targets is None:
-		targets = __file__.replace("ttl", "") 
-		targets += "JASPAR2024_CORE_non-redundant_pfms_jaspar.meme"
+		targets = os.path.join(os.path.dirname(__file__),
+			"JASPAR2024_CORE_non-redundant_pfms_jaspar.meme")
 		f = "https://jaspar.elixir.no/download/data/2024/CORE/JASPAR2024_CORE_non-redundant_pfms_meme.txt"
 
 		if not os.path.isfile(targets):
@@ -246,15 +245,18 @@ parser.add_argument("-j", "--n_jobs", type=int, default=-1,
 # Run appropriate command
 ##############
 
-args = parser.parse_args()
+def main():
+	args = parser.parse_args()
 
-#
+	if args.query is not None:
+		_run_tomtom(args)
 
-if args.query is not None:
-	_run_tomtom(args)
+	elif args.fasta is not None and args.bed is not None:
+		_run_annotate(args)
 
-elif args.fasta is not None and args.bed is not None:
-	_run_annotate(args)
+	else:
+		raise ValueError("Must provided either a query or a BED and FASTA file.")
 
-else:
-	raise ValueError("Must provided either a query or a BED and FASTA file.")
+
+if __name__ == "__main__":
+	main()
