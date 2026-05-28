@@ -204,7 +204,7 @@ def _fast_convert(X, mapping):
 
 def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1, 
 	eps=0.0001, threshold=0.0001, reverse_complement=True, return_counts=False, 
-	dim=0):
+	dim=0, verbose=True):
 	"""An implementation of the FIMO algorithm from the MEME suite.
 
 	This function implements the "Finding Individual Motif Instances" (FIMO)
@@ -261,6 +261,9 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		that motif across all examples (0, default) or one dataframe for each 
 		example containing all hits across all motifs to that example (1).
 		Default is 0.
+		
+	verbose: bool, optional
+		Whether to show progress bars during processing. Default is True.
 
 
 	Returns
@@ -319,7 +322,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	_score_to_pvals_lengths = [0]
 	_score_thresholds = numpy.empty(n_motifs, dtype=numpy.float32)
 
-	for i in range(n_motifs):	
+	for i in tqdm(range(n_motifs), desc="Processing motifs", 
+			unit="motif", leave=False, disable=not verbose):	
 		_score_to_pvals_lengths.append(len(_score_to_pvals[i]))
 
 		idx = numpy.where(_score_to_pvals[i] < log_threshold)[0]
@@ -344,7 +348,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		for i, idx in enumerate(alpha_idxs):
 			one_hot_mapping[idx] = i
 		
-		for name, chrom in fasta.items():
+		for name, chrom in tqdm(fasta.items(), desc="Loading sequences", 
+			unit="seq", leave=False, disable=not verbose):
 			chrom = chrom[:].seq.upper()
 			lengths.append(lengths[-1] + len(chrom))
 			
@@ -368,9 +373,16 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		X_lengths = X_lengths.astype(numpy.int64)
 
 	# Use a fast numba function to run the core algorithm
-	hits = _fast_hits(X, X_lengths, motif_pwms, motif_lengths, 
-		_score_thresholds, bin_size, _smallest, _score_to_pvals, 
-		_score_to_pvals_lengths)
+	if verbose:
+		with tqdm(total=1, desc="Scanning sequences", unit="scan", leave=False) as pbar:
+			hits = _fast_hits(X, X_lengths, motif_pwms, motif_lengths, 
+				_score_thresholds, bin_size, _smallest, _score_to_pvals, 
+				_score_to_pvals_lengths)
+			pbar.update(1)
+	else:
+		hits = _fast_hits(X, X_lengths, motif_pwms, motif_lengths, 
+			_score_thresholds, bin_size, _smallest, _score_to_pvals, 
+			_score_to_pvals_lengths)
 
 
 	# Convert the results to pandas DataFrames
@@ -379,11 +391,13 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 
 	if return_counts == True:
 		counts = numpy.zeros(n_, dtype='int32')
-		for i in range(n_):
+		for i in tqdm(range(n_), desc="Counting hits", 
+				unit="motif", leave=False, disable=not verbose):
 			counts[i] = len(hits[i]) + len(hits[i+n_])
 		return counts
 
-	for i in range(n_):
+	for i in tqdm(range(n_), desc="Processing results", 
+			unit="motif", leave=False, disable=not verbose):
 		if reverse_complement:
 			hits_ = pandas.DataFrame(hits[i] + hits[i + n_], columns=names)
 			hits_['strand'] = ['+'] * len(hits[i]) + ['-'] * len(hits[i+n_])
@@ -403,10 +417,18 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	hits = hits[:n_]
 
 	if dim == 1:
-		hits = pandas.concat(hits)
-		_names = numpy.unique(hits['sequence_name'])
-		hits = [hits[hits['sequence_name'] == name].reset_index(drop=True) 
-			for name in _names]
+		if verbose:
+			with tqdm(total=2, desc="Reorganizing by sequence", unit="step", leave=False) as pbar:
+				pbar.set_description("Concatenating DataFrames")
+				combined = pandas.concat(hits, ignore_index=True)
+				pbar.update(1)
+	
+				pbar.set_description("Grouping by sequence")
+				hits = [group.reset_index(drop=True) for _, group in combined.groupby('sequence_name', sort=True)]
+				pbar.update(1)
+		else:
+			combined = pandas.concat(hits, ignore_index=True)
+			hits = [group.reset_index(drop=True) for _, group in combined.groupby('sequence_name', sort=True)]
 
 	return hits
 
