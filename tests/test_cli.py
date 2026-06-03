@@ -212,6 +212,120 @@ def test_run_tomtom_forward_match_is_uppercase(capsys):
 	assert row["aligned_middle"].isupper()
 
 
+def _consensus(name):
+	"""Return the forced consensus sequence of a target in the test database."""
+
+	from memelite.io import read_meme
+	from memelite.utils import characters
+
+	return characters(read_meme("tests/data/test.meme")[name], force=True)
+
+
+def _run_and_get_row(query, name, thresh, capsys):
+	"""Run `_run_tomtom` for a string query and return the row for `name`."""
+
+	args = _tomtom_namespace(query=query, thresh=thresh)
+	_run_tomtom(args)
+	rows = _parse_tomtom_rows(capsys.readouterr().out)
+	return {row["Target Name"]: row for row in rows}[name]
+
+
+def test_run_tomtom_forward_substitution(capsys):
+	# A single substitution on the forward strand lower-cases exactly the
+	# mismatched position; every other aligned position stays upper case and
+	# the upper-cased middle recovers the target consensus.
+	name = "HIC2_MA0738.1"
+	consensus = _consensus(name)            # ATGCCCACC
+	query = consensus[:4] + "T" + consensus[5:]   # substitute position 4
+
+	row = _run_and_get_row(query, name, 0.6, capsys)
+
+	assert row["Strand"] == "+"
+	assert row["Offset"] == "0"
+	assert row["Overlap"] == "9"
+
+	middle = row["aligned_middle"]
+	assert middle == "ATGCcCACC"
+	assert middle.upper() == consensus
+	assert sum(c.islower() for c in middle) == 1
+	assert middle[4].islower()
+
+
+def test_run_tomtom_rc_substitution(capsys):
+	# A single substitution where the reverse complement is the best match:
+	# the mismatch is lower-cased against the reverse-complemented consensus.
+	name = "HIC2_MA0738.1"
+	rc = _reverse_complement(_consensus(name))    # GGTGGGCAT
+	query = rc[:3] + "A" + rc[4:]                  # substitute position 3
+
+	row = _run_and_get_row(query, name, 0.6, capsys)
+
+	assert row["Strand"] == "-"
+	assert row["Offset"] == "0"
+	assert row["Overlap"] == "9"
+
+	middle = row["aligned_middle"]
+	assert middle == "GGTgGGCAT"
+	assert middle.upper() == rc
+	assert sum(c.islower() for c in middle) == 1
+	assert middle[3].islower()
+
+
+def test_run_tomtom_forward_shift(capsys):
+	# A query that is an internal substring of the target aligns at a positive
+	# offset with full overlap and is fully upper case.
+	name = "HIC2_MA0738.1"
+	consensus = _consensus(name)        # ATGCCCACC
+	query = consensus[2:]               # GCCCACC, sits at offset 2
+
+	row = _run_and_get_row(query, name, 0.6, capsys)
+
+	assert row["Strand"] == "+"
+	assert row["Offset"] == "2"
+	assert row["Overlap"] == "7"
+	assert row["aligned_middle"] == query
+	assert row["aligned_middle"].isupper()
+
+
+def test_run_tomtom_right_overhang(capsys):
+	# A query whose tail extends past the right end of the (reverse-complement)
+	# target: the overlapping head is upper case and the hanging tail is padded
+	# with dashes.
+	name = "GCR_HUMAN.H11MO.0.A"
+	consensus = _consensus(name)            # AGAACAGAATGTTCT
+	query = consensus[-5:] + "AAA"          # GTTCTAAA
+
+	row = _run_and_get_row(query, name, 0.9, capsys)
+
+	assert row["Strand"] == "-"
+	assert row["Offset"] == "10"
+	assert row["Overlap"] == "5"
+
+	middle = row["aligned_middle"]
+	assert middle == "GTTCT---"
+	assert middle.endswith("---")
+	assert middle[:5].isupper()
+
+
+def test_run_tomtom_left_overhang(capsys):
+	# A query whose head extends past the left end of the target: the hanging
+	# head is padded with dashes and the overlapping tail is upper case.
+	name = "GCR_HUMAN.H11MO.0.A"
+	consensus = _consensus(name)            # AGAACAGAATGTTCT
+	query = "AAA" + consensus[:5]           # AAAAGAAC
+
+	row = _run_and_get_row(query, name, 0.9, capsys)
+
+	assert row["Strand"] == "+"
+	assert row["Offset"] == "-3"
+	assert row["Overlap"] == "5"
+
+	middle = row["aligned_middle"]
+	assert middle == "---AGAAC"
+	assert middle.startswith("---")
+	assert middle[3:].isupper()
+
+
 def test_run_annotate(tmp_path, capsys):
 	# Each BED row produces one annotated line with a target-database motif.
 	bed = tmp_path / "regions.bed"
