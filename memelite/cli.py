@@ -15,6 +15,12 @@ from memelite.utils import one_hot_encode
 from memelite.tomtom import tomtom
 
 
+def _reverse_complement(seq, complement={'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A'}):
+	"""Return the reverse complement of an upper-case ACGT consensus string."""
+
+	return ''.join(complement[c] for c in reversed(seq))
+
+
 def _check_download_targets(targets):
 	"""An internal function for downloading JASPAR if no target database is set."""
 	
@@ -98,6 +104,13 @@ def _run_tomtom(args):
 	for i in numpy.argsort(t_ps):
 		nq = query_pwms[0].shape[-1]
 		seq, offset, overlap = t_seqs[i], t_offsets[i], t_overlaps[i]
+
+		# When the reverse complement is the best match the offset and overlap
+		# are reported in the reverse-complement frame, so display the reverse
+		# complement of the target consensus to keep matches aligned with the
+		# query (and hence shown in upper case).
+		if t_strands[i] == '-':
+			seq = _reverse_complement(seq)
 
 		if overlap == nq and offset >= 0:
 			s1 = seq[:offset].rjust(max_offset)
