@@ -1,7 +1,7 @@
 # memesuite-lite: A re-implementation of select tools from the MEME suite.
 # Author: Jacob Schreiber
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 from .fimo import fimo
 from .tomtom import tomtom
