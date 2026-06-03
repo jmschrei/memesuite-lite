@@ -1,11 +1,15 @@
 # test_fimo.py
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
+import warnings
+
 import numpy
 import pytest
 import pandas
 
 from memelite.fimo import _pwm_to_mapping
+from memelite.fimo import _fast_convert
+from memelite.fimo import logaddexp2
 from memelite.fimo import fimo
 from memelite.io import read_meme
 
@@ -325,9 +329,221 @@ def test_fimo_threshold():
 
 
 def test_fimo_rc():
-	hits = fimo("tests/data/test.meme", "tests/data/test.fa", 
+	hits = fimo("tests/data/test.meme", "tests/data/test.fa",
 		reverse_complement=False)
 
 	assert len(hits[3]) == 1
 	assert len(hits[7]) == 1
 	assert len(hits[10]) == 1
+
+
+##
+
+
+def _make_one_hot(shape, random_state=None):
+	"""Build a correctly-formed one-hot array with a fixed random state.
+
+	A local replacement for the bugged `random_one_hot` helper in this file,
+	which returns an undefined `one` variable instead of the constructed
+	array. This version draws a random nucleotide index at each position and
+	sets the corresponding channel to one.
+	"""
+
+	random_state = numpy.random.RandomState(random_state)
+
+	n, c, l = shape
+	idxs = random_state.randint(0, c, size=(n, l))
+
+	ohe = numpy.zeros(shape, dtype='int8')
+	for i in range(n):
+		ohe[i, idxs[i], numpy.arange(l)] = 1
+
+	return ohe
+
+
+def test_logaddexp2_finite():
+	r = numpy.random.RandomState(0)
+
+	x = r.uniform(-20, 20, size=50)
+	y = r.uniform(-20, 20, size=50)
+
+	observed = numpy.array([logaddexp2(xi, yi) for xi, yi in zip(x, y)])
+	expected = numpy.logaddexp2(x, y)
+	assert_array_almost_equal(observed, expected, 4)
+
+
+def test_logaddexp2_equal():
+	for v in [-10.0, -1.0, 0.0, 1.0, 10.0]:
+		assert_array_almost_equal([logaddexp2(v, v)],
+			[numpy.logaddexp2(v, v)], 4)
+
+
+def test_logaddexp2_both_neg_inf():
+	ninf = float("-inf")
+	assert logaddexp2(ninf, ninf) == ninf
+	assert_array_almost_equal([logaddexp2(ninf, ninf)],
+		[numpy.logaddexp2(ninf, ninf)], 4)
+
+
+def test_logaddexp2_one_pos_inf():
+	inf = float("inf")
+	assert logaddexp2(inf, 3.0) == inf
+	assert logaddexp2(3.0, inf) == inf
+	assert_array_almost_equal([logaddexp2(inf, 3.0)],
+		[numpy.logaddexp2(inf, 3.0)], 4)
+
+
+def test_logaddexp2_one_neg_inf():
+	ninf = float("-inf")
+	assert_array_almost_equal([logaddexp2(ninf, 3.0)],
+		[numpy.logaddexp2(ninf, 3.0)], 4)
+	assert_array_almost_equal([logaddexp2(3.0, ninf)],
+		[numpy.logaddexp2(3.0, ninf)], 4)
+	assert logaddexp2(ninf, 3.0) == 3.0
+
+
+##
+
+
+def test_fast_convert():
+	mapping = numpy.zeros(256, dtype=numpy.int8) - 1
+	for i, c in enumerate([ord('A'), ord('C'), ord('G'), ord('T')]):
+		mapping[c] = i
+
+	X = numpy.frombuffer(bytearray("ACGTN", "utf8"), dtype=numpy.int8).copy()
+	_fast_convert(X, mapping)
+
+	assert_array_equal(X, [0, 1, 2, 3, -1])
+
+
+def test_pwm_to_mapping_uniform():
+	pwm = numpy.log2(numpy.full((4, 5), 0.25))
+	smallest, mapping = _pwm_to_mapping(pwm, 0.1)
+
+	assert smallest == -100
+	assert mapping.shape == (86,)
+	assert mapping.dtype == numpy.float64
+
+	# A uniform PWM has a single achievable score, so only one finite bin.
+	assert_array_almost_equal([mapping[~numpy.isinf(mapping)].min()], [0.0], 4)
+	assert numpy.isinf(mapping).sum() == 85
+	assert numpy.all(numpy.diff(mapping[~numpy.isinf(mapping)]) <= 0)
+
+
+##
+
+
+def test_fimo_one_hot():
+	X = _make_one_hot((5, 4, 100), random_state=0)
+	hits = fimo("tests/data/test.meme", X, threshold=0.001)
+
+	assert len(hits) == 12
+	for df in hits:
+		assert isinstance(df, pandas.DataFrame)
+		assert df.shape[1] == 8
+		assert tuple(df.columns) == ('motif_name', 'motif_idx',
+			'sequence_name', 'start', 'end', 'strand', 'score', 'p-value')
+
+	# Without sequence names, sequence_name is the integer sequence index.
+	assert_array_equal([len(df) for df in hits],
+		[0, 1, 1, 0, 1, 1, 2, 2, 0, 0, 0, 0])
+
+	df = hits[1]
+	assert df['motif_name'][0] == "HIC2_MA0738.1"
+	assert df['sequence_name'][0] == 1
+	assert df['start'][0] == 38
+	assert df['end'][0] == 47
+	assert df['strand'][0] == '-'
+
+
+def test_fimo_return_counts():
+	counts = fimo("tests/data/test.meme", "tests/data/test.fa",
+		return_counts=True)
+
+	assert isinstance(counts, numpy.ndarray)
+	assert counts.dtype == numpy.int32
+	assert counts.shape == (12,)
+	assert_array_equal(counts, [1, 0, 1, 2, 0, 0, 0, 2, 1, 1, 2, 0])
+
+	# Counts must match the row counts of the default dataframe output.
+	hits = fimo("tests/data/test.meme", "tests/data/test.fa")
+	assert_array_equal(counts, [len(df) for df in hits])
+
+
+def test_fimo_dim1():
+	hits = fimo("tests/data/test.meme", "tests/data/test.fa", dim=1)
+
+	# One dataframe per sequence that has at least one hit.
+	assert len(hits) == 3
+	for df in hits:
+		assert isinstance(df, pandas.DataFrame)
+		assert tuple(df.columns) == ('motif_name', 'motif_idx',
+			'sequence_name', 'start', 'end', 'strand', 'score', 'p-value')
+		# Each dataframe contains hits for exactly one sequence.
+		assert df['sequence_name'].nunique() == 1
+
+	assert_array_equal([df['sequence_name'].iloc[0] for df in hits],
+		['chr1', 'chr5', 'chr7'])
+	assert_array_equal([len(df) for df in hits], [1, 6, 3])
+
+
+def test_fimo_dim1_no_warning():
+	# The dim=1 concat must not raise a pandas FutureWarning about empty/all-NA
+	# entries, since empty per-motif frames are filtered before concatenation.
+	with warnings.catch_warnings():
+		warnings.simplefilter("error", FutureWarning)
+		hits = fimo("tests/data/test.meme", "tests/data/test.fa", dim=1)
+
+	assert len(hits) == 3
+
+
+def test_fimo_dim1_no_hits():
+	# When no motif has any hit, dim=1 returns an empty list rather than
+	# crashing on an empty pandas.concat.
+	hits = fimo("tests/data/test.meme", "tests/data/test.fa", dim=1,
+		threshold=1e-30)
+
+	assert hits == []
+
+
+def test_fimo_rc_false_strand():
+	hits = fimo("tests/data/test.meme", "tests/data/test.fa",
+		reverse_complement=False)
+
+	assert len(hits) == 12
+	for df in hits:
+		assert (df['strand'] == '+').all()
+
+	# Without reverse complements each forward hit appears once.
+	assert_array_equal([len(df) for df in hits],
+		[1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0])
+
+
+def test_fimo_invalid_motifs():
+	assert_raises(ValueError, fimo, 5, "tests/data/test.fa")
+	assert_raises(ValueError, fimo, [1, 2, 3], "tests/data/test.fa")
+
+	try:
+		fimo(5, "tests/data/test.fa")
+	except ValueError as e:
+		assert "must be a dict or a filename" in str(e)
+
+
+def test_fimo_eps():
+	hits = fimo("tests/data/test.meme", "tests/data/test.fa", eps=0.001)
+	assert_array_equal([len(df) for df in hits],
+		[1, 0, 1, 2, 0, 0, 0, 2, 1, 1, 2, 0])
+
+	# A larger pseudocount flattens motifs, dropping the weakest hits.
+	hits = fimo("tests/data/test.meme", "tests/data/test.fa", eps=0.01)
+	assert_array_equal([len(df) for df in hits],
+		[1, 0, 1, 2, 0, 0, 0, 2, 1, 1, 0, 0])
+
+	df = hits[9]
+	assert df['motif_name'][0] == "FOXQ1_MOUSE.H11MO.0.C"
+	assert df['sequence_name'][0] == 'chr5'
+	assert df['start'][0] == 121
+	assert df['end'][0] == 133
+	assert df['strand'][0] == '+'
+	assert_array_almost_equal(df['score'].values, [10.140161], 4)
+	assert_array_almost_equal(df['p-value'].values, [0.000088], 4)

@@ -81,6 +81,10 @@ def _run_tomtom(args):
 		t_overlaps.append(int(overlaps[qidx, tidx]))
 		t_strands.append('+-'[int(strands[qidx, tidx])])
 
+	if len(q_names) == 0:
+		print("No hits found at p-value threshold {}.".format(args.thresh))
+		return
+
 	max_q_name_len = max([len(name) for name in q_names])
 	max_q_seq_len = max([len(seq) for seq in q_seqs]) + 2
 

@@ -34,3 +34,8 @@ module-root = ""
 dev = [
     "pytest>=8.4.2",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "cmd: tests that invoke the ttl command-line tool",
+]
