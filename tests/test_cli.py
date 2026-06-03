@@ -127,6 +127,91 @@ def test_run_tomtom_no_hits(capsys):
 	assert "Query Name" not in out
 
 
+def _reverse_complement(seq):
+	"""Return the reverse complement of an upper-case ACGT string."""
+
+	complement = {'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A'}
+	return ''.join(complement[c] for c in reversed(seq))
+
+
+def _parse_tomtom_rows(out):
+	"""Parse `_run_tomtom` stdout into a list of per-hit field dictionaries.
+
+	The aligned target sequence column contains the match string of the form
+	`prefix.MIDDLE.suffix` where `MIDDLE` is the aligned region with matches in
+	upper case and mismatches in lower case. This helper splits that out so the
+	tests can inspect the capitalisation directly.
+	"""
+
+	lines = out.strip().split("\n")
+	header = lines[0].split("\t")
+
+	rows = []
+	for line in lines[1:]:
+		fields = [f.strip() for f in line.split("\t")]
+		row = dict(zip(header, fields))
+
+		aligned = row["Target Sequence"]
+		row["aligned_middle"] = aligned.split(".")[1]
+		rows.append(row)
+
+	return rows
+
+
+def test_run_tomtom_rc_match_is_uppercase(capsys):
+	# When the reverse complement is the best match, the aligned region should
+	# capitalise the matching positions rather than showing them all as
+	# lower-case mismatches against the forward strand.
+	from memelite.io import read_meme
+	from memelite.utils import characters
+
+	targets = read_meme("tests/data/test.meme")
+
+	# A perfect reverse-complement query for each target whose consensus is
+	# unambiguous: the aligned region must come back fully upper case.
+	cases = ["HIC2_MA0738.1", "PAX7_PAX_2", "TBX19_MA0804.1"]
+
+	for name in cases:
+		consensus = characters(targets[name], force=True)
+		query = _reverse_complement(consensus)
+
+		args = _tomtom_namespace(query=query, thresh=0.5)
+		_run_tomtom(args)
+		rows = _parse_tomtom_rows(capsys.readouterr().out)
+
+		hits = {row["Target Name"]: row for row in rows}
+		assert name in hits, name
+
+		row = hits[name]
+		assert row["Strand"] == "-", name
+
+		# The query is an exact reverse complement, so every aligned position
+		# matches and the middle must equal the query in upper case.
+		assert row["aligned_middle"] == query, (name, row["aligned_middle"])
+		assert row["aligned_middle"].isupper(), (name, row["aligned_middle"])
+
+
+def test_run_tomtom_forward_match_is_uppercase(capsys):
+	# A forward (`+` strand) exact match must likewise capitalise the aligned
+	# region; this guards against the reverse-complement fix breaking the
+	# forward strand.
+	from memelite.io import read_meme
+	from memelite.utils import characters
+
+	targets = read_meme("tests/data/test.meme")
+	name = "HIC2_MA0738.1"
+	query = characters(targets[name], force=True)
+
+	args = _tomtom_namespace(query=query, thresh=0.5)
+	_run_tomtom(args)
+	rows = _parse_tomtom_rows(capsys.readouterr().out)
+
+	row = {r["Target Name"]: r for r in rows}[name]
+	assert row["Strand"] == "+"
+	assert row["aligned_middle"] == query
+	assert row["aligned_middle"].isupper()
+
+
 def test_run_annotate(tmp_path, capsys):
 	# Each BED row produces one annotated line with a target-database motif.
 	bed = tmp_path / "regions.bed"
