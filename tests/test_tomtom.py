@@ -467,6 +467,255 @@ def test_tomtom_n_target_bins_small():
 		2.,  1., -2.,  7.,  0.], 6)
 	assert_array_almost_equal(overlaps[0], [10.,  9., 10.,  9.,  8., 10.,  8.,  
 		8., 10.,  8., 10., 10.], 6)
-	assert_array_almost_equal(strands[0], [0., 1., 0., 0., 1., 1., 0., 0., 0., 
+	assert_array_almost_equal(strands[0], [0., 1., 0., 0., 1., 1., 0., 0., 0.,
 		1., 1., 0.])
-	
+
+
+###
+
+
+def test_binned_median_single():
+	X = numpy.array([5.0], dtype='float64')
+	bins = numpy.zeros((3, 2), dtype='float64')
+	counts = numpy.ones(1, dtype='int64')
+	assert _binned_median(X, bins, 5.0, 6.0, counts) == 5.0
+
+
+def test_binned_median_identical():
+	X = numpy.array([3.0, 3.0, 3.0, 3.0], dtype='float64')
+	bins = numpy.zeros((5, 2), dtype='float64')
+	counts = numpy.ones(4, dtype='int64')
+	assert _binned_median(X, bins, 3.0, 4.0, counts) == 3.0
+
+
+def test_binned_median_dominant_bin():
+	X = numpy.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype='float64')
+	bins = numpy.zeros((5, 2), dtype='float64')
+	counts = numpy.ones(5, dtype='int64')
+	counts[0] = 100
+	assert _binned_median(X, bins, 0.0, 4.0, counts) == 0.0
+
+
+###
+
+
+def test_tomtom_n_target_bins_none():
+	pwms = list(read_meme("tests/data/test.meme").values())
+	p, scores, offsets, overlaps, strands = tomtom(pwms[:1], pwms,
+		n_target_bins=None)
+
+	assert p.shape == (1, 12)
+	assert scores.shape == (1, 12)
+	assert offsets.shape == (1, 12)
+	assert overlaps.shape == (1, 12)
+	assert strands.shape == (1, 12)
+
+	assert_array_almost_equal(p[0], [-2.087219e-14, 9.594323e-01,
+		9.903021e-01, 5.028105e-01, 6.634917e-01, 9.923712e-01, 2.186044e-01,
+		9.999984e-01, 2.656418e-01, 5.193330e-01, 8.727407e-01, 7.193744e-01],
+		4)
+	assert_array_almost_equal(scores[0], [879., 557., 565., 617., 582., 574.,
+		626., 515., 628., 608., 599., 587.], 6)
+	assert_array_almost_equal(offsets[0], [0., 0., 0., 7., -2., 2., 2., 2., 1.,
+		-2., 7., 0.], 6)
+	assert_array_almost_equal(overlaps[0], [10., 9., 10., 8., 8., 10., 8., 8.,
+		10., 8., 10., 10.], 6)
+	assert_array_almost_equal(strands[0], [0., 1., 0., 1., 0., 1., 0., 0., 0.,
+		1., 1., 0.])
+
+
+def test_tomtom_n_target_bins_none_vs_default():
+	pwms = list(read_meme("tests/data/test.meme").values())
+	p0, s0, o0, v0, t0 = tomtom(pwms[:1], pwms, n_target_bins=None)
+	p1, s1, o1, v1, t1 = tomtom(pwms[:1], pwms)
+
+	# Hashing is approximate, so the no-hashing path is allowed to differ
+	# from the default but should be in the same ballpark.
+	assert numpy.abs(p0 - p1).max() < 0.05
+	assert numpy.abs(s0 - s1).max() <= 10
+
+
+def test_tomtom_n_nearest_one():
+	pwms = list(read_meme("tests/data/test.meme").values())
+	p, scores, offsets, overlaps, strands, idxs = tomtom(pwms, pwms,
+		n_nearest=1)
+	p2, scores2, offsets2, overlaps2, strands2 = tomtom(pwms, pwms)
+
+	assert p.shape == (12, 1)
+	assert scores.shape == (12, 1)
+	assert offsets.shape == (12, 1)
+	assert overlaps.shape == (12, 1)
+	assert strands.shape == (12, 1)
+	assert idxs.shape == (12, 1)
+
+	for i in range(len(pwms)):
+		idx = idxs[i].astype(int)
+		assert_array_almost_equal(p[i], p2[i, idx])
+		assert_array_almost_equal(scores[i], scores2[i, idx])
+		assert_array_almost_equal(offsets[i], offsets2[i, idx])
+		assert_array_almost_equal(overlaps[i], overlaps2[i, idx])
+		assert_array_almost_equal(strands[i], strands2[i, idx])
+
+
+def test_tomtom_n_nearest_all():
+	pwms = list(read_meme("tests/data/test.meme").values())
+	K = len(pwms)
+	p, scores, offsets, overlaps, strands, idxs = tomtom(pwms, pwms,
+		n_nearest=K)
+	p2, scores2, offsets2, overlaps2, strands2 = tomtom(pwms, pwms)
+
+	assert p.shape == (12, K)
+	assert idxs.shape == (12, K)
+
+	for i in range(len(pwms)):
+		idx = idxs[i].astype(int)
+		assert_array_almost_equal(p[i], p2[i, idx])
+		assert_array_almost_equal(scores[i], scores2[i, idx])
+		assert_array_almost_equal(offsets[i], offsets2[i, idx])
+		assert_array_almost_equal(overlaps[i], overlaps2[i, idx])
+		assert_array_almost_equal(strands[i], strands2[i, idx])
+
+
+def test_tomtom_n_nearest_sorted():
+	pwms = list(read_meme("tests/data/test.meme").values())
+	for K in (1, 3, len(pwms)):
+		p, scores, offsets, overlaps, strands, idxs = tomtom(pwms, pwms,
+			n_nearest=K)
+
+		# p-values must be returned in non-decreasing order per query
+		for i in range(len(pwms)):
+			assert numpy.all(numpy.diff(p[i]) >= -1e-9)
+
+
+def test_tomtom_different_lengths_and_counts():
+	pwms = generate_random_meme(n=20)
+	p, scores, offsets, overlaps, strands = tomtom(pwms[:3], pwms[5:9])
+
+	assert p.shape == (3, 4)
+	assert scores.shape == (3, 4)
+	assert offsets.shape == (3, 4)
+	assert overlaps.shape == (3, 4)
+	assert strands.shape == (3, 4)
+
+	# Selecting a subset of queries (with the same target set) must give
+	# identical results to running the full query set.
+	pf, sf, of, vf, tf = tomtom(pwms, pwms[5:9])
+
+	assert_array_almost_equal(p, pf[:3], 6)
+	assert_array_almost_equal(scores, sf[:3], 6)
+	assert_array_almost_equal(offsets, of[:3], 6)
+	assert_array_almost_equal(overlaps, vf[:3], 6)
+	assert_array_almost_equal(strands, tf[:3], 6)
+
+
+def test_tomtom_single_column():
+	state = numpy.random.RandomState(0)
+	single = []
+	for i in range(4):
+		pwm = state.rand(4, 1)
+		single.append(pwm / pwm.sum(axis=0, keepdims=True))
+
+	p, scores, offsets, overlaps, strands = tomtom(single, single)
+
+	assert p.shape == (4, 4)
+
+	assert_array_almost_equal(p, [
+		[0.234375, 0.609375, 0.75, 0.984375],
+		[0.609375, 0.234375, 0.4375, 0.984375],
+		[0.609375, 0.4375, 0.234375, 0.984375],
+		[0.4375, 0.859375, 0.609375, 0.234375]], 4)
+	assert_array_almost_equal(scores, [
+		[99., 85., 84., 66.],
+		[86., 99., 95., 64.],
+		[86., 95., 99., 66.],
+		[72., 68., 69., 99.]], 6)
+	assert_array_almost_equal(overlaps, numpy.ones((4, 4)), 6)
+	assert_array_almost_equal(offsets, numpy.zeros((4, 4)), 6)
+
+
+def test_tomtom_mixed_short_long():
+	state = numpy.random.RandomState(2)
+
+	def mk(length):
+		pwm = state.rand(4, length)
+		return pwm / pwm.sum(axis=0, keepdims=True)
+
+	mixed = [mk(1), mk(2), mk(3), mk(25), mk(30)]
+	p, scores, offsets, overlaps, strands = tomtom(mixed, mixed)
+
+	assert p.shape == (5, 5)
+	assert scores.shape == (5, 5)
+	assert offsets.shape == (5, 5)
+	assert overlaps.shape == (5, 5)
+	assert strands.shape == (5, 5)
+
+	# Each motif matches itself best (lowest p-value on the diagonal).
+	assert_array_almost_equal(numpy.diag(p), [1.632626e-02, 1.343680e-04,
+		1.101413e-06, -7.149836e-14, -1.039169e-13], 6)
+
+	# The overlap of a query against itself is the full motif length.
+	assert_array_almost_equal(numpy.diag(overlaps), [1., 2., 3., 25., 30.], 6)
+	assert_array_almost_equal(numpy.diag(offsets), [0., 0., 0., 0., 0.], 6)
+
+	# Overlap with a target can never exceed the shorter motif's length.
+	assert_array_almost_equal(overlaps, [
+		[1., 1., 1., 1., 1.],
+		[1., 2., 1., 2., 2.],
+		[1., 2., 3., 3., 3.],
+		[1., 2., 3., 25., 25.],
+		[1., 2., 3., 25., 30.]], 6)
+
+
+def test_tomtom_reverse_complement_merge():
+	# An end-to-end check of the reverse-complement merge that complements the
+	# helper-level `test_merge_rc_results`. Note that the per-strand p-values
+	# and scores from an RC run cannot be reconstructed exactly by two separate
+	# `reverse_complement=False` runs, because the score binning, medians, and
+	# background distributions are estimated over the *combined* target set
+	# (forward + reverse) in a single RC run. We therefore check the properties
+	# that hold exactly within the RC run plus golden values.
+	pwms = list(read_meme("tests/data/test.meme").values())
+
+	p_rc, s_rc, o_rc, v_rc, t_rc = tomtom(pwms[:1], pwms,
+		reverse_complement=True)
+
+	# Run both strands separately with reverse_complement=False, which gives
+	# the strand-selection direction (which strand scores higher).
+	p_f, s_f, o_f, v_f, t_f = tomtom(pwms[:1], pwms, reverse_complement=False)
+	p_r, s_r, o_r, v_r, t_r = tomtom(pwms[:1],
+		[t[::-1, ::-1] for t in pwms], reverse_complement=False)
+
+	# Strands are binary.
+	assert set(numpy.unique(t_rc)).issubset({0.0, 1.0})
+
+	# The RC run selects the reverse strand exactly where the reverse strand
+	# scores strictly higher than the forward strand.
+	rev_wins = (s_r > s_f).astype('float64')
+	assert_array_almost_equal(t_rc, rev_wins)
+
+	# Golden values captured from the RC run.
+	assert_array_almost_equal(p_rc[0], [-1.687538e-14, 0.959270, 0.990233,
+		0.501984, 0.662968, 0.993437, 0.218161, 0.999998, 0.265077, 0.533010,
+		0.872186, 0.718780], 4)
+	assert_array_almost_equal(s_rc[0], [879., 557., 565., 617., 582., 573.,
+		626., 515., 628., 607., 599., 587.], 6)
+	assert_array_almost_equal(t_rc[0], [0., 1., 0., 1., 0., 1., 0., 0., 0., 1.,
+		1., 0.])
+
+
+def test_tomtom_n_jobs_subsets():
+	pwms = list(read_meme("tests/data/test.meme").values())
+	out1 = tomtom(pwms[:5], pwms, n_jobs=1)
+	out2 = tomtom(pwms[:5], pwms, n_jobs=-1)
+
+	for a, b in zip(out1, out2):
+		assert_array_almost_equal(a, b)
+
+
+def test_tomtom_n_jobs_n_nearest():
+	pwms = list(read_meme("tests/data/test.meme").values())
+	out1 = tomtom(pwms, pwms, n_nearest=4, n_jobs=1)
+	out2 = tomtom(pwms, pwms, n_nearest=4, n_jobs=-1)
+
+	for a, b in zip(out1, out2):
+		assert_array_almost_equal(a, b)

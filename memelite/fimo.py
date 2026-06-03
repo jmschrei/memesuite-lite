@@ -403,9 +403,13 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	hits = hits[:n_]
 
 	if dim == 1:
+		hits = [df for df in hits if len(df) > 0]
+		if len(hits) == 0:
+			return []
+
 		hits = pandas.concat(hits)
 		_names = numpy.unique(hits['sequence_name'])
-		hits = [hits[hits['sequence_name'] == name].reset_index(drop=True) 
+		hits = [hits[hits['sequence_name'] == name].reset_index(drop=True)
 			for name in _names]
 
 	return hits
