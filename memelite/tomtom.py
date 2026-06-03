@@ -207,8 +207,14 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 		for j in range(1, n):
 			B[i, j] += B[i, j-1]
 		
+		# The cumsum above accumulates floating-point round-off across thousands
+		# of bins and the underlying distribution does not sum to exactly 1, so
+		# at the extreme right tail (the very best matches) the CDF can land just
+		# above 1.0. A survival probability cannot be negative, so clamp the
+		# round-off to zero to avoid returning tiny negative p-values.
 		for j in range(n):
-			B[i, j] = 1 - B[i, j]
+			b = 1 - B[i, j]
+			B[i, j] = b if b > 0 else 0.0
 			
 
 @njit(cache=True)

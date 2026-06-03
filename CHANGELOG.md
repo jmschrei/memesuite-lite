@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `tomtom` no longer returns tiny negative p-values (~ -1e-14 to -1e-11) for
+  very good matches. The p-value is read from a background survival function
+  computed as `1 - cumsum(pdf)`; floating-point round-off in the cumsum over
+  thousands of bins, combined with a distribution that does not sum to exactly
+  1, could push the survival value just below zero at the extreme right tail
+  (i.e. for the best-scoring alignments). `_p_value_backgrounds` now clamps the
+  survival function to be non-negative.
+
 ## [0.3.0]
 
 ### Fixed

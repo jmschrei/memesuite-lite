@@ -703,6 +703,32 @@ def test_tomtom_reverse_complement_merge():
 		1., 0.])
 
 
+def test_tomtom_p_values_non_negative():
+	# Regression test for the small, negative p-values that users reported on
+	# very good matches.
+	#
+	# The p-value of a hit is read straight out of the background survival
+	# function `B` built in `_p_value_backgrounds`, which is formed as
+	# `1 - cumsum(pdf)`. The cumsum accumulates floating-point round-off over
+	# thousands of bins and the underlying distribution does not sum to exactly
+	# 1, so for the very best (highest-scoring) matches -- which land in the
+	# extreme right tail where the CDF is ~1 -- the survival value could come
+	# out as a tiny negative number (~ -1e-14 single strand, roughly doubled by
+	# the `1 - (1 - p) ** 2` reverse-complement merge). A survival probability
+	# can never be negative, so `_p_value_backgrounds` now clamps it to zero.
+	#
+	# A self-comparison of `test.meme` exercises this: every motif's best hit
+	# is itself, sitting in that tail. Pre-fix the diagonal entries were
+	# negative (see the golden values in `test_tomtom_meme`); they must now be
+	# non-negative on both strands.
+	pwms = list(read_meme("tests/data/test.meme").values())
+
+	for rc in (True, False):
+		p, scores, offsets, overlaps, strands = tomtom(pwms, pwms,
+			reverse_complement=rc)
+		assert numpy.all(p >= 0), p.min()
+
+
 def test_tomtom_n_jobs_subsets():
 	pwms = list(read_meme("tests/data/test.meme").values())
 	out1 = tomtom(pwms[:5], pwms, n_jobs=1)
