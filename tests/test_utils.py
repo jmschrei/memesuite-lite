@@ -720,3 +720,20 @@ def test_characters_ties_force_allow_N(random_state):
 def test_characters_raise_shapes(shape):
 	pwm = numpy.random.RandomState(0).randn(*shape)
 	assert_raises(ValueError, characters, pwm)
+
+
+##
+
+
+@pytest.mark.skip(reason="BUG: characters computes the tie check before "
+	"converting a torch tensor to numpy; `tensor.max(axis=0, keepdims=True)` "
+	"returns a (values, indices) tuple, so the comparison yields a bool and "
+	"`.sum()` raises AttributeError for every tensor input.")
+def test_characters_torch():
+	torch = pytest.importorskip("torch")
+
+	ohe = one_hot_encode('GCTAC')
+	assert characters(torch.from_numpy(ohe)) == 'GCTAC'
+	assert characters(torch.from_numpy(ohe).float()) == 'GCTAC'
+	assert characters(torch.from_numpy(ohe)[None]) == 'GCTAC'
+	assert characters(torch.from_numpy(ohe), allow_N=True) == 'GCTAC'

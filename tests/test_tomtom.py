@@ -1418,3 +1418,22 @@ def test_p_value_backgrounds_survival(nq, t_max):
 	# Each single-column distribution sums to one.
 	for i in range(nq):
 		assert_array_almost_equal([A[i, i].sum()], [1.0], 12)
+
+
+##
+
+
+def test_tomtom_torch():
+	# Tensors are converted with `.numpy()`, so results match numpy inputs
+	# exactly, including float32 tensors against float32 arrays.
+	torch = pytest.importorskip("torch")
+
+	pwms = list(read_meme("tests/data/test.meme").values())
+	pwms_t = [torch.from_numpy(pwm) for pwm in pwms]
+	_assert_identical(tomtom(pwms, pwms), tomtom(pwms_t, pwms_t))
+	_assert_identical(tomtom(pwms, pwms, n_nearest=3), 
+		tomtom(pwms_t, pwms_t, n_nearest=3))
+
+	pwms32 = [pwm.astype('float32') for pwm in pwms]
+	_assert_identical(tomtom(pwms32, pwms), 
+		tomtom([torch.from_numpy(pwm) for pwm in pwms32], pwms_t))

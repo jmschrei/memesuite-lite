@@ -847,3 +847,18 @@ def test_run_annotate_extra_bed_columns(tmp_path, capsys):
 	out6 = capsys.readouterr().out
 
 	assert out3 == out6
+
+
+@pytest.mark.cmd
+def test_cmd_module_entry_point(capsys):
+	# `python -m memelite.cli` runs `main()` through the `__main__` guard and
+	# prints the same table as calling `_run_tomtom` directly.
+	import subprocess
+	import sys
+
+	result = subprocess.run([sys.executable, "-m", "memelite.cli", "-q", 
+		"ACGTACGTAC", "-t", "tests/data/test.meme", "-p", "0.5", "-j", "1"], 
+		capture_output=True, text=True, check=True)
+
+	_run_tomtom(_tomtom_namespace(query="ACGTACGTAC", thresh=0.5))
+	assert result.stdout == capsys.readouterr().out

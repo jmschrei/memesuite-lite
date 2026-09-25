@@ -1456,3 +1456,47 @@ def test_fimo_single_column_motif():
 		assert len(hits) == 1
 		assert hits['start'][0] == 1
 		assert_array_almost_equal(hits['p-value'].values, [0.25], 4)
+
+
+##
+
+
+def test_fimo_torch():
+	# Tensor motifs and tensor sequences are converted with `.numpy()`, so the
+	# hits match numpy inputs exactly.
+	torch = pytest.importorskip("torch")
+
+	motifs = read_meme("tests/data/test.meme")
+	X = _make_one_hot((3, 4, 200), random_state=0)
+	expected = fimo(motifs, X, threshold=1e-3)
+
+	observed = fimo(motifs, torch.from_numpy(X), threshold=1e-3)
+	for df0, df1 in zip(expected, observed):
+		pandas.testing.assert_frame_equal(df0, df1)
+
+	motifs_t = {name: torch.from_numpy(pwm) for name, pwm in motifs.items()}
+	observed = fimo(motifs_t, X, threshold=1e-3)
+	for df0, df1 in zip(expected, observed):
+		pandas.testing.assert_frame_equal(df0, df1)
+
+
+def test_fimo_unreachable_threshold():
+	# A uniform motif's best p-value is 1, so no score can pass the threshold.
+	# It must report no hits and leave the other motifs' hits unchanged.
+	motifs = _random_pwms(3, 6, 12, random_state=7)
+	X = _make_one_hot((4, 4, 150), random_state=1)
+	expected = fimo(motifs, X, threshold=1e-2)
+
+	motifs_u = {'uniform': numpy.full((4, 5), 0.25), **motifs}
+	for return_counts in (False, True):
+		observed = fimo(motifs_u, X, threshold=1e-2, 
+			return_counts=return_counts)
+		
+		if return_counts:
+			assert observed[0] == 0
+			assert_array_equal(observed[1:], [len(df) for df in expected])
+		else:
+			assert observed[0].shape == (0, 8)
+			for df0, df1 in zip(expected, observed[1:]):
+				df1 = df1.assign(motif_idx=df1['motif_idx'] - 1)
+				pandas.testing.assert_frame_equal(df0, df1)
