@@ -316,6 +316,9 @@ def fimo_table(hits, dim=0):
 		out['frame_len'] = numpy.array([len(df) for df in hits],
 			dtype='int64')
 
+	# Empty frames are dropped before concatenating, which pandas 2.x warns
+	# about otherwise and which contribute no rows either way.
+	hits = [df for df in hits if len(df) > 0]
 	if len(hits) == 0:
 		df = pandas.DataFrame(columns=['motif_idx', 'sequence_name', 'start',
 			'end', 'strand', 'score', 'p-value'])
