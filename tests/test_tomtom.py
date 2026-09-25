@@ -18,6 +18,16 @@ from numpy.testing import assert_raises
 from numpy.testing import assert_array_equal
 from numpy.testing import assert_array_almost_equal
 
+# The grids use two threads to exercise the parallel path while keeping the
+# per-thread scratchpad small; n_jobs above numba's thread count is an error.
+_N_JOBS = min(2, numba.config.NUMBA_NUM_THREADS)
+
+
+def _require_threads(n_jobs):
+	if n_jobs > numba.config.NUMBA_NUM_THREADS:
+		pytest.skip("needs {} numba threads".format(n_jobs))
+
+
 
 def generate_random_meme(n=5, min_len=4, max_len=20, random_state=0):
 	state = numpy.random.RandomState(random_state)
@@ -855,7 +865,7 @@ def test_tomtom_shape_grid(n_q, n_t, regime):
 	Ts = _random_pwms(_lengths(regime, n_t, False, 100+n_t), 
 		random_state=100+n_t)
 
-	out = tomtom(Qs, Ts, n_jobs=2)
+	out = tomtom(Qs, Ts, n_jobs=_N_JOBS)
 	_assert_valid(out, Qs, Ts)
 
 
@@ -866,10 +876,10 @@ def test_tomtom_shape_grid_n_nearest(n_nearest, regime):
 	Qs = _random_pwms(_lengths(regime, 7, True, 0), random_state=0)
 	Ts = _random_pwms(_lengths(regime, 9, False, 1), random_state=1)
 
-	out = tomtom(Qs, Ts, n_nearest=n_nearest, n_jobs=2)
+	out = tomtom(Qs, Ts, n_nearest=n_nearest, n_jobs=_N_JOBS)
 	_assert_valid(out, Qs, Ts, n_nearest=n_nearest)
 
-	full = tomtom(Qs, Ts, n_jobs=2)
+	full = tomtom(Qs, Ts, n_jobs=_N_JOBS)
 	idxs = out[5].astype(int)
 	for i in range(len(Qs)):
 		assert numpy.all(numpy.diff(out[0][i]) >= 0)
@@ -886,7 +896,7 @@ def test_tomtom_shape_grid_no_rc(regime):
 	Qs = _random_pwms(_lengths(regime, 7, True, 0), random_state=0)
 	Ts = _random_pwms(_lengths(regime, 9, False, 1), random_state=1)
 
-	out = tomtom(Qs, Ts, reverse_complement=False, n_jobs=2)
+	out = tomtom(Qs, Ts, reverse_complement=False, n_jobs=_N_JOBS)
 	_assert_valid(out, Qs, Ts, reverse_complement=False)
 
 
@@ -963,6 +973,7 @@ def test_tomtom_target_permutation(mixed_pwms, reverse_complement):
 @pytest.mark.parametrize("n_jobs", [1, 2, 3, 5, -1])
 @pytest.mark.parametrize("n_nearest", [None, 3])
 def test_tomtom_n_jobs_identical(mixed_pwms, n_jobs, n_nearest):
+	_require_threads(n_jobs)
 	out = tomtom(mixed_pwms, mixed_pwms, n_nearest=n_nearest, n_jobs=1)
 	out_j = tomtom(mixed_pwms, mixed_pwms, n_nearest=n_nearest, n_jobs=n_jobs)
 	_assert_identical(out, out_j)
@@ -970,6 +981,7 @@ def test_tomtom_n_jobs_identical(mixed_pwms, n_jobs, n_nearest):
 
 @pytest.mark.parametrize("n_jobs", [1, 2, 3, -1])
 def test_tomtom_n_jobs_restores_threads(mixed_pwms, n_jobs):
+	_require_threads(n_jobs)
 	before = numba.get_num_threads()
 	tomtom(mixed_pwms[:3], mixed_pwms, n_jobs=n_jobs)
 	assert numba.get_num_threads() == before

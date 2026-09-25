@@ -19,7 +19,7 @@ from .tomtom import _p_values
 from .tomtom import tomtom
 
  
-@njit
+@njit(cache=True)
 def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 	"""An internal function that calculates the backgrounds for p-values.
 
@@ -101,9 +101,9 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 			B[i, j] = 1 - B[i, j]
 			
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
-	n_score_bins, n_median_bins, n_cache, reverse_complement):
+	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement):
 	"""An internal function implementing the TOMTOM algorithm.
 
 	This internal function is necessary to handle the numba component of the
@@ -125,7 +125,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 
 	# Re-usable workspace for each thread instead of re-allocating
 	# and freeing large arrays for each example.
-	n = numba.get_num_threads()
+	n = n_threads
 	n_len = Q_max*n_score_bins + Q_max*n_cache
 	
 	_gamma = numpy.empty((n, nt, Q_max), dtype='float64')
@@ -333,7 +333,8 @@ def symmetric_tomtom(Xs, n_score_bins=100, n_median_bins=1000,
 	###
 	
 	results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, 
-		-1, n_score_bins, n_median_bins, n_cache, int(reverse_complement))
+		-1, n_score_bins, n_median_bins, n_cache, numba.get_num_threads(), 
+		int(reverse_complement))
 
 	if n_jobs != -1:
 		numba.set_num_threads(_n_jobs)

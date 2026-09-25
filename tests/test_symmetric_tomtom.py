@@ -1,6 +1,7 @@
 # test_symmetric_tomtom.py
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
+import numba
 import numpy
 import pytest
 
@@ -10,6 +11,16 @@ from memelite.symmetric_tomtom import symmetric_tomtom
 
 from numpy.testing import assert_raises
 from numpy.testing import assert_array_almost_equal
+
+# The grids use two threads to exercise the parallel path while keeping the
+# per-thread scratchpad small; n_jobs above numba's thread count is an error.
+_N_JOBS = min(2, numba.config.NUMBA_NUM_THREADS)
+
+
+def _require_threads(n_jobs):
+	if n_jobs > numba.config.NUMBA_NUM_THREADS:
+		pytest.skip("needs {} numba threads".format(n_jobs))
+
 
 
 def generate_random_meme(n=5, min_len=4, max_len=20, random_state=0):
@@ -320,7 +331,8 @@ def test_symmetric_tomtom_shapes(name):
 	n = len(lengths)
 	pwms = generate_dirichlet_meme(lengths, random_state=len(name))
 
-	p, scores, offsets, overlaps, strands = symmetric_tomtom(pwms, n_jobs=2)
+	p, scores, offsets, overlaps, strands = symmetric_tomtom(pwms, 
+		n_jobs=_N_JOBS)
 
 	for x in (p, scores, offsets, overlaps, strands):
 		assert isinstance(x, numpy.ndarray)
@@ -367,8 +379,8 @@ def test_symmetric_tomtom_matches_tomtom(name):
 	lengths = SHAPE_GRID[name]
 	pwms = generate_dirichlet_meme(lengths, random_state=len(name))
 
-	observed = symmetric_tomtom(pwms, n_jobs=2)
-	expected = expected_from_tomtom(pwms, n_jobs=2)
+	observed = symmetric_tomtom(pwms, n_jobs=_N_JOBS)
+	expected = expected_from_tomtom(pwms, n_jobs=_N_JOBS)
 	assert_off_diagonal_equal(observed, expected)
 
 
@@ -387,8 +399,8 @@ def test_symmetric_tomtom_matches_tomtom_kwargs(kwargs):
 	# equivalence to plain tomtom holds for every setting.
 	pwms = generate_random_meme(n=10)
 
-	observed = symmetric_tomtom(pwms, n_jobs=2, **kwargs)
-	expected = expected_from_tomtom(pwms, n_jobs=2, **kwargs)
+	observed = symmetric_tomtom(pwms, n_jobs=_N_JOBS, **kwargs)
+	expected = expected_from_tomtom(pwms, n_jobs=_N_JOBS, **kwargs)
 	assert_off_diagonal_equal(observed, expected)
 
 
@@ -441,6 +453,7 @@ def test_symmetric_tomtom_n_cache_too_small(n_cache):
 
 @pytest.mark.parametrize("n_jobs", [1, 2, 3, -1])
 def test_symmetric_tomtom_n_jobs_grid(n_jobs):
+	_require_threads(n_jobs)
 	pwms = generate_dirichlet_meme(SHAPE_GRID['n30_mixed'], random_state=5)
 
 	r0 = symmetric_tomtom(pwms, n_jobs=1)
@@ -450,6 +463,7 @@ def test_symmetric_tomtom_n_jobs_grid(n_jobs):
 
 @pytest.mark.parametrize("n_jobs", [1, 2, 3, -1])
 def test_symmetric_tomtom_restores_num_threads(n_jobs):
+	_require_threads(n_jobs)
 	import numba
 
 	pwms = generate_random_meme(n=6)

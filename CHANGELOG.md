@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Integer scores are now held in `int16`/`int64` instead of `int8`/`int16`,
     which overflowed for large `n_score_bins` or long motifs.
 
+### Changed
+
+- `symmetric_tomtom`'s numba kernels are now cached to disk like `tomtom`'s,
+  so they are no longer recompiled in every new process (about 4-6 s each).
+  The thread count is passed into the kernel instead of read inside it, which
+  had prevented caching.
+
 ### Added
 
 - A much larger unit test suite: brute-force references for `fimo`, exact

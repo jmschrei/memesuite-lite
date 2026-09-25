@@ -1,5 +1,6 @@
 import os
 import argparse
+import numba
 import numpy
 import pytest
 import pandas
@@ -496,6 +497,9 @@ def test_run_tomtom_meme_query_matches_tomtom(thresh, capsys):
 	{'n_jobs': 2},
 ])
 def test_run_tomtom_kwargs_match_tomtom(kwargs, capsys):
+	if kwargs.get('n_jobs', 1) > numba.config.NUMBA_NUM_THREADS:
+		pytest.skip("needs {} numba threads".format(kwargs['n_jobs']))
+
 	queries = read_meme(QUERIES)
 
 	tomtom_kwargs = dict(n_jobs=1)
