@@ -518,3 +518,205 @@ def test_fast_one_hot_encode_direct():
 
 
 ###
+
+def _reference_one_hot(sequence, alphabet, ignore):
+	"""A pure-Python reference encoding with shape (len(alphabet), len)."""
+
+	ohe = numpy.zeros((len(alphabet), len(sequence)), dtype='int64')
+	for i, char in enumerate(sequence):
+		if char in ignore:
+			continue
+
+		ohe[list(alphabet).index(char), i] = 1
+
+	return ohe
+
+
+def _random_sequence(length, symbols, random_state):
+	state = numpy.random.RandomState(random_state)
+	return ''.join(numpy.array(list(symbols))[state.randint(0, len(symbols),
+		size=length)])
+
+
+_PROTEIN = list('ACDEFGHIKLMNPQRSTVWY')
+
+
+@pytest.mark.parametrize("length", [0, 1, 2, 7, 100, 10000])
+@pytest.mark.parametrize("alphabet,ignore", [
+	(['A', 'C', 'G', 'T'], ['N']),
+	(['A', 'B'], ['N']),
+	(_PROTEIN, ['X', '-']),
+	(['*', '-', '.', '0', '9'], ['?']),
+	(['A', 'C', 'G', 'T'], [])
+])
+def test_one_hot_encode_reference(length, alphabet, ignore):
+	symbols = list(alphabet) + list(ignore)
+	seq = _random_sequence(length, symbols, random_state=length)
+
+	ohe = one_hot_encode(seq, alphabet=alphabet, ignore=ignore)
+	ohe_ref = _reference_one_hot(seq, alphabet, ignore)
+
+	assert ohe.dtype == numpy.int8
+	assert ohe.shape == (len(alphabet), length)
+	assert numpy.array_equal(ohe, ohe_ref)
+
+	# Every position sums to one except those holding an ignored character.
+	is_ignored = numpy.array([c in ignore for c in seq], dtype=bool)
+	assert numpy.all(ohe.sum(axis=0) == (~is_ignored).astype(int))
+
+
+@pytest.mark.parametrize("length", [1, 2, 7, 100, 10000])
+@pytest.mark.parametrize("alphabet", [['A', 'C', 'G', 'T'], ['A', 'B'],
+	_PROTEIN, ['*', '-', '.', '0', '9']])
+def test_one_hot_encode_characters_round_trip(length, alphabet):
+	seq = _random_sequence(length, alphabet, random_state=length+1)
+	ohe = one_hot_encode(seq, alphabet=alphabet, ignore=[])
+
+	assert characters(ohe, alphabet=alphabet) == seq
+
+
+@pytest.mark.parametrize("random_state", range(5))
+def test_one_hot_encode_reference_with_N_round_trip(random_state):
+	seq = _random_sequence(500, 'ACGTN', random_state=random_state)
+	ohe = one_hot_encode(seq)
+
+	assert numpy.array_equal(ohe, _reference_one_hot(seq, 'ACGT', 'N'))
+	assert characters(ohe, allow_N=True) == seq
+
+
+@pytest.mark.parametrize("dtype", [numpy.int8, numpy.uint8, numpy.int32,
+	numpy.int64, numpy.float16, numpy.float32, numpy.float64, bool, 'float32',
+	'int16'])
+def test_one_hot_encode_dtypes(dtype):
+	seq = _random_sequence(64, 'ACGTN', random_state=0)
+	ohe = one_hot_encode(seq, dtype=dtype)
+
+	assert ohe.dtype == numpy.dtype(dtype)
+	assert ohe.shape == (4, 64)
+	assert numpy.array_equal(ohe.astype('int64'),
+		_reference_one_hot(seq, 'ACGT', 'N'))
+
+
+def test_one_hot_encode_string_alphabet():
+	# A string alphabet is treated like the equivalent list of characters.
+	seq = _random_sequence(50, 'ACGT', random_state=0)
+	assert numpy.array_equal(one_hot_encode(seq, alphabet='ACGT'),
+		one_hot_encode(seq))
+
+
+@pytest.mark.skip(reason="BUG: one_hot_encode documents tuple alphabets but "
+	"raises TypeError because only lists are joined into a string")
+def test_one_hot_encode_tuple_alphabet():
+	seq = _random_sequence(50, 'ACGT', random_state=0)
+	assert numpy.array_equal(one_hot_encode(seq, alphabet=('A', 'C', 'G', 'T')),
+		one_hot_encode(seq))
+
+
+def test_one_hot_encode_does_not_mutate_arguments():
+	alphabet, ignore = ['A', 'C', 'G', 'T'], ['N']
+	one_hot_encode('ACGTN', alphabet=alphabet, ignore=ignore)
+
+	assert alphabet == ['A', 'C', 'G', 'T']
+	assert ignore == ['N']
+
+
+@pytest.mark.parametrize("position", [0, 1, 25, 49])
+@pytest.mark.parametrize("char", ['Q', 'a', 'n', ' ', '\n', 'Z'])
+def test_one_hot_encode_unknown_char_any_position(position, char):
+	seq = list(_random_sequence(50, 'ACGT', random_state=position))
+	seq[position] = char
+	assert_raises(ValueError, one_hot_encode, ''.join(seq))
+
+
+def test_one_hot_encode_non_ascii_raises():
+	assert_raises(ValueError, one_hot_encode, 'ACGTé')
+
+
+@pytest.mark.parametrize("alphabet,ignore", [
+	(['A', 'C', 'G', 'T'], ['A']),
+	(['A', 'C', 'G', 'T'], ['N', 'T']),
+	(['A', 'C', 'G', 'T', 'N'], ['N']),
+])
+def test_one_hot_encode_raises_ignore_overlap(alphabet, ignore):
+	assert_raises(ValueError, one_hot_encode, 'ACGT', alphabet=alphabet,
+		ignore=ignore)
+
+
+def test_one_hot_encode_empty_custom_alphabet():
+	ohe = one_hot_encode('', alphabet=['A', 'B'])
+	assert ohe.shape == (2, 0)
+
+
+##
+
+
+@pytest.mark.parametrize("random_state", range(10))
+@pytest.mark.parametrize("n_chars", [2, 4, 20])
+def test_characters_random_pwm_argmax(random_state, n_chars):
+	# Continuous random values have no ties, so the result is the argmax.
+	state = numpy.random.RandomState(random_state)
+	alphabet = _PROTEIN[:n_chars]
+	pwm = state.randn(n_chars, 37)
+
+	expected = ''.join(alphabet[i] for i in pwm.argmax(axis=0))
+	assert characters(pwm, alphabet=alphabet) == expected
+	assert characters(pwm[None], alphabet=alphabet) == expected
+	assert characters(pwm, alphabet=alphabet, force=True) == expected
+
+
+def test_characters_negative_values():
+	# Attribution-style matrices with only negative values still decode by
+	# argmax.
+	pwm = numpy.array([
+		[-1.0, -2.0, -3.0],
+		[-0.5, -3.0, -0.2],
+		[-2.0, -0.1, -4.0],
+		[-4.0, -5.0, -9.0]
+	])
+
+	assert characters(pwm) == 'CGC'
+	assert characters(pwm, allow_N=True) == 'CGC'
+
+
+@pytest.mark.parametrize("dtype", ['int8', 'int32', 'int64', 'uint8',
+	'float16', 'float32', 'float64', 'bool'])
+def test_characters_dtypes(dtype):
+	seq = _random_sequence(40, 'ACGT', random_state=2)
+	ohe = one_hot_encode(seq).astype(dtype)
+
+	assert characters(ohe) == seq
+
+
+def test_characters_tuple_alphabet():
+	seq = _random_sequence(40, 'ACGT', random_state=3)
+	assert characters(one_hot_encode(seq), alphabet=('A', 'C', 'G', 'T')) == seq
+
+
+@pytest.mark.parametrize("random_state", range(5))
+def test_characters_ties_force_allow_N(random_state):
+	# Integer-valued PWMs with frequent ties and all-zero columns.
+	state = numpy.random.RandomState(random_state)
+	pwm = state.randint(0, 2, size=(4, 30))
+	pwm[:, :3] = 0
+
+	alphabet = numpy.array(['A', 'C', 'G', 'T'])
+	is_max = pwm == pwm.max(axis=0, keepdims=True)
+	assert is_max.sum(axis=0).max() > 1
+
+	assert_raises(ValueError, characters, pwm)
+
+	forced = ''.join(alphabet[pwm.argmax(axis=0)])
+	assert characters(pwm, force=True) == forced
+
+	with_N = ''.join('N' if pwm[:, i].sum() == 0 else c
+		for i, c in enumerate(forced))
+	assert characters(pwm, allow_N=True) == with_N
+	assert characters(pwm, force=True, allow_N=True) == with_N
+	assert with_N[:3] == 'NNN'
+
+
+@pytest.mark.parametrize("shape", [(4,), (2, 4, 5), (1, 1, 4, 5), (3, 5),
+	(5, 5), (1, 3, 5)])
+def test_characters_raise_shapes(shape):
+	pwm = numpy.random.RandomState(0).randn(*shape)
+	assert_raises(ValueError, characters, pwm)

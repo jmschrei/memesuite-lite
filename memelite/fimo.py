@@ -172,7 +172,7 @@ def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size,
 			start = numpy.uint64(chrom_lengths[l])
 			end = numpy.uint64(chrom_lengths[l+1])
 			
-			for i in range(end-start-n):
+			for i in range(end-start-n+1):
 				i = numpy.uint64(i)
 				
 				score = 0.0

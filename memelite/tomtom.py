@@ -232,8 +232,10 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results):
 	n = len(T_lens) // 2
 	total_offset = uint64(0)
 
-	max_nt = gamma.shape[0]
-	t_sums = numpy.empty(max_nt+nq-1, dtype='int16')
+	# Sized by the longest target, not by gamma, whose rows are the unique
+	# target columns and can be fewer than a target's length after hashing.
+	max_nt = T_lens.max()
+	t_sums = numpy.empty(max_nt+nq-1, dtype='int64')
 
 	for i, nt in enumerate(T_lens):
 		nt = uint64(nt)
@@ -262,7 +264,7 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results):
 				if score == results[i, 1] and results[i, 2] >= overlap:
 					continue
 
-				results[i, 0] = B_cdfs[nt, uint64(score-1)]
+				results[i, 0] = B_cdfs[nt, uint64(score-1)] if score > 0 else 1.0
 				results[i, 1] = score
 				results[i, 2] = k - nq + 1
 				results[i, 3] = overlap
@@ -318,7 +320,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	n_len = Q_max*n_score_bins + Q_max*n_cache
 	
 	_gamma = numpy.empty((n_threads, nt, Q_max), dtype='float64')
-	_gamma_int = numpy.empty((n_threads, nt, Q_max), dtype='int8')
+	_gamma_int = numpy.empty((n_threads, nt, Q_max), dtype='int16')
 	_f = numpy.empty((n_threads, Q_max, n_score_bins+1), dtype='float64')
 
 	_A = numpy.empty((n_threads, Q_max, Q_max, n_len), dtype='float64')
@@ -340,14 +342,21 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			_gamma_int[pid], _f[pid], _medians[pid], _median_bins[pid], Q_norm, 
 			T_norm, rr_counts, Q_offsets[i], nq, n_score_bins)
 
-		if offset > n_cache:
-			print("Offset is larger than `n_cache`. Please increase `n_cache`"
-				" to at least ", offset)
+		# The backgrounds span nq*(n_score_bins+offset) bins. When the offset
+		# exceeds `n_cache` this can overrun the shared workspace, so allocate
+		# a large enough one for this query instead.
+		n_needed = nq*n_score_bins + nq*offset
+		if n_needed > n_len:
+			A = numpy.empty((nq, nq, n_needed), dtype='float64')
+			B = numpy.empty((T_max+1, n_needed), dtype='float64')
+			A_csum = numpy.empty((nq, nq, n_needed), dtype='float64')
+		else:
+			A, B, A_csum = _A[pid], _B[pid], _A_csum[pid]
 
-		_p_value_backgrounds(_f[pid], _A[pid], _B[pid], _A_csum[pid], nq, 
-			n_score_bins, T_max, offset)
+		_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, T_max, 
+			offset)
 
-		_p_values(_gamma_int[pid], _B[pid], rr_inv, T_lens, -1, nq, offset, 
+		_p_values(_gamma_int[pid], B, rr_inv, T_lens, -1, nq, offset, 
 			_results[pid])
 
 		if reverse_complement == 1:
@@ -430,7 +439,9 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	n_cache: int, optional
 		A cache size to use when allocating the scratchpad. A higher number will
 		linearly increase the amount of memory used but will not increase the
-		amount of compute needed. Default is 250.
+		amount of compute needed. A query that needs more than this is given
+		its own larger scratchpad, so this does not change the results.
+		Default is 100.
 
 	reverse_complement: bool, optional
 		Whether to automatically compare each query to targets and also the

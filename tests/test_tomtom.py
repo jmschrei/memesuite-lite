@@ -1,6 +1,7 @@
 # test_tomtom.py
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
+import numba
 import numpy
 import pytest
 import pandas
@@ -9,9 +10,12 @@ from memelite.io import read_meme
 from memelite.tomtom import _binned_median
 from memelite.tomtom import _pairwise_max
 from memelite.tomtom import _merge_rc_results
+from memelite.tomtom import _p_value_backgrounds
+from memelite.tomtom import _p_values
 from memelite.tomtom import tomtom
 
 from numpy.testing import assert_raises
+from numpy.testing import assert_array_equal
 from numpy.testing import assert_array_almost_equal
 
 
@@ -250,7 +254,11 @@ def test_tomtom_pytorch():
 '''
 
 
-def test_tomtom_reverse_complement():
+@pytest.mark.xfail(strict=True, reason="When the forward and reverse "
+	"strand best scores tie, `_merge_rc_results` resolves to strand 1 (`<=`), "
+	"so reversing the targets changes the reported strand and offset for tied "
+	"pairs. See test_tomtom_reverse_complement_targets_untied.")
+def test_tomtom_reverse_complement_targets():
 	pwms = generate_random_meme(n=20)
 	p0, scores0, offsets0, overlaps0, strands0 = tomtom(pwms, pwms)
 	p1, scores1, offsets1, overlaps1, strands1 = tomtom(pwms,
@@ -745,3 +753,656 @@ def test_tomtom_n_jobs_n_nearest():
 
 	for a, b in zip(out1, out2):
 		assert_array_almost_equal(a, b)
+
+
+##
+# Helpers for the property tests below.
+
+
+def _random_pwms(lengths, random_state=0):
+	"""Random PWMs with the given lengths, built like generate_random_meme."""
+
+	state = numpy.random.RandomState(random_state)
+
+	pwms = []
+	for length in lengths:
+		pwm = state.choice(17, p=[0.2] + [0.05]*16, size=(length, 4))
+		pwm[pwm.sum(axis=1) == 0] = [1, 0, 0, 0]
+		pwm = pwm / pwm.sum(axis=1, keepdims=True)
+		pwms.append(pwm.T)
+
+	return pwms
+
+
+def _lengths(regime, n, is_query, random_state):
+	state = numpy.random.RandomState(random_state)
+
+	if regime == 'short':
+		return state.randint(1, 6, size=n)
+	elif regime == 'equal':
+		return numpy.full(n, 8)
+	elif regime == 'mixed':
+		return state.randint(1, 33, size=n)
+	elif regime == 'qlong':
+		return state.randint(20, 31, size=n) if is_query else \
+			state.randint(3, 9, size=n)
+	elif regime == 'tlong':
+		return state.randint(3, 9, size=n) if is_query else \
+			state.randint(20, 31, size=n)
+
+
+def _assert_identical(out0, out1):
+	assert len(out0) == len(out1)
+	for a, b in zip(out0, out1):
+		assert a.shape == b.shape
+		assert_array_equal(a, b)
+
+
+def _assert_valid(out, Qs, Ts, n_nearest=None, reverse_complement=True):
+	"""Structural checks that any correct TOMTOM output must satisfy."""
+
+	n_q, n_t = len(Qs), len(Ts)
+	n_out = n_t if n_nearest is None else n_nearest
+
+	assert isinstance(out, numpy.ndarray)
+	assert len(out) == (5 if n_nearest is None else 6)
+	for x in out:
+		assert x.dtype == numpy.float64
+		assert x.shape == (n_q, n_out)
+		assert numpy.all(numpy.isfinite(x))
+
+	p, scores, offsets, overlaps, strands = out[:5]
+
+	if n_nearest is None:
+		t_idxs = numpy.tile(numpy.arange(n_t), (n_q, 1))
+	else:
+		t_idxs = out[5].astype(int)
+		assert_array_equal(out[5], t_idxs)
+		assert t_idxs.min() >= 0 and t_idxs.max() < n_t
+		for row in t_idxs:
+			assert len(numpy.unique(row)) == len(row)
+
+	assert p.min() >= 0 and p.max() <= 1
+	assert set(numpy.unique(strands)).issubset({0.0, 1.0})
+	if not reverse_complement:
+		assert numpy.all(strands == 0)
+
+	for x in (scores, offsets, overlaps):
+		assert_array_equal(x, numpy.round(x))
+
+	nq = numpy.array([Q.shape[-1] for Q in Qs])[:, None]
+	nt = numpy.array([T.shape[-1] for T in Ts])[t_idxs]
+
+	assert numpy.all(overlaps >= 1)
+	assert numpy.all(overlaps <= numpy.minimum(nq, nt))
+	assert numpy.all(offsets >= -(nq - 1))
+	assert numpy.all(offsets <= nt - 1)
+
+	k = offsets + nq - 1
+	assert_array_equal(overlaps, numpy.minimum(k + 1, nq) -
+		numpy.maximum(0, k - nt + 1))
+
+
+##
+
+
+@pytest.mark.parametrize("n_q", [1, 2, 7, 33])
+@pytest.mark.parametrize("n_t", [1, 2, 9, 40])
+@pytest.mark.parametrize("regime", ['short', 'equal', 'mixed', 'qlong', 
+	'tlong'])
+def test_tomtom_shape_grid(n_q, n_t, regime):
+	Qs = _random_pwms(_lengths(regime, n_q, True, n_q), random_state=n_q)
+	Ts = _random_pwms(_lengths(regime, n_t, False, 100+n_t), 
+		random_state=100+n_t)
+
+	out = tomtom(Qs, Ts, n_jobs=2)
+	_assert_valid(out, Qs, Ts)
+
+
+@pytest.mark.parametrize("n_nearest", [1, 2, 5, 9])
+@pytest.mark.parametrize("regime", ['short', 'equal', 'mixed', 'qlong', 
+	'tlong'])
+def test_tomtom_shape_grid_n_nearest(n_nearest, regime):
+	Qs = _random_pwms(_lengths(regime, 7, True, 0), random_state=0)
+	Ts = _random_pwms(_lengths(regime, 9, False, 1), random_state=1)
+
+	out = tomtom(Qs, Ts, n_nearest=n_nearest, n_jobs=2)
+	_assert_valid(out, Qs, Ts, n_nearest=n_nearest)
+
+	full = tomtom(Qs, Ts, n_jobs=2)
+	idxs = out[5].astype(int)
+	for i in range(len(Qs)):
+		assert numpy.all(numpy.diff(out[0][i]) >= 0)
+		for x, y in zip(out[:5], full):
+			assert_array_equal(x[i], y[i, idxs[i]])
+
+		# The kept targets are the n_nearest smallest p-values.
+		assert_array_equal(out[0][i], numpy.sort(full[0][i])[:n_nearest])
+
+
+@pytest.mark.parametrize("regime", ['short', 'equal', 'mixed', 'qlong', 
+	'tlong'])
+def test_tomtom_shape_grid_no_rc(regime):
+	Qs = _random_pwms(_lengths(regime, 7, True, 0), random_state=0)
+	Ts = _random_pwms(_lengths(regime, 9, False, 1), random_state=1)
+
+	out = tomtom(Qs, Ts, reverse_complement=False, n_jobs=2)
+	_assert_valid(out, Qs, Ts, reverse_complement=False)
+
+
+@pytest.mark.skip(reason="BUG: n_nearest larger than the number of targets "
+	"returns uninitialized memory (values like 1e-315) in the surplus columns "
+	"instead of raising or clipping to the number of targets.")
+def test_tomtom_n_nearest_larger_than_targets():
+	Qs = _random_pwms([6, 8, 10], random_state=0)
+	Ts = _random_pwms([5, 7, 9, 11, 4], random_state=1)
+
+	try:
+		out = tomtom(Qs, Ts, n_nearest=8)
+	except ValueError:
+		return
+
+	_assert_valid(out, Qs, Ts, n_nearest=out[0].shape[1])
+	assert out[0].shape[1] <= len(Ts)
+
+
+##
+
+
+@pytest.fixture
+def mixed_pwms():
+	lengths = numpy.random.RandomState(3).randint(1, 31, size=20)
+	return _random_pwms(lengths, random_state=3)
+
+
+def test_tomtom_query_permutation(mixed_pwms):
+	out = tomtom(mixed_pwms, mixed_pwms)
+
+	for seed in range(3):
+		perm = numpy.random.RandomState(seed).permutation(len(mixed_pwms))
+		out_p = tomtom([mixed_pwms[i] for i in perm], mixed_pwms)
+		_assert_identical([x[perm] for x in out], out_p)
+
+
+def test_tomtom_query_duplicates(mixed_pwms):
+	out = tomtom([mixed_pwms[3]]*4 + [mixed_pwms[5]]*3, mixed_pwms)
+
+	for x in out:
+		for k in range(1, 4):
+			assert_array_equal(x[0], x[k])
+		assert_array_equal(x[4], x[5])
+		assert_array_equal(x[4], x[6])
+
+
+def test_tomtom_query_subsets(mixed_pwms):
+	out = tomtom(mixed_pwms, mixed_pwms)
+	state = numpy.random.RandomState(0)
+
+	for _ in range(10):
+		n = state.randint(1, len(mixed_pwms))
+		idxs = numpy.sort(state.choice(len(mixed_pwms), size=n, replace=False))
+		out_s = tomtom([mixed_pwms[i] for i in idxs], mixed_pwms)
+		_assert_identical([x[idxs] for x in out], out_s)
+
+
+@pytest.mark.parametrize("reverse_complement", [True, False])
+def test_tomtom_target_permutation(mixed_pwms, reverse_complement):
+	# Exact only without target hashing: with hashing, the representative
+	# column kept for each hash bin is the first one seen, so the target
+	# order changes the (approximate) columns that are scored.
+	out = tomtom(mixed_pwms, mixed_pwms, n_target_bins=None, 
+		reverse_complement=reverse_complement)
+
+	for seed in range(3):
+		perm = numpy.random.RandomState(seed).permutation(len(mixed_pwms))
+		out_p = tomtom(mixed_pwms, [mixed_pwms[i] for i in perm], 
+			n_target_bins=None, reverse_complement=reverse_complement)
+		_assert_identical([x[:, perm] for x in out], out_p)
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2, 3, 5, -1])
+@pytest.mark.parametrize("n_nearest", [None, 3])
+def test_tomtom_n_jobs_identical(mixed_pwms, n_jobs, n_nearest):
+	out = tomtom(mixed_pwms, mixed_pwms, n_nearest=n_nearest, n_jobs=1)
+	out_j = tomtom(mixed_pwms, mixed_pwms, n_nearest=n_nearest, n_jobs=n_jobs)
+	_assert_identical(out, out_j)
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2, 3, -1])
+def test_tomtom_n_jobs_restores_threads(mixed_pwms, n_jobs):
+	before = numba.get_num_threads()
+	tomtom(mixed_pwms[:3], mixed_pwms, n_jobs=n_jobs)
+	assert numba.get_num_threads() == before
+
+
+def test_tomtom_inputs_not_mutated(mixed_pwms):
+	Qs = [x.copy() for x in mixed_pwms[:5]]
+	Ts = [x.copy() for x in mixed_pwms]
+	Qs_list, Ts_list = list(Qs), list(Ts)
+
+	tomtom(Qs, Ts)
+	tomtom(Qs, Ts, reverse_complement=False, n_target_bins=None)
+
+	assert len(Qs) == 5 and len(Ts) == len(mixed_pwms)
+	for a, b in zip(Qs, mixed_pwms[:5]):
+		assert_array_equal(a, b)
+	for a, b in zip(Ts, mixed_pwms):
+		assert_array_equal(a, b)
+	assert all(a is b for a, b in zip(Qs, Qs_list))
+	assert all(a is b for a, b in zip(Ts, Ts_list))
+
+
+def test_tomtom_non_contiguous(mixed_pwms):
+	out = tomtom(mixed_pwms, mixed_pwms)
+
+	Qs = [numpy.asfortranarray(x) for x in mixed_pwms]
+	Ts = [numpy.repeat(x, 2, axis=1)[:, ::2] for x in mixed_pwms]
+	assert not Ts[0].flags['C_CONTIGUOUS'] or Ts[0].shape[1] == 1
+	_assert_identical(out, tomtom(Qs, Ts))
+
+	# Reversed views of reversed arrays are non-contiguous views of the
+	# original values.
+	rr = [numpy.ascontiguousarray(x[::-1, ::-1])[::-1, ::-1] 
+		for x in mixed_pwms]
+	_assert_identical(out, tomtom(rr, rr))
+
+
+def test_tomtom_float32(mixed_pwms):
+	# float32 inputs are not converted to float64, so the distances are 
+	# computed at lower precision and a few scores move by one bin. The
+	# results must stay valid and agree closely with float64.
+	out = tomtom(mixed_pwms, mixed_pwms)
+
+	Xs = [x.astype('float32') for x in mixed_pwms]
+	out32 = tomtom(Xs, Xs)
+
+	_assert_valid(out32, Xs, Xs)
+	assert numpy.abs(out[1] - out32[1]).max() <= 1
+	assert (out[1] != out32[1]).mean() < 0.05
+	assert_array_equal(out[0].argmin(axis=1), out32[0].argmin(axis=1))
+
+
+def test_tomtom_query_with_zero_column(mixed_pwms):
+	# A single all-zero column is allowed; only all-zero inputs are rejected.
+	Q = mixed_pwms[0].copy()
+	Q[:, 0] = 0
+	Q = numpy.concatenate([Q, mixed_pwms[1]], axis=-1)
+
+	out = tomtom([Q], mixed_pwms)
+	_assert_valid(out, [Q], mixed_pwms)
+
+
+@pytest.mark.parametrize("n_q", [1, 3])
+def test_tomtom_all_zero_raises(mixed_pwms, n_q):
+	zeros = numpy.zeros((4, 7))
+
+	assert_raises(ValueError, tomtom, [zeros]*n_q, mixed_pwms)
+	assert_raises(ValueError, tomtom, mixed_pwms, [zeros]*n_q)
+	assert_raises(ValueError, tomtom, mixed_pwms, [zeros]*n_q, 
+		reverse_complement=False)
+	assert_raises(ValueError, tomtom, [zeros], [zeros], n_target_bins=None)
+
+
+##
+
+
+def test_tomtom_reverse_complement_targets_untied():
+	# Reversing every target swaps the strands of the best alignment. Pairs
+	# whose forward and reverse best scores tie are resolved to strand 1 in
+	# both runs (see _merge_rc_results), so they are excluded.
+	pwms = generate_random_meme(n=20)
+	rc = [p[::-1, ::-1] for p in pwms]
+
+	out0 = tomtom(pwms, pwms)
+	out1 = tomtom(pwms, rc)
+
+	assert_array_equal(out0[0], out1[0])
+	assert_array_equal(out0[1], out1[1])
+
+	s_f = tomtom(pwms, pwms, reverse_complement=False)[1]
+	s_r = tomtom(pwms, rc, reverse_complement=False)[1]
+
+	untied = (out0[4] + out1[4]) == 1
+	assert untied.mean() > 0.9
+
+	for x0, x1 in zip(out0[2:4], out1[2:4]):
+		assert_array_equal(x0[untied], x1[untied])
+
+	# Where strands are tied, both runs report strand 1.
+	assert_array_equal(out0[4][~untied], 1)
+	assert_array_equal(out1[4][~untied], 1)
+
+
+def test_tomtom_self_is_best(mixed_pwms):
+	informative = [x for x in mixed_pwms if x.shape[-1] >= 6]
+	p, scores, offsets, overlaps, strands = tomtom(informative, informative)
+
+	n = len(informative)
+	assert_array_equal(p.argmin(axis=1), numpy.arange(n))
+	assert_array_equal(numpy.diag(offsets), numpy.zeros(n))
+	assert_array_equal(numpy.diag(overlaps), 
+		[x.shape[-1] for x in informative])
+	assert_array_equal(numpy.diag(strands), numpy.zeros(n))
+	assert numpy.all(numpy.diag(p) < 1e-4)
+
+	# A PWM's score against itself is the largest in its row.
+	assert_array_equal(scores.argmax(axis=1), numpy.arange(n))
+
+
+@pytest.mark.parametrize("j", range(12))
+def test_tomtom_substring_queries(j):
+	# Every substring of a target, and its reverse complement, is placed at
+	# the position it was cut from with the correct strand.
+	pwms = list(read_meme("tests/data/test.meme").values())
+	t = pwms[j]
+	L = t.shape[-1]
+
+	Qs, spans = [], []
+	for a in range(0, L-3):
+		for b in range(a+4, L+1):
+			Qs.append(t[:, a:b])
+			Qs.append(t[:, a:b][::-1, ::-1])
+			spans.append((a, b))
+
+	p, scores, offsets, overlaps, strands = tomtom(Qs, pwms)
+
+	for i, (a, b) in enumerate(spans):
+		f, r = 2*i, 2*i + 1
+
+		assert p[f].argmin() == j
+		assert offsets[f, j] == a
+		assert overlaps[f, j] == b - a
+		assert strands[f, j] == 0
+
+		assert p[r].argmin() == j
+		assert offsets[r, j] == L - b
+		assert overlaps[r, j] == b - a
+		assert strands[r, j] == 1
+
+
+def test_tomtom_substring_queries_no_rc():
+	pwms = list(read_meme("tests/data/test.meme").values())
+
+	for j, t in enumerate(pwms):
+		L = t.shape[-1]
+		Qs = [t[:, a:a+5] for a in range(L-4)]
+		p, scores, offsets, overlaps, strands = tomtom(Qs, pwms, 
+			reverse_complement=False)
+
+		assert_array_equal(p.argmin(axis=1), j)
+		assert_array_equal(offsets[:, j], numpy.arange(L-4))
+		assert_array_equal(overlaps[:, j], 5)
+		assert_array_equal(strands, 0)
+
+
+def test_tomtom_rc_matches_query_rc(mixed_pwms):
+	# Reverse complementing the targets under reverse_complement=False scores
+	# the same set of alignments as reverse complementing the queries, so the
+	# best scores match exactly and the p-values to round-off. Offsets and
+	# overlaps are not compared because equal-scoring alignments are broken
+	# in scan order, which differs between the two orientations.
+	Qs = mixed_pwms[:6]
+	Ts = mixed_pwms
+
+	out = tomtom(Qs, [T[::-1, ::-1] for T in Ts], reverse_complement=False,
+		n_target_bins=None)
+	out_q = tomtom([Q[::-1, ::-1] for Q in Qs], Ts, reverse_complement=False,
+		n_target_bins=None)
+
+	_assert_valid(out, Qs, Ts, reverse_complement=False)
+	assert_array_equal(out[1], out_q[1])
+	assert_array_almost_equal(out[0], out_q[0], 12)
+
+
+##
+
+
+# 255 and 400 push the histogram offset past the default n_cache and, at 400,
+# past the range of the old int8 `_gamma_int`.
+@pytest.mark.parametrize("n_score_bins", [10, 50, 100, 127, 150, 200, 255, 
+	400])
+def test_tomtom_n_score_bins(n_score_bins):
+	pwms = list(read_meme("tests/data/test.meme").values())
+	out = tomtom(pwms, pwms, n_score_bins=n_score_bins)
+
+	_assert_valid(out, pwms, pwms)
+	p, scores = out[:2]
+	assert_array_equal(p.argmin(axis=1), numpy.arange(12))
+	assert_array_equal(scores.argmax(axis=1), numpy.arange(12))
+
+	# Scores are sums of per-column bins, so they scale with the number of
+	# bins.
+	ref = tomtom(pwms, pwms)[1]
+	ratio = scores / ref
+	assert numpy.abs(numpy.median(ratio) - n_score_bins / 100.) < 0.1
+
+
+@pytest.mark.parametrize("n_median_bins", [10, 100, 1000, 5000])
+def test_tomtom_n_median_bins(n_median_bins):
+	pwms = list(read_meme("tests/data/test.meme").values())
+	out = tomtom(pwms, pwms, n_median_bins=n_median_bins)
+
+	_assert_valid(out, pwms, pwms)
+	assert_array_equal(out[0].argmin(axis=1), numpy.arange(12))
+
+	ref = tomtom(pwms, pwms, n_median_bins=5000)
+	if n_median_bins >= 1000:
+		assert numpy.abs(out[0] - ref[0]).max() < 0.05
+
+
+@pytest.mark.parametrize("n_target_bins", [None, 3, 5, 10, 100, 1000])
+def test_tomtom_n_target_bins(n_target_bins, mixed_pwms):
+	pwms = list(read_meme("tests/data/test.meme").values())
+	out = tomtom(pwms, pwms, n_target_bins=n_target_bins)
+
+	_assert_valid(out, pwms, pwms)
+	if n_target_bins is None or n_target_bins >= 10:
+		assert_array_equal(out[0].argmin(axis=1), numpy.arange(12))
+
+	out = tomtom(mixed_pwms, mixed_pwms, n_target_bins=n_target_bins)
+	_assert_valid(out, mixed_pwms, mixed_pwms)
+
+
+def test_tomtom_n_target_bins_2(mixed_pwms):
+	# Regression: with coarse hashing there are fewer unique target columns
+	# than the longest target, which overran `t_sums` in `_p_values`.
+	out = tomtom(mixed_pwms, mixed_pwms, n_target_bins=2)
+	_assert_valid(out, mixed_pwms, mixed_pwms)
+
+
+def test_p_values_fewer_unique_columns_than_target_length():
+	# Regression: `t_sums` was sized by the number of unique target columns,
+	# so a target longer than that overran it. The overrun corrupts the heap
+	# without changing the output, so it is only visible to a bounds-checked
+	# copy of the kernel.
+	_p_values_checked = numba.njit(boundscheck=True)(_p_values.py_func)
+
+	state = numpy.random.RandomState(0)
+	nq, offset, n_bins = 3, 2, 10
+	T_lens = numpy.array([12, 4], dtype='int64')
+	gamma_int = state.randint(-offset, n_bins - offset + 1, 
+		size=(2, nq)).astype('int16')
+	rr_inv = state.randint(0, 2, size=T_lens.sum()).astype('uint64')
+	B_cdfs = numpy.linspace(1, 0, nq*(n_bins+offset))[None].repeat(13, axis=0)
+	results = numpy.zeros((2, 5))
+
+	_p_values_checked(gamma_int, B_cdfs, rr_inv, T_lens, -1, nq, offset, 
+		results)
+
+	# The best score is the best sum along any alignment of the query.
+	start = 0
+	for i, nt in enumerate(T_lens):
+		cols = gamma_int[rr_inv[start:start+nt].astype(int)]
+		sums = numpy.full(nt+nq-1, nq*offset)
+		for k in range(nt):
+			sums[k:k+nq] += cols[k]
+
+		assert results[i, 1] == sums.max()
+		start += nt
+
+
+def test_tomtom_n_target_bins_many_equals_none():
+	# With a very fine hash every distinct column gets its own bin, so the
+	# hashed and unhashed paths score the same columns.
+	pwms = list(read_meme("tests/data/test.meme").values())
+	out0 = tomtom(pwms, pwms, n_target_bins=None)
+	out1 = tomtom(pwms, pwms, n_target_bins=100000)
+
+	for a, b in zip(out0[1:], out1[1:]):
+		assert_array_equal(a, b)
+	assert_array_almost_equal(out0[0], out1[0], 10)
+
+
+@pytest.mark.parametrize("n_cache", [100, 250, 500])
+def test_tomtom_n_cache(n_cache):
+	# n_cache only sizes the scratchpad, so it must not change the results.
+	pwms = list(read_meme("tests/data/test.meme").values())
+	_assert_identical(tomtom(pwms, pwms), tomtom(pwms, pwms, n_cache=n_cache))
+
+
+@pytest.mark.parametrize("n_cache", [0, 5, 20])
+def test_tomtom_n_cache_too_small(mixed_pwms, n_cache):
+	# Regression: an offset above n_cache used to overrun the workspace. Such
+	# queries now get their own workspace, so the results are unchanged.
+	_assert_identical(tomtom(mixed_pwms[:5], mixed_pwms), 
+		tomtom(mixed_pwms[:5], mixed_pwms, n_cache=n_cache))
+
+
+##
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_binned_median_random_counts(seed):
+	state = numpy.random.RandomState(seed)
+	n, n_bins = state.randint(5, 2000), 1000
+
+	X = state.randn(n)
+	counts = state.randint(1, 10, size=n)
+	bins = numpy.zeros((n_bins, 2), dtype='float64')
+
+	m = _binned_median(X, bins, X.min(), X.max(), counts)
+	expected = numpy.median(numpy.repeat(X, counts))
+
+	width = (X.max() - X.min()) / (n_bins - 1)
+	assert abs(m - expected) <= width
+	assert X.min() <= m <= X.max()
+
+
+@pytest.mark.parametrize("n_bins", [2, 10, 100, 10000])
+def test_binned_median_bin_count(n_bins):
+	X = numpy.random.RandomState(0).uniform(-5, 0, size=501)
+	counts = numpy.ones(len(X), dtype='int64')
+	bins = numpy.zeros((n_bins, 2), dtype='float64')
+
+	m = _binned_median(X, bins, X.min(), X.max(), counts)
+	width = (X.max() - X.min()) / (n_bins - 1)
+	assert abs(m - numpy.median(X)) <= width
+
+
+def test_binned_median_reuses_bins():
+	# Bins are cleared on every call, so dirty scratch space is harmless.
+	X = numpy.array([0, 4, 2, 1, 3], dtype='float64')
+	counts = numpy.ones(5, dtype='int64')
+	bins = numpy.full((5, 2), 1000.0)
+
+	assert _binned_median(X, bins, 0, 4, counts) == 2
+	assert _binned_median(X, bins, 0, 4, counts) == 2
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_pairwise_max_brute_force(seed):
+	state = numpy.random.RandomState(seed)
+	n = state.randint(1, 60)
+
+	x = state.dirichlet(numpy.ones(n) * 0.5)
+	y = state.dirichlet(numpy.ones(n) * 0.5)
+
+	expected = numpy.zeros(n)
+	for i in range(n):
+		for j in range(n):
+			expected[max(i, j)] += x[i] * y[j]
+
+	z = numpy.empty(n)
+	_pairwise_max(x, y, numpy.cumsum(y), z, n)
+	assert_array_almost_equal(z, expected, 12)
+	assert_array_almost_equal([z.sum()], [1.0], 12)
+
+
+def test_pairwise_max_in_place():
+	# `_p_value_backgrounds` passes the same array as `x` and `z`.
+	state = numpy.random.RandomState(0)
+	x = state.dirichlet(numpy.ones(20))
+	y = state.dirichlet(numpy.ones(20))
+
+	expected = numpy.empty(20)
+	_pairwise_max(x.copy(), y, numpy.cumsum(y), expected, 20)
+
+	_pairwise_max(x, y, numpy.cumsum(y), x, 20)
+	assert_array_almost_equal(x, expected, 12)
+
+
+def test_pairwise_max_partial_n():
+	x = numpy.random.RandomState(0).dirichlet(numpy.ones(10))
+	y = numpy.random.RandomState(1).dirichlet(numpy.ones(10))
+
+	z = numpy.full(10, -7.0)
+	_pairwise_max(x, y, numpy.cumsum(y), z, 6)
+
+	assert_array_equal(z[6:], -7.0)
+	assert_array_almost_equal(z[:6], (x * numpy.cumsum(y) + y * numpy.cumsum(x)
+		- x * y)[:6], 12)
+
+
+def test_merge_rc_results_ties():
+	# Equal scores resolve to the reverse strand.
+	results = numpy.array([
+		[0.1, 5, 1, 3, 0],
+		[0.2, 7, 2, 4, 0],
+		[0.3, 9, 3, 5, 0],
+		[0.4, 5, -1, 2, 0],
+		[0.5, 6, -2, 1, 0],
+		[0.1, 9, -3, 6, 0]
+	], dtype='float64')
+
+	_merge_rc_results(results)
+
+	assert_array_almost_equal(results[:3, 0], [1 - 0.9**2, 1 - 0.8**2, 
+		1 - 0.9**2], 12)
+	assert_array_equal(results[:3, 1], [5, 7, 9])
+	assert_array_equal(results[:3, 2], [-1, 2, -3])
+	assert_array_equal(results[:3, 3], [2, 4, 6])
+	assert_array_equal(results[:3, 4], [1, 0, 1])
+
+	# The reverse-strand half is left untouched.
+	assert_array_equal(results[3:, 1], [5, 6, 9])
+
+
+@pytest.mark.parametrize("nq", [1, 2, 3, 6])
+@pytest.mark.parametrize("t_max", [1, 3, 8])
+def test_p_value_backgrounds_survival(nq, t_max):
+	# B[t] is a survival function over integer scores for targets of length
+	# t: it starts near 1, never increases, and stays within [0, 1].
+	n_bins, n_cache, offset = 20, 20, 5
+	n_len = nq * n_bins + nq * n_cache
+
+	state = numpy.random.RandomState(nq * 10 + t_max)
+	f = numpy.zeros((nq, n_bins + 1))
+	f[:, 1:] = state.dirichlet(numpy.ones(n_bins), size=nq)
+
+	A = numpy.empty((nq, nq, n_len))
+	A_csum = numpy.empty((nq, nq, n_len))
+	B = numpy.empty((t_max + 1, n_len))
+
+	_p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, 
+		numpy.uint64(offset))
+
+	n = n_bins * nq + nq * offset
+	for t in range(1, t_max + 1):
+		assert numpy.all(B[t, :n] >= 0)
+		assert numpy.all(B[t, :n] <= 1)
+		assert numpy.all(numpy.diff(B[t, :n]) <= 1e-12)
+		assert B[t, 0] > 0.9
+
+	# Each single-column distribution sums to one.
+	for i in range(nq):
+		assert_array_almost_equal([A[i, i].sum()], [1.0], 12)
