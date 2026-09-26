@@ -572,6 +572,32 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	reverse_complement=1):
 	"""An internal function for calculating the best match and p-values.
 
+	Chooses the width of the running sums and calls `_p_values_sums`. Each
+	sum is nq * offset plus at most nq int16 values of `gamma`, so it lies in
+	[-nq * 32768, nq * (offset + 32767)]. When that fits in int32 the sums
+	are exact in int32, which halves the accumulation's vector width;
+	otherwise they are kept in int64.
+	"""
+
+	# Sized by the longest target, not by gamma, whose rows are the unique
+	# target columns and can be fewer than a target's length after hashing.
+	n_sums = T_lens.max() + nq - 1
+
+	if int64(nq) * (int64(offset) + 32768) <= 2147483647:
+		t_sums = numpy.empty(n_sums, dtype='int32')
+		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
+			results, reverse_complement, t_sums)
+	else:
+		t_sums64 = numpy.empty(n_sums, dtype='int64')
+		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
+			results, reverse_complement, t_sums64)
+
+
+@njit(cache=True)
+def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
+	reverse_complement, t_sums):
+	"""An internal function for calculating the best match and p-values.
+
 	This function will take in the integerized score matrix `gamma` and
 	background distributions `B_cdfs` and calculate the best overlap.
 	The best overlap is calculated as the best sum of scores across the
@@ -585,11 +611,6 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 
 	n = len(T_lens) // 2 if reverse_complement == 1 else len(T_lens)
 	total_offset = uint64(0)
-
-	# Sized by the longest target, not by gamma, whose rows are the unique
-	# target columns and can be fewer than a target's length after hashing.
-	max_nt = T_lens.max()
-	t_sums = numpy.empty(max_nt+nq-1, dtype='int64')
 
 	for i, nt in enumerate(T_lens):
 		nt = uint64(nt)
