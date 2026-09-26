@@ -186,6 +186,76 @@ def _pairwise_max_window(x, y, y_csum, z, L, H, copy):
 			z[i] = x[i] * y_csum[i] + y[i] * x_csum - x[i] * y[i]
 
 
+@njit(cache=True, inline='always')
+def _pairwise_max_support(x, y, y_csum, z, L, H, x_lo, x_hi, y_lo, y_hi, 
+	copy, inplace):
+	"""`_pairwise_max_window` using the nonzero supports of x and y.
+
+	Within [L, H), x is zero outside [x_lo, x_hi) and y outside [y_lo, y_hi),
+	and y's support is not empty. Then y_csum is zero below y_lo, the running
+	sum of x is zero below x_lo and constant from x_hi, and every term of
+	`x[i] * y_csum[i] + y[i] * x_csum - x[i] * y[i]` whose factor is zero is
+	exactly +0.0. So z is exactly zero below max(x_lo, y_lo) and above
+	max(x_hi, y_hi), equals `x[i] * y_csum[i]` where only x is nonzero and
+	`y[i] * x_csum` where only y is, and elsewhere is computed by the full
+	expression with the same running sum: skipped additions to it are all of
+	+0.0. z is written over all of [L, H), as `_pairwise_max_window` does, 
+	except that an in-place z (z is x) is already zero outside [x_lo, x_hi).
+	Returns the support of z.
+	"""
+
+	if copy:
+		for i in range(L, y_lo):
+			z[i] = 0.0
+		for i in range(y_lo, y_hi):
+			z[i] = y[i]
+		for i in range(y_hi, H):
+			z[i] = 0.0
+		return y_lo, y_hi
+
+	z_lo, z_hi = max(x_lo, y_lo), max(x_hi, y_hi)
+	m = min(x_hi, y_hi)
+
+	x_csum = 0.0
+	for i in range(x_lo, min(z_lo, x_hi)):
+		x_csum += x[i]
+
+	if inplace:
+		for i in range(x_lo, min(z_lo, x_hi)):
+			z[i] = 0.0
+	else:
+		for i in range(L, z_lo):
+			z[i] = 0.0
+		for i in range(z_hi, H):
+			z[i] = 0.0
+
+	for i in range(z_lo, m):
+		x_csum += x[i]
+		z[i] = x[i] * y_csum[i] + y[i] * x_csum - x[i] * y[i]
+
+	if x_hi > y_hi:
+		for i in range(max(y_hi, z_lo), x_hi):
+			z[i] = x[i] * y_csum[i]
+	else:
+		for i in range(max(x_hi, z_lo), y_hi):
+			z[i] = y[i] * x_csum
+
+	return z_lo, z_hi
+
+
+@njit(cache=True, inline='always')
+def _pm(x, A, A_csum, a, b, z, L, H, a_lo, a_hi, x_lo, x_hi, copy, inplace):
+	"""One step of the B build: z = max(x, A[a, b]) over [L, H), returning 
+	the support of z. x_lo and x_hi are x's support; unused when `copy`."""
+
+	if a_lo[a, b] < 0:
+		_pairwise_max_window(x, A[a, b], A_csum[a, b], z, L, H, copy)
+		return L, H
+
+	return _pairwise_max_support(x, A[a, b], A_csum[a, b], z, L, H, x_lo, 
+		x_hi, a_lo[a, b], a_hi[a, b], copy, inplace)
+
+
 @njit(cache=True)
 def _A_cumsum(A, A_csum, nq, n_bins, offset, n):
 	"""An internal function for the cumulative sums of the span backgrounds.
@@ -293,24 +363,21 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 	# those windows. The values dropped are exact zeros, so every value that
 	# is kept is computed by the same operations in the same order.
 	L, H = int64(n), int64(0)
+	a_lo = numpy.empty((nq, nq), dtype='int64')
+	a_hi = numpy.empty((nq, nq), dtype='int64')
 	for i in range(nq):
 		lo, hi, empty = int64(0), int64(0), False
 		for j in range(i, nq):
-			flo, fhi = 0, 0
-			for l in range(1, n_bins+1):
-				if f[j, l] != 0:
-					if flo == 0:
-						flo = l
-					fhi = l
-
-			if flo == 0:
+			if f_lo[j] > n_bins:
 				empty = True
 			if empty:
-				break
+				a_lo[i, j] = -1
+				continue
 
-			lo += flo
-			hi += fhi
+			lo += f_lo[j]
+			hi += f_hi[j]
 			c = int64(offset) * int64(nq - j + i - 1)
+			a_lo[i, j], a_hi[i, j] = lo + c, hi + c + 1
 			L = min(L, lo + c)
 			H = max(H, hi + c + 1)
 
@@ -319,37 +386,51 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 	if H <= L:
 		L, H = 0, 0
 
+	# A[a, b] is zero outside [a_lo, a_hi) (clipped to [L, H)), and a_lo is 
+	# -1 when the row is all zero; its A_csum is then not zero below the fill
+	# of 1, so it goes through the unrestricted `_pairwise_max_window` and 
+	# the result's support is taken to be all of [L, H).
+	for i in range(nq):
+		for j in range(i, nq):
+			if a_lo[i, j] >= 0:
+				a_hi[i, j] = min(a_hi[i, j], H)
+
 	# Rows below nq are rebuilt from A alone further down, so the first pass
 	# only matters as the start of the chain that builds rows nq..t_max.
-	if t_max >= nq:
+	if H > L and t_max >= nq:
+		b_lo, b_hi = L, H
 		if nq > 1:
-			_pairwise_max_window(B[0], A[0, 0], A_csum[0, 0], B[1], L, H, True)
-			_pairwise_max_window(B[1], A[nq-1, nq-1], A_csum[nq-1, nq-1], B[1],
-				L, H, False)
+			b_lo, b_hi = _pm(B[0], A, A_csum, 0, 0, B[1], L, H, a_lo, a_hi,
+				b_lo, b_hi, True, False)
+			b_lo, b_hi = _pm(B[1], A, A_csum, nq-1, nq-1, B[1], L, H, a_lo, 
+				a_hi, b_lo, b_hi, False, True)
 
 		for i in range(2, nq):
-			_pairwise_max_window(B[i-1], A[0, i-1], A_csum[0, i-1], B[i], L, 
-				H, False)
-			_pairwise_max_window(B[i], A[nq-i, nq-1], A_csum[nq-i, nq-1], 
-				B[i], L, H, False)
+			b_lo, b_hi = _pm(B[i-1], A, A_csum, 0, i-1, B[i], L, H, a_lo, 
+				a_hi, b_lo, b_hi, False, False)
+			b_lo, b_hi = _pm(B[i], A, A_csum, nq-i, nq-1, B[i], L, H, a_lo, 
+				a_hi, b_lo, b_hi, False, True)
 
 		for i in range(nq, t_max+1):
-			_pairwise_max_window(B[i-1], A[0, nq-1], A_csum[0, nq-1], B[i], L,
-				H, i == 1)
+			b_lo, b_hi = _pm(B[i-1], A, A_csum, 0, nq-1, B[i], L, H, a_lo, 
+				a_hi, b_lo, b_hi, i == 1, False)
 
 	for i in range(1, min(nq, t_max+1)):
+		if H <= L:
+			break
 		if needed is not None and not needed[i]:
 			continue
 
+		b_lo, b_hi = L, H
 		for j in range(nq - i + 1):
-			_pairwise_max_window(B[i], A[j, j+i-1], A_csum[j, j+i-1], B[i], L,
-				H, j == 0)
+			b_lo, b_hi = _pm(B[i], A, A_csum, j, j+i-1, B[i], L, H, a_lo, 
+				a_hi, b_lo, b_hi, j == 0, True)
 	
 		for j in range(i-1):
-			_pairwise_max_window(B[i], A[0, j], A_csum[0, j], B[i], L, H, 
-				False)
-			_pairwise_max_window(B[i], A[nq-1-j, nq-1], A_csum[nq-1-j, nq-1], 
-				B[i], L, H, False)
+			b_lo, b_hi = _pm(B[i], A, A_csum, 0, j, B[i], L, H, a_lo, a_hi,
+				b_lo, b_hi, False, True)
+			b_lo, b_hi = _pm(B[i], A, A_csum, nq-1-j, nq-1, B[i], L, H, a_lo,
+				a_hi, b_lo, b_hi, False, True)
 
 	# Row 0 is the all -1 starting point and is never a real distribution.
 	if needed is None or needed[0]:
