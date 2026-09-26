@@ -1039,7 +1039,9 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	n_len = Q_max*n_score_bins + Q_max*n_cache
 	
 	_gamma = numpy.empty((n_threads, nt, Q_max), dtype='float64')
-	_gamma_int = numpy.empty((n_threads, nt, Q_max), dtype='int16')
+	# Flat per thread; each query takes a (nt, nq) view, so a row holds only
+	# the nq columns that are written and read, and the rows are packed.
+	_gamma_int = numpy.empty((n_threads, nt*Q_max), dtype='int16')
 	_f = numpy.empty((n_threads, Q_max, n_score_bins+1), dtype='float64')
 
 	# A and A_csum are flat per thread; each query takes a contiguous
@@ -1059,8 +1061,9 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		nq = Q_lens[i]
 		pid = numba.get_thread_id()
 
+		gamma_int = _gamma_int[pid, :nt*nq].reshape((nt, nq))
 		offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
-			_gamma_int[pid], _f[pid], _medians[pid], _median_bins[pid], Q_norm, 
+			gamma_int, _f[pid], _medians[pid], _median_bins[pid], Q_norm, 
 			T_norm, rr_counts, Q_offsets[i], nq, n_score_bins)
 
 		# The backgrounds span nq*(n_score_bins+offset) bins. When the offset
@@ -1080,7 +1083,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, T_max, 
 			offset, needed)
 
-		_p_values(_gamma_int[pid], B, rr_inv, T_lens, -1, nq, offset, 
+		_p_values(gamma_int, B, rr_inv, T_lens, -1, nq, offset, 
 			_results[pid], reverse_complement)
 
 		# The full-matrix, two-strand case merges straight into the output.
