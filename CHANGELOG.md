@@ -26,6 +26,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     background workspace.
   - Integer scores are now held in `int16`/`int64` instead of `int8`/`int16`,
     which overflowed for large `n_score_bins` or long motifs.
+- `fimo` no longer scores single-column motifs against uninitialized memory.
+  `_pwm_to_mapping` computed the p-value table from a buffer that is only
+  filled for motifs with at least two columns.
+- `fimo(..., return_counts=True, reverse_complement=False)` no longer raises
+  `IndexError`; it added reverse-strand hits that are only there when reverse
+  complements are scanned.
+- `tomtom` with `n_nearest` larger than the number of targets now returns
+  every target instead of filling the surplus columns with uninitialized
+  memory. `n_nearest` is clipped to `len(Ts)`.
+- `symmetric_tomtom(..., reverse_complement=False)` no longer returns p=1,
+  score=0 for pairs it never scored. It skipped targets from the middle of the
+  list onward as if they were reverse complements.
+- `read_meme` no longer drops a motif when the file ends right after its last
+  matrix row, or when a `MOTIF` line directly follows the previous matrix.
+  It reads the width from the `w=` field, so `alength=4 w=2` (no space after
+  `=`) is parsed correctly, and `n_motifs=0` returns no motifs instead of all
+  of them.
+- `one_hot_encode` accepts a tuple alphabet, as documented, instead of raising
+  `TypeError`.
+- `characters` accepts torch tensors again; it raised `AttributeError` for
+  every tensor input.
+- The `ttl tomtom` command line: `-n` no longer raises "too many values to
+  unpack" and reports the right targets; with several queries of different
+  lengths each row's alignment is laid out with its own query's length; and a
+  target lying entirely inside the query is shown with every query column.
 
 ### Changed
 
@@ -40,8 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   p-value enumeration for short motifs, invariance and shape-grid tests for
   `tomtom` and `symmetric_tomtom`, CLI flag coverage, `read_meme` format
   robustness, and golden-output regression tests (`tests/test_golden.py`,
-  regenerated with `tests/generate_golden.py --force`). Known bugs that are
-  not yet fixed are covered by tests marked `skip` with the bug as the reason.
+  regenerated with `tests/generate_golden.py --force`). The bugs the new
+  tests found are fixed above.
 
 ## [0.4.0]
 
