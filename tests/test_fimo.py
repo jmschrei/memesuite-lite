@@ -581,11 +581,6 @@ NAMES = ['motif_name', 'motif_idx', 'sequence_name', 'start', 'end', 'strand',
 # `_pwm_to_mapping` never enters its dynamic programming loop for a single
 # column motif and returns an uninitialized `numpy.empty` buffer, so p-values
 # and cutoffs for length-1 motifs are garbage that changes from call to call.
-_SKIP_ONE = pytest.mark.skip(reason="BUG: _pwm_to_mapping returns "
-	"uninitialized memory for single-column PWMs")
-_ONE = pytest.param(1, marks=_SKIP_ONE)
-
-
 def _random_pwms(n, min_len, max_len, alpha=0.5, random_state=0):
 	"""Return a dict of `n` Dirichlet-sampled PWMs with random lengths."""
 
@@ -874,7 +869,7 @@ def test_fimo_reference_float32_motifs():
 ##
 
 
-@pytest.mark.parametrize("n", [_ONE, 2, 6, 11, 25])
+@pytest.mark.parametrize("n", [1, 2, 6, 11, 25])
 @pytest.mark.parametrize("reverse_complement", [True, False])
 def test_fimo_sequence_length_edges(n, reverse_complement):
 	# Sequences shorter than, equal to, and one longer than the motif. A short
@@ -899,7 +894,7 @@ def test_fimo_sequence_length_edges(n, reverse_complement):
 		assert numpy.all(hits[0]['end'].values <= length)
 
 
-@pytest.mark.parametrize("n", [_ONE, 4, 10, 20])
+@pytest.mark.parametrize("n", [1, 4, 10, 20])
 def test_fimo_last_window_forward(n):
 	# Regression test: the last window of a sequence used to be skipped, so a
 	# motif flush with the right end was never reported.
@@ -933,7 +928,7 @@ def test_fimo_last_window_forward(n):
 	assert hits['end'][0] == n
 
 
-@pytest.mark.parametrize("n", [_ONE, 4, 10, 20])
+@pytest.mark.parametrize("n", [1, 4, 10, 20])
 def test_fimo_last_window_reverse(n):
 	# The same regression on the reverse strand: the reverse complement of the
 	# consensus placed flush with the right end is reported on '-'.
@@ -957,7 +952,7 @@ def test_fimo_last_window_reverse(n):
 ##
 
 
-@pytest.mark.parametrize("L", [_ONE, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("L", [1, 2, 3, 4, 5, 6])
 @pytest.mark.parametrize("bin_size", [0.001, 0.01, 0.1, 0.5])
 def test_fimo_p_values_vs_enumeration(L, bin_size):
 	# Enumerate all 4^L sequences and compare each reported p-value to the
@@ -1016,7 +1011,7 @@ def test_fimo_p_values_bounded_and_monotone(threshold):
 ##
 
 
-@pytest.mark.parametrize("L", [_ONE, 2, 5, 14, 30])
+@pytest.mark.parametrize("L", [1, 2, 5, 14, 30])
 @pytest.mark.parametrize("bin_size", [0.01, 0.1, 1.0])
 @pytest.mark.parametrize("alpha", [0.1, 1.0, 10.0])
 def test_pwm_to_mapping_vs_reference(L, bin_size, alpha):
@@ -1137,10 +1132,7 @@ def test_fimo_row_order():
 
 
 @pytest.mark.parametrize("threshold", [1e-4, 1e-3, 0.05])
-@pytest.mark.parametrize("reverse_complement", [True, pytest.param(False,
-	marks=pytest.mark.skip(reason="BUG: return_counts=True with "
-	"reverse_complement=False indexes hits[i + n_] past the end of the list "
-	"and raises IndexError"))])
+@pytest.mark.parametrize("reverse_complement", [True, False])
 def test_fimo_return_counts_matches_rows(threshold, reverse_complement):
 	motifs = _random_pwms(12, 2, 20, random_state=21)
 	X = _random_sequences(10, 90, n_frac=0.05, random_state=22)
@@ -1422,7 +1414,6 @@ def test_fimo_invalid_motif_values():
 	assert_raises(ValueError, fimo, (1, 2), X)
 
 
-@_SKIP_ONE
 def test_pwm_to_mapping_single_column():
 	# A single column PWM has survival probabilities 1, 0.75, 0.5, 0.25 at its
 	# four scores and zero above them.
@@ -1444,7 +1435,6 @@ def test_pwm_to_mapping_single_column():
 	assert numpy.all(numpy.isinf(mapping[~nonzero]))
 
 
-@_SKIP_ONE
 def test_fimo_single_column_motif():
 	# The 'C' position of a single-column motif has p-value 0.25 and must be
 	# reported at threshold 0.3; no other position is.

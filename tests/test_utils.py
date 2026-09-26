@@ -604,8 +604,6 @@ def test_one_hot_encode_string_alphabet():
 		one_hot_encode(seq))
 
 
-@pytest.mark.skip(reason="BUG: one_hot_encode documents tuple alphabets but "
-	"raises TypeError because only lists are joined into a string")
 def test_one_hot_encode_tuple_alphabet():
 	seq = _random_sequence(50, 'ACGT', random_state=0)
 	assert numpy.array_equal(one_hot_encode(seq, alphabet=('A', 'C', 'G', 'T')),
@@ -725,10 +723,6 @@ def test_characters_raise_shapes(shape):
 ##
 
 
-@pytest.mark.skip(reason="BUG: characters computes the tie check before "
-	"converting a torch tensor to numpy; `tensor.max(axis=0, keepdims=True)` "
-	"returns a (values, indices) tuple, so the comparison yields a bool and "
-	"`.sum()` raises AttributeError for every tensor input.")
 def test_characters_torch():
 	torch = pytest.importorskip("torch")
 

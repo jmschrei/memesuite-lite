@@ -1,6 +1,7 @@
 # io.py
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
+import re
 import numpy
 
 
@@ -26,6 +27,10 @@ def read_meme(filename, n_motifs=None):
 
 	motifs = {}
 
+	# The limit is checked after each motif is added, which never stops at 0.
+	if n_motifs == 0:
+		return motifs
+
 	with open(filename, "r") as infile:
 		motif, width, i = None, None, 0
 
@@ -38,19 +43,21 @@ def read_meme(filename, n_motifs=None):
 
 			elif width is None:
 				if line[:6] == 'letter':
-					width = int(line.split()[5])
+					width = int(re.search(r'\bw=\s*(\d+)', line).group(1))
 					pwm = numpy.zeros((width, 4))
 
-			elif i < width:
+			else:
 				pwm[i] = list(map(float, line.strip("\r\n").split()))
 				i += 1
 
-			else:
-				motifs[motif] = pwm.T
-				motif, width, i = None, None, 0
+				# Stored as soon as the last row is read, rather than on the
+				# line after it, which may be the next MOTIF line or absent.
+				if i == width:
+					motifs[motif] = pwm.T
+					motif, width, i = None, None, 0
 
-				if n_motifs is not None and len(motifs) == n_motifs:
-					break
+					if n_motifs is not None and len(motifs) == n_motifs:
+						break
 
 	return motifs
 

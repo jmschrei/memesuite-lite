@@ -512,23 +512,17 @@ def test_read_meme_header_only(tmp_path):
 	assert _read_text(tmp_path, _HEADER) == {}
 
 
-@pytest.mark.skip(reason="BUG: read_meme drops the last motif when the file "
-	"ends right after its final matrix row")
 @pytest.mark.parametrize("trailing", ["", "\n"])
 def test_read_meme_ends_after_matrix(tmp_path, trailing):
 	text = _HEADER + _MOTIF_A + "\n" + _MOTIF_B.rstrip("\n") + trailing
 	_assert_ab(_read_text(tmp_path, text))
 
 
-@pytest.mark.skip(reason="BUG: read_meme consumes a MOTIF line that directly "
-	"follows the previous matrix as the terminator and drops that motif")
 def test_read_meme_no_separator(tmp_path):
 	text = _HEADER + _MOTIF_A + _MOTIF_B + "\n"
 	_assert_ab(_read_text(tmp_path, text))
 
 
-@pytest.mark.skip(reason="BUG: read_meme takes the width from the sixth "
-	"whitespace token, so 'alength=4 w=2' (no space after '=') is misparsed")
 def test_read_meme_lpm_no_spaces(tmp_path):
 	text = _MOTIF_A.replace("alength= 4 w= 2", "alength=4 w=2")
 	motifs = _read_text(tmp_path, _HEADER + text + "\n")
@@ -536,8 +530,6 @@ def test_read_meme_lpm_no_spaces(tmp_path):
 	assert numpy.array_equal(motifs['a'], _PWM_A)
 
 
-@pytest.mark.skip(reason="BUG: n_motifs=0 is checked only after a motif is "
-	"added, so it returns every motif instead of none")
 def test_read_meme_n_motifs_zero(tmp_path):
 	motifs = _read_text(tmp_path, _HEADER + _MOTIF_A + "\n" + _MOTIF_B + "\n",
 		n_motifs=0)

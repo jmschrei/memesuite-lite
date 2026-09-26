@@ -127,6 +127,10 @@ def _pwm_to_mapping(log_pwm, bin_size):
 		for j in range(largest - smallest + 1):
 			old_logpdf[j] = logpdf[j]
 
+	# `old_logpdf` holds the distribution over every column. `logpdf` is only
+	# written by the loop above, which does not run for a single-column PWM.
+	logpdf = old_logpdf
+
 	for i in range(len(logpdf) - 2, -1, -1):
 		logpdf[i] = logaddexp2(logpdf[i], logpdf[i + 1])
 
@@ -380,7 +384,10 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	if return_counts == True:
 		counts = numpy.zeros(n_, dtype='int32')
 		for i in range(n_):
-			counts[i] = len(hits[i]) + len(hits[i+n_])
+			counts[i] = len(hits[i])
+			if reverse_complement:
+				counts[i] += len(hits[i+n_])
+
 		return counts
 
 	for i in range(n_):

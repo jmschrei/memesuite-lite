@@ -561,10 +561,6 @@ def test_run_tomtom_aligned_middle_case(capsys):
 				assert c.isupper() == (c == c0)
 
 
-@pytest.mark.skip(reason="BUG: when the target lies strictly inside the "
-	"query (negative offset and offset + target length < query length) the "
-	"aligned middle is padded with dashes on the left only, e.g. query "
-	"GAACAGAATGTTC vs TEAD3_TEA_2 prints '---tgGAATGT' (11 of 13 columns).")
 def test_run_tomtom_aligned_middle_length(capsys):
 	_run_tomtom(_tomtom_namespace(query="GAACAGAATGTTC", thresh=0.5))
 
@@ -572,9 +568,6 @@ def test_run_tomtom_aligned_middle_length(capsys):
 		assert len(row["aligned_middle"]) == len("GAACAGAATGTTC")
 
 
-@pytest.mark.skip(reason="BUG: `_run_tomtom` always unpacks five outputs "
-	"from tomtom, but tomtom returns six when `n_nearest` is set, so -n "
-	"raises 'ValueError: too many values to unpack (expected 5)'.")
 def test_run_tomtom_n_nearest(capsys):
 	args = _tomtom_namespace(query=QUERIES, thresh=1.0, n_nearest=2)
 	_run_tomtom(args)
@@ -583,10 +576,6 @@ def test_run_tomtom_n_nearest(capsys):
 	assert len(rows) == 2 * len(read_meme(QUERIES))
 
 
-@pytest.mark.skip(reason="BUG: `_run_tomtom` sets `nq` from the first query "
-	"for every row, so in a multi-query file with different lengths the "
-	"aligned target sequence is formatted with the wrong query length (e.g. "
-	"the FOXL1 row in test2.meme drops the '.att' suffix).")
 def test_run_tomtom_multi_query_display(tmp_path, capsys):
 	# Each row of a multi-query run must be displayed exactly as in a
 	# single-query run of that query.

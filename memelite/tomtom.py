@@ -218,7 +218,8 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 			
 
 @njit(cache=True)
-def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results):
+def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
+	reverse_complement=1):
 	"""An internal function for calculating the best match and p-values.
 
 	This function will take in the integerized score matrix `gamma` and
@@ -227,9 +228,12 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results):
 	alignment, minus a penalty for each unaligned column. After finding
 	a new best overlap, the p-value is calculated by comparing the
 	score to the background distribution.
+
+	Targets 0..iq are skipped, and so are their reverse complements, which
+	start at len(T_lens) // 2 only when `reverse_complement` is 1.
 	"""
 
-	n = len(T_lens) // 2
+	n = len(T_lens) // 2 if reverse_complement == 1 else len(T_lens)
 	total_offset = uint64(0)
 
 	# Sized by the longest target, not by gamma, whose rows are the unique
@@ -357,7 +361,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			offset)
 
 		_p_values(_gamma_int[pid], B, rr_inv, T_lens, -1, nq, offset, 
-			_results[pid])
+			_results[pid], reverse_complement)
 
 		if reverse_complement == 1:
 			_merge_rc_results(_results[pid])
@@ -410,7 +414,8 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		The number of nearest targets to keep for each query, where nearness is
 		defined by the p-value. Setting this can significant reduce memory
 		because, otherwise, you get a len(Qs) by len(Ts) complete matrix. If
-		None, return the complete matrix. Default is None.
+		None, return the complete matrix. Values larger than len(Ts) are
+		clipped to len(Ts). Default is None.
 
 	n_score_bins: int, optional
 		The number of bins to use when discretizing scores. A higher number is 
@@ -483,8 +488,12 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	else:
 		n_jobs = _n_jobs = numba.get_num_threads()
 
+	# Asking for more neighbors than there are targets returns every target;
+	# the surplus columns would otherwise be left uninitialized.
 	if n_nearest is None:
 		n_nearest = -1
+	else:
+		n_nearest = min(n_nearest, len(Ts))
 
 	if not isinstance(Qs[0], numpy.ndarray):
 		Qs = [Q.numpy() for Q in Qs]

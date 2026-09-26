@@ -168,7 +168,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			offset)
 
 		_p_values(_gamma_int[pid], B, rr_inv, T_lens, i, nq, offset, 
-			_results[pid])
+			_results[pid], reverse_complement)
 
 		if reverse_complement == 1:
 			_merge_rc_results(_results[pid])

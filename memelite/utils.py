@@ -52,14 +52,17 @@ def characters(pwm, alphabet=['A', 'C', 'G', 'T'], force=False, allow_N=False):
 		raise ValueError("PWM must have the same alphabet size as the " +
 			"provided alphabet.")
 
+	# Before the tie check, whose `max(axis=0, keepdims=True)` returns a
+	# (values, indices) tuple for a torch tensor.
+	if not isinstance(pwm, numpy.ndarray):
+		pwm = pwm.numpy(force=True)
+
 	pwm_ismax = pwm == pwm.max(axis=0, keepdims=True)
 	if pwm_ismax.sum(axis=0).max() > 1 and force == False and allow_N == False:
 		raise ValueError("At least one position in the PWM has multiple " +
 			"letters with the same probability.")
 
 	alphabet = numpy.array(alphabet)
-	if not isinstance(pwm, numpy.ndarray):
-		pwm = pwm.numpy(force=True)
 
 	if allow_N:
 		n_inds = numpy.where(pwm.sum(axis=0) == 0)[0]
@@ -137,7 +140,7 @@ def one_hot_encode(sequence, alphabet=['A', 'C', 'G', 'T'], dtype=numpy.int8,
 			raise ValueError("Character {} in the alphabet ".format(char) + 
 				"and also in the list of ignored characters.")
 
-	if isinstance(alphabet, list):
+	if isinstance(alphabet, (list, tuple)):
 		alphabet = ''.join(alphabet)
 
 	ignore = ''.join(ignore)
