@@ -151,12 +151,16 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 	"""
 
 	n = n_bins*nq + nq*offset
-	A[:] = 0
 	
 	for i in range(nq):
 		i = uint64(i)
 		for j in range(i, nq):
 			j, c = uint64(j), uint64(offset * (nq - j + i - 1))
+
+			# Only A[i, j, :n] with i <= j is ever read (here, by the
+			# convolution for j+1, and by `_pairwise_max` below), so clear
+			# only that rather than the whole Q_max x Q_max x n_len workspace.
+			A[i, j, :n] = 0
 			
 			if i == j:
 				for l in range(1, n_bins+1):
