@@ -103,9 +103,108 @@ def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 	return -99999
 
 
+@njit(cache=True, inline='always')
+def _column_distances(X, c, Y, Y_norm, xn, g_row, x2, mxb, mnb, zb, 
+	median_bins, Y_counts, halfway):
+	"""One query column's distance row, its min and max, and its median.
+
+	Writes -sqrt(distance) between query column `c` of `X` and every column
+	of `Y` into `g_row` and returns (min, max, binned median) of that row.
+	Everything depends only on the column's values and the targets, so a
+	column that occurs more than once gives the same row and scalars.
+
+	The distance terms are subtracted in the same order as before; `2 * X` is
+	hoisted, which is the same product. The min/max pass is separate so the
+	distance loop vectorizes. It runs as 64 lanes through numpy.maximum/
+	minimum, which compile to packed code where a serial max/min chain
+	cannot. Every g value is -sqrt(z) with z > 0 or +0.0: never NaN and never
+	-0.0, so max and min give the same bits in any order.
+	"""
+
+	n_a, n_y = Y.shape[0], Y.shape[-1]
+	z_min_, z_max_ = 9999999.9, -9999999.9
+
+	if n_a == 4:
+		x0 = 2 * X[0, c]
+		x1 = 2 * X[1, c]
+		x2_ = 2 * X[2, c]
+		x3 = 2 * X[3, c]
+		for j in range(n_y):
+			z = xn + Y_norm[j]
+			z -= x0 * Y[0, j]
+			z -= x1 * Y[1, j]
+			z -= x2_ * Y[2, j]
+			z -= x3 * Y[3, j]
+			g_row[j] = -math.sqrt(z) if z > 0 else 0
+	else:
+		for k in range(n_a):
+			x2[k] = 2 * X[k, c]
+		for j in range(n_y):
+			z = xn + Y_norm[j]
+			for k in range(n_a):
+				z -= x2[k] * Y[k, j]
+			g_row[j] = -math.sqrt(z) if z > 0 else 0
+
+	nb = n_y - n_y % 64
+	if nb > 0:
+		mxb[:] = g_row[:64]
+		mnb[:] = g_row[:64]
+		for j in range(64, nb, 64):
+			numpy.maximum(mxb, g_row[j:j+64], mxb)
+			numpy.minimum(mnb, g_row[j:j+64], mnb)
+		for u in range(64):
+			z_max_ = max(z_max_, mxb[u])
+			z_min_ = min(z_min_, mnb[u])
+	for j in range(nb, n_y):
+		z = g_row[j]
+		z_max_ = max(z_max_, z)
+		z_min_ = min(z_min_, z)
+
+	m = _binned_median_z(g_row, median_bins, z_min_, z_max_, Y_counts,
+		zb, halfway)
+	return z_min_, z_max_, m
+
+
+@njit(cache=True)
+def _halfway(Y_counts):
+	halfway = 0
+	for j in range(len(Y_counts)):
+		halfway += Y_counts[j]
+	return halfway / 2
+
+
+@njit(cache=True)
+def _fill_column_cache(X, Y, X_norm, Y_norm, Y_counts, cols, G_cache, 
+	S_cache, n_median_bins):
+	"""Distance rows and (min, max, median) for the columns in `cols`.
+
+	Row s of `G_cache` and `S_cache` hold column `cols[s]`'s results from
+	`_column_distances`, the same function the per-query path runs, so a
+	query can read them in place of recomputing its own. Filled once, before
+	the parallel loop, and only read afterwards.
+	"""
+
+	n_a, n_y = Y.shape[0], Y.shape[-1]
+	x2 = numpy.empty(n_a, dtype=numpy.float64)
+	zb = numpy.empty(n_y, dtype=numpy.int32)
+	mxb = numpy.empty(64, dtype=numpy.float64)
+	mnb = numpy.empty(64, dtype=numpy.float64)
+	median_bins = numpy.empty((n_median_bins, 2), dtype=numpy.float64)
+	halfway = _halfway(Y_counts)
+
+	for s in range(len(cols)):
+		c = cols[s]
+		z_min_, z_max_, m = _column_distances(X, c, Y, Y_norm, X_norm[c], 
+			G_cache[s], x2, mxb, mnb, zb, median_bins, Y_counts, halfway)
+		S_cache[s, 0] = z_min_
+		S_cache[s, 1] = z_max_
+		S_cache[s, 2] = m
+
+
 @njit(cache=True)
 def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians, 
-	median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins):
+	median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins, q_slot=None,
+	G_cache=None, S_cache=None):
 	"""An internal function for integerized scores and the histogram.
 
 	This function is the main workhorse for the TOMTOM algorithm. It contains
@@ -118,6 +217,11 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	minimum and maximum values for each query column for re-use in the median
 	calculation, the binned median approximation, and calculating the histogram
 	simultaneously with the binned score matrix. 
+
+	When `q_slot` is given, a query column c with q_slot[c] >= 0 takes its
+	distance row, min, max and median from row q_slot[c] of `G_cache` and
+	`S_cache` (see `_fill_column_cache`) instead of computing them. Those are
+	the values the computation would give, bit for bit.
 	"""
 	
 	# `gamma` is private scratch, so its buffer is used as (n_rows, n_y): each
@@ -128,64 +232,24 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	zb = numpy.empty(n_y, dtype=numpy.int32)
 	mxb = numpy.empty(64, dtype=numpy.float64)
 	mnb = numpy.empty(64, dtype=numpy.float64)
-	halfway = 0
-	for j in range(n_y):
-		halfway += Y_counts[j]
-	halfway /= 2
+	halfway = _halfway(Y_counts)
 
-	# Calculate the Euclidean distance between query and targets. The terms are
-	# subtracted in the same order as before; `2 * X` is hoisted, which is the
-	# same product. The min/max pass is separate so the distance loop
-	# vectorizes. It runs as 64 lanes through numpy.maximum/minimum, which
-	# compile to packed code where a serial max/min chain cannot. Every g value
-	# is -sqrt(z) with z > 0 or +0.0: never NaN and never -0.0, so max and min
-	# give the same bits in any order.
 	z_min, z_max = 9999999.9, -9999999.9
 	for i in range(nq):
-		z_min_, z_max_ = 9999999.9, -9999999.9
-		xn = X_norm[i + nq_csum]
+		c = i + nq_csum
+		slot = -1
+		if q_slot is not None:
+			slot = q_slot[c]
 
-		if n_a == 4:
-			x0 = 2 * X[0, i + nq_csum]
-			x1 = 2 * X[1, i + nq_csum]
-			x2_ = 2 * X[2, i + nq_csum]
-			x3 = 2 * X[3, i + nq_csum]
-			for j in range(n_y):
-				z = xn + Y_norm[j]
-				z -= x0 * Y[0, j]
-				z -= x1 * Y[1, j]
-				z -= x2_ * Y[2, j]
-				z -= x3 * Y[3, j]
-				g[i, j] = -math.sqrt(z) if z > 0 else 0
+		if slot >= 0:
+			z_min_ = S_cache[slot, 0]
+			z_max_ = S_cache[slot, 1]
+			m = S_cache[slot, 2]
 		else:
-			for k in range(n_a):
-				x2[k] = 2 * X[k, i + nq_csum]
-			for j in range(n_y):
-				z = xn + Y_norm[j]
-				for k in range(n_a):
-					z -= x2[k] * Y[k, j]
-				g[i, j] = -math.sqrt(z) if z > 0 else 0
-
-		nb = n_y - n_y % 64
-		if nb > 0:
-			mxb[:] = g[i, :64]
-			mnb[:] = g[i, :64]
-			for j in range(64, nb, 64):
-				numpy.maximum(mxb, g[i, j:j+64], mxb)
-				numpy.minimum(mnb, g[i, j:j+64], mnb)
-			for u in range(64):
-				z_max_ = max(z_max_, mxb[u])
-				z_min_ = min(z_min_, mnb[u])
-		for j in range(nb, n_y):
-			z = g[i, j]
-			z_max_ = max(z_max_, z)
-			z_min_ = min(z_min_, z)
+			z_min_, z_max_, m = _column_distances(X, c, Y, Y_norm, X_norm[c], 
+				g[i], x2, mxb, mnb, zb, median_bins, Y_counts, halfway)
 		
-		# Subtract out the median from each row
-		m = _binned_median_z(g[i], median_bins, z_min_, z_max_, Y_counts,
-			zb, halfway)
 		medians[i] = m
-
 		z_min = min(z_min, z_min_ - m)
 		z_max = max(z_max, z_max_ - m)
 			
@@ -211,8 +275,14 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	for i in range(nq):
 		k = nq - i - 1
 		mi = medians[i]
+		row = g[i]
+		if q_slot is not None:
+			slot = q_slot[i + nq_csum]
+			if slot >= 0:
+				row = G_cache[slot]
+
 		for j in range(n_y):
-			zb[j] = math.floor((g[i, j] - mi) * bin_scale + 0.5)
+			zb[j] = math.floor((row[j] - mi) * bin_scale + 0.5)
 
 		for j in range(n_y):
 			x = zb[j]
@@ -1009,7 +1079,8 @@ def _merge_rc_results_into(results, out):
 
 @njit(parallel=True, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
-	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement):
+	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement,
+	q_slot, q_cached):
 	"""An internal function implementing the TOMTOM algorithm.
 
 	This internal function is necessary to handle the numba component of the
@@ -1057,6 +1128,13 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	results = numpy.empty((len(Q_lens), n_out_targets, n_outputs), 
 		dtype='float64') 
 
+	# Query columns that occur more than once have their distance row, min,
+	# max and median computed once here; every query reads them from these.
+	G_cache = numpy.empty((len(q_cached), nt), dtype='float64')
+	S_cache = numpy.empty((len(q_cached), 3), dtype='float64')
+	_fill_column_cache(Q, T, Q_norm, T_norm, rr_counts, q_cached, G_cache,
+		S_cache, n_median_bins)
+
 	for i in prange(len(Q_lens)):
 		nq = Q_lens[i]
 		pid = numba.get_thread_id()
@@ -1064,7 +1142,8 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		gamma_int = _gamma_int[pid, :nt*nq].reshape((nt, nq))
 		offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
 			gamma_int, _f[pid], _medians[pid], _median_bins[pid], Q_norm, 
-			T_norm, rr_counts, Q_offsets[i], nq, n_score_bins)
+			T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, q_slot, G_cache,
+			S_cache)
 
 		# The backgrounds span nq*(n_score_bins+offset) bins. When the offset
 		# exceeds `n_cache` this can overrun the shared workspace, so allocate
@@ -1259,11 +1338,28 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		rr_inv = numpy.arange(T.shape[-1])
 		rr_counts = numpy.ones_like(rr_inv)
 	
-	###
-	
+	# Query columns with identical bytes give identical distance rows, minima,
+	# maxima and medians, so a column that occurs more than once has those
+	# computed once (`_fill_column_cache`). The cache holds one float64 row of
+	# T.shape[-1] per column, so it is capped at 32 MB, filled with the most
+	# frequent columns first. `q_cached` lists the first occurrence of each
+	# cached column and q_slot[c] is column c's row in the cache, or -1.
+	Qc = numpy.ascontiguousarray(Q.T)
+	Qv = Qc.view(numpy.dtype((numpy.void, Qc.dtype.itemsize * Qc.shape[1])))
+	_, q_first, q_inv, q_counts = numpy.unique(Qv.ravel(), return_index=True,
+		return_inverse=True, return_counts=True)
+	q_inv = q_inv.ravel()
+	n_slots = max(1, 2 ** 25 // (8 * T.shape[-1]))
+	shared = numpy.argsort(-q_counts, kind='stable')[:n_slots]
+	shared = shared[q_counts[shared] > 1]
+	unique_slot = numpy.full(len(q_counts), -1, dtype='int64')
+	unique_slot[shared] = numpy.arange(len(shared))
+	q_slot = unique_slot[q_inv]
+	q_cached = q_first[shared].astype('int64')
+
 	results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, 
 		n_nearest, n_score_bins, n_median_bins, n_cache, n_jobs, 
-		int(reverse_complement))
+		int(reverse_complement), q_slot, q_cached)
 
 	if n_jobs != -1:
 		numba.set_num_threads(_n_jobs)
