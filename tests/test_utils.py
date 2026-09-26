@@ -723,10 +723,6 @@ def test_characters_raise_shapes(shape):
 ##
 
 
-@pytest.mark.skip(reason="BUG: characters computes the tie check before "
-	"converting a torch tensor to numpy; `tensor.max(axis=0, keepdims=True)` "
-	"returns a (values, indices) tuple, so the comparison yields a bool and "
-	"`.sum()` raises AttributeError for every tensor input.")
 def test_characters_torch():
 	torch = pytest.importorskip("torch")
 
