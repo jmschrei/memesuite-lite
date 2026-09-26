@@ -76,8 +76,10 @@ def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 
 	cnt = bins.reshape(-1).view(numpy.int64)[:n_bins]
 	cnt[:] = 0
+	# Every index lies in [0, n_bins), so an unsigned index is the same bin
+	# and drops numba's negative-index wraparound from the scatter.
 	for i in range(n):
-		cnt[zb[i]] += counts[i]
+		cnt[uint64(zb[i])] += counts[i]
 
 	count = 0
 	for b in range(n_bins):
@@ -202,9 +204,30 @@ def _fill_column_cache(X, Y, X_norm, Y_norm, Y_counts, cols, G_cache,
 
 
 @njit(cache=True)
+def _binned_load(h_int, h_f, gamma_int, f_row, k):
+	"""Copy a cached `gamma_int` column and `f` row into this query's."""
+
+	for j in range(len(h_int)):
+		gamma_int[j, k] = h_int[j]
+	for x in range(len(h_f)):
+		f_row[x] = h_f[x]
+
+
+@njit(cache=True)
+def _binned_save(h_int, h_f, gamma_int, f_row, k):
+	"""Save a `gamma_int` column and `f` row into the cache."""
+
+	for j in range(len(h_int)):
+		h_int[j] = gamma_int[j, k]
+	for x in range(len(h_f)):
+		h_f[x] = f_row[x]
+
+
+@njit(cache=True)
 def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians, 
 	median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins, q_slot=None,
-	G_cache=None, S_cache=None):
+	G_cache=None, S_cache=None, H_keys=None, H_filled=None, H_int=None,
+	H_f=None):
 	"""An internal function for integerized scores and the histogram.
 
 	This function is the main workhorse for the TOMTOM algorithm. It contains
@@ -222,6 +245,14 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	distance row, min, max and median from row q_slot[c] of `G_cache` and
 	`S_cache` (see `_fill_column_cache`) instead of computing them. Those are
 	the values the computation would give, bit for bit.
+
+	When `H_keys` is also given, the binned stage of the cached columns with
+	slot < H_int.shape[1] is cached too. A column's `gamma_int` column and
+	`f` row depend only on its slot and the query's (i_min, bin_scale), which
+	also fix `offset`. H_keys[0, 0] counts the (i_min, bin_scale) classes
+	seen, stored in H_keys[1:]. The first query of a class to reach a slot
+	computes both as usual and saves them to H_int[h, slot] and H_f[h, slot];
+	later ones copy them. The arrays belong to one thread.
 	"""
 	
 	# `gamma` is private scratch, so its buffer is used as (n_rows, n_y): each
@@ -267,6 +298,20 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	for j in range(n_y):
 		w[j] = Y_counts[j] / ys
 
+	# The (i_min, bin_scale) class of this query in the binned-stage cache.
+	h = -1
+	if H_keys is not None:
+		n_h = H_keys[0, 0]
+		for u in range(n_h):
+			if H_keys[u+1, 0] == i_min and H_keys[u+1, 1] == bin_scale:
+				h = u
+				break
+		if h == -1 and n_h < H_keys.shape[0] - 1:
+			h = n_h
+			H_keys[h+1, 0] = i_min
+			H_keys[h+1, 1] = bin_scale
+			H_keys[0, 0] = n_h + 1
+
 	# Convert the distances to bins and record the histogram of counts. The
 	# bin indices are computed in their own loop, which vectorizes, and the
 	# scatter-add then runs in the original order. Every index lies in
@@ -281,6 +326,14 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 			if slot >= 0:
 				row = G_cache[slot]
 
+		hs = -1
+		if H_keys is not None:
+			if h >= 0 and slot >= 0 and slot < H_int.shape[1]:
+				hs = slot
+				if H_filled[h, hs]:
+					_binned_load(H_int[h, hs], H_f[h, hs], gamma_int, f[i], k)
+					continue
+
 		for j in range(n_y):
 			zb[j] = math.floor((row[j] - mi) * bin_scale + 0.5)
 
@@ -288,6 +341,10 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 			x = zb[j]
 			gamma_int[j, k] = x - offset
 			f[i, uint64(x)] += w[j]
+
+		if hs >= 0:
+			_binned_save(H_int[h, hs], H_f[h, hs], gamma_int, f[i], k)
+			H_filled[h, hs] = True
 
 	return uint64(offset)
 
@@ -867,11 +924,11 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	if int64(nq) * (int64(offset) + 32768) <= 2147483647:
 		t_sums = numpy.empty(n_sums, dtype='int32')
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
-			results, reverse_complement, t_sums)
+			results, reverse_complement, t_sums, True)
 	else:
 		t_sums64 = numpy.empty(n_sums, dtype='int64')
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
-			results, reverse_complement, t_sums64)
+			results, reverse_complement, t_sums64, None)
 
 
 @njit(cache=True)
@@ -929,7 +986,7 @@ def _sums_window(t_sums, gamma, rr_inv, start, nt, W):
 
 @njit(cache=True)
 def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
-	reverse_complement, t_sums):
+	reverse_complement, t_sums, literal):
 	"""An internal function for calculating the best match and p-values.
 
 	This function will take in the integerized score matrix `gamma` and
@@ -941,6 +998,10 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 
 	Targets 0..iq are skipped, and so are their reverse complements, which
 	start at len(T_lens) // 2 only when `reverse_complement` is 1.
+
+	`literal` is True to use the kernels compiled for a literal width, and
+	None for the generic loop. numba prunes a branch on `is None` at compile
+	time, so the int64 sums, which pass None, compile none of those kernels.
 	"""
 
 	n = len(T_lens) // 2 if reverse_complement == 1 else len(T_lens)
@@ -955,9 +1016,20 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 			total_offset += nt
 			continue
 
-		# Narrow queries use kernels compiled for their literal width, which
-		# have no per-row loop setup. Each t_sums entry gets the same terms.
-		if nq <= 6:
+		# Queries up to width 16 use kernels compiled for their literal width,
+		# which have no per-row loop setup. Each t_sums entry gets the same
+		# terms.
+		if literal is None:
+			for k in range(nt+nq-1):
+				k = uint64(k)
+				t_sums[k] = nq * offset
+			for k in range(nt):
+				k = uint64(k)
+				k_idx = uint64(rr_inv[total_offset + k])
+				for l in range(nq):
+					l = uint64(l)
+					t_sums[k+l] += gamma[k_idx, l]
+		elif nq <= 6:
 			t_sums[0] = nq * offset
 			if nq == 1:
 				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 1)
@@ -984,6 +1056,18 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 9)
 			elif nq == 10:
 				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 10)
+			elif nq == 11:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 11)
+			elif nq == 12:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 12)
+			elif nq == 13:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 13)
+			elif nq == 14:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 14)
+			elif nq == 15:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 15)
+			elif nq == 16:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 16)
 			else:
 				for k in range(nt):
 					k = uint64(k)
@@ -1135,6 +1219,19 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	_fill_column_cache(Q, T, Q_norm, T_norm, rr_counts, q_cached, G_cache,
 		S_cache, n_median_bins)
 
+	# The binned stage (`gamma_int` column and `f` row) of the most frequent
+	# cached columns, per (i_min, bin_scale) class, filled as queries reach
+	# them. One copy per thread, so nothing is shared under prange; at most
+	# 8 classes and the 4 most frequent columns; the sweep in iteration 65
+	# found 4, 16 and 53 columns equally fast.
+	n_h = 8
+	h_row = 2 * nt + 8 * (n_score_bins + 1)
+	n_hs = min(len(q_cached), 4, 2 ** 24 // (n_threads * n_h * h_row))
+	_H_keys = numpy.zeros((n_threads, n_h+1, 2), dtype='int64')
+	_H_filled = numpy.zeros((n_threads, n_h, n_hs), dtype=numpy.bool_)
+	_H_int = numpy.empty((n_threads, n_h, n_hs, nt), dtype='int16')
+	_H_f = numpy.empty((n_threads, n_h, n_hs, n_score_bins+1), dtype='float64')
+
 	# Queries are visited in increasing width, so consecutive iterations
 	# share kernel branches and workspace shapes. prange hands each thread a
 	# contiguous block, so the sorted queries are dealt round-robin into
@@ -1160,7 +1257,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
 			gamma_int, _f[pid], _medians[pid], _median_bins[pid], Q_norm, 
 			T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, q_slot, G_cache,
-			S_cache)
+			S_cache, _H_keys[pid], _H_filled[pid], _H_int[pid], _H_f[pid])
 
 		# The backgrounds span nq*(n_score_bins+offset) bins. When the offset
 		# exceeds `n_cache` this can overrun the shared workspace, so allocate
