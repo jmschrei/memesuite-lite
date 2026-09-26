@@ -41,16 +41,18 @@ def read_meme(filename, n_motifs=None):
 					width = int(line.split()[5])
 					pwm = numpy.zeros((width, 4))
 
-			elif i < width:
+			else:
 				pwm[i] = list(map(float, line.strip("\r\n").split()))
 				i += 1
 
-			else:
-				motifs[motif] = pwm.T
-				motif, width, i = None, None, 0
+				# Stored as soon as the last row is read, rather than on the
+				# line after it, which may be the next MOTIF line or absent.
+				if i == width:
+					motifs[motif] = pwm.T
+					motif, width, i = None, None, 0
 
-				if n_motifs is not None and len(motifs) == n_motifs:
-					break
+					if n_motifs is not None and len(motifs) == n_motifs:
+						break
 
 	return motifs
 

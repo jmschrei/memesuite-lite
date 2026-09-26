@@ -512,16 +512,12 @@ def test_read_meme_header_only(tmp_path):
 	assert _read_text(tmp_path, _HEADER) == {}
 
 
-@pytest.mark.skip(reason="BUG: read_meme drops the last motif when the file "
-	"ends right after its final matrix row")
 @pytest.mark.parametrize("trailing", ["", "\n"])
 def test_read_meme_ends_after_matrix(tmp_path, trailing):
 	text = _HEADER + _MOTIF_A + "\n" + _MOTIF_B.rstrip("\n") + trailing
 	_assert_ab(_read_text(tmp_path, text))
 
 
-@pytest.mark.skip(reason="BUG: read_meme consumes a MOTIF line that directly "
-	"follows the previous matrix as the terminator and drops that motif")
 def test_read_meme_no_separator(tmp_path):
 	text = _HEADER + _MOTIF_A + _MOTIF_B + "\n"
 	_assert_ab(_read_text(tmp_path, text))
