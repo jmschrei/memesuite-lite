@@ -105,6 +105,8 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	g = gamma.reshape((gamma.shape[1], gamma.shape[0]))
 	x2 = numpy.empty(n_a, dtype=numpy.float64)
 	zb = numpy.empty(n_y, dtype=numpy.int32)
+	mxb = numpy.empty(64, dtype=numpy.float64)
+	mnb = numpy.empty(64, dtype=numpy.float64)
 	halfway = 0
 	for j in range(n_y):
 		halfway += Y_counts[j]
@@ -113,7 +115,10 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	# Calculate the Euclidean distance between query and targets. The terms are
 	# subtracted in the same order as before; `2 * X` is hoisted, which is the
 	# same product. The min/max pass is separate so the distance loop
-	# vectorizes; min/max visit the same values in the same order.
+	# vectorizes. It runs as 64 lanes through numpy.maximum/minimum, which
+	# compile to packed code where a serial max/min chain cannot. Every g value
+	# is -sqrt(z) with z > 0 or +0.0: never NaN and never -0.0, so max and min
+	# give the same bits in any order.
 	z_min, z_max = 9999999.9, -9999999.9
 	for i in range(nq):
 		z_min_, z_max_ = 9999999.9, -9999999.9
@@ -140,7 +145,17 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 					z -= x2[k] * Y[k, j]
 				g[i, j] = -math.sqrt(z) if z > 0 else 0
 
-		for j in range(n_y):
+		nb = n_y - n_y % 64
+		if nb > 0:
+			mxb[:] = g[i, :64]
+			mnb[:] = g[i, :64]
+			for j in range(64, nb, 64):
+				numpy.maximum(mxb, g[i, j:j+64], mxb)
+				numpy.minimum(mnb, g[i, j:j+64], mnb)
+			for u in range(64):
+				z_max_ = max(z_max_, mxb[u])
+				z_min_ = min(z_min_, mnb[u])
+		for j in range(nb, n_y):
 			z = g[i, j]
 			z_max_ = max(z_max_, z)
 			z_min_ = min(z_min_, z)
