@@ -432,8 +432,18 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 				l = uint64(l)
 				t_sums[k+l] += gamma[k_idx, l]
 
+		# Only a position holding the maximum can be the final winner: the
+		# first one overwrites every field set by an earlier, lower score.
+		# Skipping the rest keeps the result and the branches predictable.
+		M = t_sums[0]
+		for k in range(1, nt+nq-1):
+			M = max(M, t_sums[k])
+
 		for k in range(nt+nq-1):
 			score = t_sums[k]
+			if score != M:
+				continue
+
 			overlap = min(k+1, nq) - max(0, k-nt+1)
 			if score >= results[i, 1]:
 				if score == results[i, 1] and results[i, 2] >= overlap:
