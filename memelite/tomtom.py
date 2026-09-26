@@ -158,6 +158,33 @@ def _pairwise_max_window(x, y, y_csum, z, L, H, copy):
 
 
 @njit(cache=True)
+def _A_cumsum(A, A_csum, nq, n_bins, offset, n):
+	"""An internal function for the cumulative sums of the span backgrounds.
+
+	A[i, j] can only be nonzero in [c + m, c + m*n_bins], where m = j - i + 1
+	is the span length, so the running sum is 0.0 below that range and the
+	total above it. Up to n_bins*(j+1) + c it holds the total and past that
+	1, over the first n entries, which are all that `_pairwise_max` reads.
+	"""
+
+	for i in range(nq):
+		i = uint64(i)
+		for j in range(i, nq):
+			j, c = uint64(j), uint64(offset * (nq - j + i - 1))
+			m = j - i + uint64(1)
+			lo, hi = c + m, c + m*n_bins
+
+			A_csum[i, j, :lo] = 0
+			acc = 0.0
+			for k in range(lo, hi+1):
+				acc += A[i, j, k]
+				A_csum[i, j, k] = acc
+
+			A_csum[i, j, hi+1:n_bins*(j+1)+c] = acc
+			A_csum[i, j, n_bins*(j+1)+c:n] = 1
+
+
+@njit(cache=True)
 def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset, 
 	needed=None):
 	"""An internal function that calculates the backgrounds for p-values.
@@ -224,13 +251,9 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 						A[i, j, l+k+c] += a * f[j, l]
 
 				k_lo, k_hi = k_lo + l_lo, k_hi + l_hi
-					
-			A_csum[i, j, n_bins*(j+1)+c:] = 1
-			for k in range(n_bins*(j+1)+c):
-				k = uint64(k)
-				A_csum[i, j, k] = A[i, j, k]
-				if k > 0:
-					A_csum[i, j, k] += A_csum[i, j, k-1]
+
+
+	_A_cumsum(A, A_csum, nq, n_bins, offset, n)
 
 	###
 
