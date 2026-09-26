@@ -127,6 +127,10 @@ def _pwm_to_mapping(log_pwm, bin_size):
 		for j in range(largest - smallest + 1):
 			old_logpdf[j] = logpdf[j]
 
+	# `old_logpdf` holds the distribution over every column. `logpdf` is only
+	# written by the loop above, which does not run for a single-column PWM.
+	logpdf = old_logpdf
+
 	for i in range(len(logpdf) - 2, -1, -1):
 		logpdf[i] = logaddexp2(logpdf[i], logpdf[i + 1])
 
