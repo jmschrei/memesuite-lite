@@ -9,6 +9,7 @@ import numba
 from numba import njit
 from numba import prange
 from numpy import uint64
+from numpy import int64
 
 
 @njit(cache=True)
@@ -138,7 +139,27 @@ def _pairwise_max(x, y, y_csum, z, n):
 
  
 @njit(cache=True)
-def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
+def _pairwise_max_window(x, y, y_csum, z, L, H, copy):
+	"""`_pairwise_max` restricted to the bins [L, H).
+
+	x and y must be zero outside [L, H), and so z is too; only [L, H) of z is
+	written. When `copy` is true, x is the empty starting point and z = y. The
+	running sum of x starts at L, where it is still exactly zero.
+	"""
+
+	if copy:
+		for i in range(L, H):
+			z[i] = y[i]
+	else:
+		x_csum = 0.0
+		for i in range(L, H):
+			x_csum += x[i]
+			z[i] = x[i] * y_csum[i] + y[i] * x_csum - x[i] * y[i]
+
+
+@njit(cache=True)
+def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset, 
+	needed=None):
 	"""An internal function that calculates the backgrounds for p-values.
 
 	This method takes in the histogram of integerized scores `f` and returns 
@@ -148,6 +169,9 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 	target are overlapping (on either end). Additionally, background
 	probabilities are calculated for all spans across the query for when the
 	target is smaller than the query and has to be scanned against it.
+
+	When `needed` is given, only the rows `t` with `needed[t]` true are
+	finished; the others hold unspecified values.
 	"""
 
 	n = n_bins*nq + nq*offset
@@ -210,38 +234,106 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 
 	###
 
-	B[0] = -1
-	for i in range(1, min(nq, t_max+1)):
-		_pairwise_max(B[i-1], A[0, i-1], A_csum[0, i-1], B[i], n)
-		_pairwise_max(B[i], A[nq-i, nq-1], A_csum[nq-i, nq-1], B[i], n)
+	# Every A[i, j] is zero outside [lo, hi), where lo and hi follow from the
+	# lowest and highest nonzero bins of f, so every B row is too: the pdf of
+	# a maximum is zero below the larger of the two lower ends and above the
+	# larger of the two upper ends. B is built only over [L, H), the union of
+	# those windows. The values dropped are exact zeros, so every value that
+	# is kept is computed by the same operations in the same order.
+	L, H = int64(n), int64(0)
+	for i in range(nq):
+		lo, hi, empty = int64(0), int64(0), False
+		for j in range(i, nq):
+			flo, fhi = 0, 0
+			for l in range(1, n_bins+1):
+				if f[j, l] != 0:
+					if flo == 0:
+						flo = l
+					fhi = l
 
-	if (t_max+1) > nq:
+			if flo == 0:
+				empty = True
+			if empty:
+				break
+
+			lo += flo
+			hi += fhi
+			c = int64(offset) * int64(nq - j + i - 1)
+			L = min(L, lo + c)
+			H = max(H, hi + c + 1)
+
+	if H > int64(n):
+		H = int64(n)
+	if H <= L:
+		L, H = 0, 0
+
+	# Rows below nq are rebuilt from A alone further down, so the first pass
+	# only matters as the start of the chain that builds rows nq..t_max.
+	if t_max >= nq:
+		if nq > 1:
+			_pairwise_max_window(B[0], A[0, 0], A_csum[0, 0], B[1], L, H, True)
+			_pairwise_max_window(B[1], A[nq-1, nq-1], A_csum[nq-1, nq-1], B[1],
+				L, H, False)
+
+		for i in range(2, nq):
+			_pairwise_max_window(B[i-1], A[0, i-1], A_csum[0, i-1], B[i], L, 
+				H, False)
+			_pairwise_max_window(B[i], A[nq-i, nq-1], A_csum[nq-i, nq-1], 
+				B[i], L, H, False)
+
 		for i in range(nq, t_max+1):
-			_pairwise_max(B[i-1], A[0, nq-1], A_csum[0, nq-1], B[i], n)
-	 
+			_pairwise_max_window(B[i-1], A[0, nq-1], A_csum[0, nq-1], B[i], L,
+				H, i == 1)
+
 	for i in range(1, min(nq, t_max+1)):
-		B[i] = -1
+		if needed is not None and not needed[i]:
+			continue
+
 		for j in range(nq - i + 1):
-			_pairwise_max(B[i], A[j, j+i-1], A_csum[j, j+i-1], B[i], n)
+			_pairwise_max_window(B[i], A[j, j+i-1], A_csum[j, j+i-1], B[i], L,
+				H, j == 0)
 	
 		for j in range(i-1):
-			_pairwise_max(B[i], A[0, j], A_csum[0, j], B[i], n)
-			_pairwise_max(B[i], A[nq-1-j, nq-1], A_csum[nq-1-j, nq-1], 
-				B[i], n)
+			_pairwise_max_window(B[i], A[0, j], A_csum[0, j], B[i], L, H, 
+				False)
+			_pairwise_max_window(B[i], A[nq-1-j, nq-1], A_csum[nq-1-j, nq-1], 
+				B[i], L, H, False)
 
-	# Again, `axis` is not implemented for cumsum
-	for i in range(B.shape[0]):
-		for j in range(1, n):
-			B[i, j] += B[i, j-1]
-		
-		# The cumsum above accumulates floating-point round-off across thousands
-		# of bins and the underlying distribution does not sum to exactly 1, so
-		# at the extreme right tail (the very best matches) the CDF can land just
-		# above 1.0. A survival probability cannot be negative, so clamp the
-		# round-off to zero to avoid returning tiny negative p-values.
+	# Row 0 is the all -1 starting point and is never a real distribution.
+	if needed is None or needed[0]:
 		for j in range(n):
+			B[0, j] = -1
+		for j in range(1, n):
+			B[0, j] += B[0, j-1]
+		for j in range(n):
+			b = 1 - B[0, j]
+			B[0, j] = b if b > 0 else 0.0
+
+	# `axis` is not implemented for cumsum. The pdf is zero below L, so the
+	# CDF is zero there and the survival 1, and it is flat from H on.
+	#
+	# The cumsum accumulates floating-point round-off across thousands of bins
+	# and the underlying distribution does not sum to exactly 1, so at the
+	# extreme right tail (the very best matches) the CDF can land just above
+	# 1.0. A survival probability cannot be negative, so clamp the round-off
+	# to zero to avoid returning tiny negative p-values.
+	for i in range(1, t_max+1):
+		if needed is not None and not needed[i]:
+			continue
+
+		for j in range(L+1, H):
+			B[i, j] += B[i, j-1]
+
+		for j in range(L):
+			B[i, j] = 1.0
+
+		for j in range(L, H):
 			b = 1 - B[i, j]
 			B[i, j] = b if b > 0 else 0.0
+
+		tail = B[i, H-1] if H > 0 else 1.0
+		for j in range(H, n):
+			B[i, j] = tail
 			
 
 @njit(cache=True)
@@ -336,6 +428,11 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	"""
 
 	T_max = max(T_lens)
+
+	# `_p_values` reads B only at the rows that are target lengths.
+	needed = numpy.zeros(T_max+1, dtype=numpy.bool_)
+	for t in T_lens:
+		needed[t] = True
 	
 	Q_offsets = numpy.zeros(len(Q_lens)+1, dtype='int64')
 	Q_offsets[1:] = numpy.cumsum(Q_lens)
@@ -385,7 +482,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			A, B, A_csum = _A[pid], _B[pid], _A_csum[pid]
 
 		_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, T_max, 
-			offset)
+			offset, needed)
 
 		_p_values(_gamma_int[pid], B, rr_inv, T_lens, -1, nq, offset, 
 			_results[pid], reverse_complement)
