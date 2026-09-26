@@ -336,6 +336,87 @@ def _pm(x, A, A_csum, a, b, z, L, H, a_lo, a_hi, x_lo, x_hi, copy, inplace):
 		x_hi, a_lo[a, b], a_hi[a, b], copy, inplace)
 
 
+@njit(cache=True, inline='always')
+def _pm_fused2(x, y0, c0, z0, y1, c1, z1, lo, hi):
+	"""Two chained steps of `_pairwise_max_window` in one pass over [lo, hi):
+	z0 = max(x, y0), then z1 = max(z0, y1).
+
+	Each step is the same expression with its own running sum, accumulated in
+	the same order, so each z is bitwise what two separate passes give. The
+	two running sums overlap in one pass. x may be z0 or z1 (in place): x[i] 
+	is read before z0[i] or z1[i] is written.
+	"""
+
+	s0, s1 = 0.0, 0.0
+	for i in range(lo, hi):
+		v = x[i]
+		s0 += v
+		t0 = v * c0[i] + y0[i] * s0 - v * y0[i]
+		z0[i] = t0
+		s1 += t0
+		z1[i] = t0 * c1[i] + y1[i] * s1 - t0 * y1[i]
+
+
+@njit(cache=True, inline='always')
+def _pm_chain(B, src, sa, sb, dst, n_steps, A, A_csum, L, H, a_lo, a_hi, 
+	x_lo, x_hi):
+	"""Run n_steps steps of the B build: step k sets B[dst[k]] to the max of
+	the previous result (B[src] for the first) and A[sa[k], sb[k]]. Returns 
+	the support of the last result.
+
+	Steps are fused two at a time with `_pm_fused2`, over [lo, hi): lo is 
+	the start of the input's support, and hi the largest end of the input's 
+	and every A row's support. Every result is supported in [lo, hi) (all of
+	[L, H) for an all-zero A row, whose window kernel runs over [L, H)), and 
+	outside the supports every term of the expression is exactly +0.0, so 
+	the full expression over [lo, hi) gives the bits `_pm` gives. A result 
+	row that is not the input row is zeroed over the rest of [L, H), as a 
+	non-in-place `_pm` does. The remaining steps go through `_pm`.
+	"""
+
+	k, row = 0, src
+	while k + 2 <= n_steps:
+		lo, hi, z_lo, z_hi = x_lo, x_hi, x_lo, x_hi
+		for r in range(k, k+2):
+			a, b = sa[r], sb[r]
+			if a_lo[a, b] < 0:
+				lo, hi, z_lo, z_hi = min(lo, L), H, L, H
+			else:
+				hi = max(hi, a_hi[a, b])
+				z_lo, z_hi = max(z_lo, a_lo[a, b]), max(z_hi, a_hi[a, b])
+
+		_pm_fused2(B[row], A[sa[k], sb[k]], A_csum[sa[k], sb[k]], B[dst[k]],
+			A[sa[k+1], sb[k+1]], A_csum[sa[k+1], sb[k+1]], B[dst[k+1]], lo, hi)
+
+		for r in range(k, k+2):
+			d = dst[r]
+			if d != row and (r == k or d != dst[r-1]):
+				for i in range(L, lo):
+					B[d, i] = 0.0
+				for i in range(hi, H):
+					B[d, i] = 0.0
+
+		row, x_lo, x_hi = dst[k+1], z_lo, z_hi
+		k += 2
+
+	while k < n_steps:
+		x_lo, x_hi = _pm(B[row], A, A_csum, sa[k], sb[k], B[dst[k]], L, H, 
+			a_lo, a_hi, x_lo, x_hi, False, dst[k] == row)
+		row = dst[k]
+		k += 1
+
+	return x_lo, x_hi
+
+
+@njit(cache=True, inline='always')
+def _A_cumsum_fill(A_csum, i, j, lo, hi, n_bins, c, n, acc):
+	"""The constant parts of the row A_csum[i, j] around its running sum."""
+
+	A_csum[i, j, :lo] = 0
+	A_csum[i, j, hi+1:n_bins*(j+1)+c] = acc
+	A_csum[i, j, n_bins*(j+1)+c:n] = 1
+
+
 @njit(cache=True)
 def _A_cumsum(A, A_csum, nq, n_bins, offset, n):
 	"""An internal function for the cumulative sums of the span backgrounds.
@@ -344,23 +425,45 @@ def _A_cumsum(A, A_csum, nq, n_bins, offset, n):
 	is the span length, so the running sum is 0.0 below that range and the
 	total above it. Up to n_bins*(j+1) + c it holds the total and past that
 	1, over the first n entries, which are all that `_pairwise_max` reads.
+
+	c depends only on m, so every row of one span length has the same range.
+	Two such rows are summed in one pass, each in its own accumulator, so
+	the two serial chains overlap. Each row's sum is the same chain of 
+	additions in the same order as a pass over that row alone.
 	"""
 
-	for i in range(nq):
-		i = uint64(i)
-		for j in range(i, nq):
-			j, c = uint64(j), uint64(offset * (nq - j + i - 1))
-			m = j - i + uint64(1)
-			lo, hi = c + m, c + m*n_bins
+	for m in range(1, nq+1):
+		m = uint64(m)
+		c = uint64(offset * (nq - m))
+		lo, hi = c + m, c + m*n_bins
 
-			A_csum[i, j, :lo] = 0
-			acc = 0.0
+		i = 0
+		while i + 2 <= nq - m + 1:
+			i0 = uint64(i)
+			a0, s0 = A[i0, i0+m-1], A_csum[i0, i0+m-1]
+			a1, s1 = A[i0+1, i0+m], A_csum[i0+1, i0+m]
+
+			acc0, acc1 = 0.0, 0.0
 			for k in range(lo, hi+1):
-				acc += A[i, j, k]
-				A_csum[i, j, k] = acc
+				acc0 += a0[k]
+				acc1 += a1[k]
+				s0[k] = acc0
+				s1[k] = acc1
 
-			A_csum[i, j, hi+1:n_bins*(j+1)+c] = acc
-			A_csum[i, j, n_bins*(j+1)+c:n] = 1
+			_A_cumsum_fill(A_csum, i0, i0+m-1, lo, hi, n_bins, c, n, acc0)
+			_A_cumsum_fill(A_csum, i0+1, i0+m, lo, hi, n_bins, c, n, acc1)
+			i += 2
+
+		while i < nq - m + 1:
+			i0 = uint64(i)
+			a0, s0 = A[i0, i0+m-1], A_csum[i0, i0+m-1]
+			acc0 = 0.0
+			for k in range(lo, hi+1):
+				acc0 += a0[k]
+				s0[k] = acc0
+
+			_A_cumsum_fill(A_csum, i0, i0+m-1, lo, hi, n_bins, c, n, acc0)
+			i += 1
 
 
 @njit(cache=True)
@@ -544,24 +647,36 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 				a_hi[i, j] = min(a_hi[i, j], H)
 
 	# Rows below nq are rebuilt from A alone further down, so the first pass
-	# only matters as the start of the chain that builds rows nq..t_max.
+	# only matters as the start of the chain that builds rows nq..t_max. 
+	# Each row is built by a chain of steps that `_pm_chain` runs.
+	n_steps_max = 2*nq + t_max
+	sa = numpy.empty(n_steps_max, dtype='int64')
+	sb = numpy.empty(n_steps_max, dtype='int64')
+	dst = numpy.empty(n_steps_max, dtype='int64')
+
 	if H > L and t_max >= nq:
-		b_lo, b_hi = L, H
+		b_lo, b_hi, ns = L, H, 0
 		if nq > 1:
 			b_lo, b_hi = _pm(B[0], A, A_csum, 0, 0, B[1], L, H, a_lo, a_hi,
 				b_lo, b_hi, True, False)
-			b_lo, b_hi = _pm(B[1], A, A_csum, nq-1, nq-1, B[1], L, H, a_lo, 
-				a_hi, b_lo, b_hi, False, True)
+			sa[ns], sb[ns], dst[ns] = nq-1, nq-1, 1
+			ns += 1
 
 		for i in range(2, nq):
-			b_lo, b_hi = _pm(B[i-1], A, A_csum, 0, i-1, B[i], L, H, a_lo, 
-				a_hi, b_lo, b_hi, False, False)
-			b_lo, b_hi = _pm(B[i], A, A_csum, nq-i, nq-1, B[i], L, H, a_lo, 
-				a_hi, b_lo, b_hi, False, True)
+			sa[ns], sb[ns], dst[ns] = 0, i-1, i
+			sa[ns+1], sb[ns+1], dst[ns+1] = nq-i, nq-1, i
+			ns += 2
 
 		for i in range(nq, t_max+1):
-			b_lo, b_hi = _pm(B[i-1], A, A_csum, 0, nq-1, B[i], L, H, a_lo, 
-				a_hi, b_lo, b_hi, i == 1, False)
+			if i == 1:
+				b_lo, b_hi = _pm(B[0], A, A_csum, 0, nq-1, B[1], L, H, a_lo,
+					a_hi, b_lo, b_hi, True, False)
+				continue
+			sa[ns], sb[ns], dst[ns] = 0, nq-1, i
+			ns += 1
+
+		b_lo, b_hi = _pm_chain(B, 1, sa, sb, dst, ns, A, A_csum, L, H, a_lo,
+			a_hi, b_lo, b_hi)
 
 	for i in range(1, min(nq, t_max+1)):
 		if H <= L:
@@ -569,16 +684,21 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 		if needed is not None and not needed[i]:
 			continue
 
-		b_lo, b_hi = L, H
-		for j in range(nq - i + 1):
-			b_lo, b_hi = _pm(B[i], A, A_csum, j, j+i-1, B[i], L, H, a_lo, 
-				a_hi, b_lo, b_hi, j == 0, True)
+		b_lo, b_hi = _pm(B[i], A, A_csum, 0, i-1, B[i], L, H, a_lo, a_hi, 
+			L, H, True, True)
+
+		ns = 0
+		for j in range(1, nq - i + 1):
+			sa[ns], sb[ns], dst[ns] = j, j+i-1, i
+			ns += 1
 	
 		for j in range(i-1):
-			b_lo, b_hi = _pm(B[i], A, A_csum, 0, j, B[i], L, H, a_lo, a_hi,
-				b_lo, b_hi, False, True)
-			b_lo, b_hi = _pm(B[i], A, A_csum, nq-1-j, nq-1, B[i], L, H, a_lo,
-				a_hi, b_lo, b_hi, False, True)
+			sa[ns], sb[ns], dst[ns] = 0, j, i
+			sa[ns+1], sb[ns+1], dst[ns+1] = nq-1-j, nq-1, i
+			ns += 2
+
+		b_lo, b_hi = _pm_chain(B, i, sa, sb, dst, ns, A, A_csum, L, H, a_lo,
+			a_hi, b_lo, b_hi)
 
 	# Row 0 is the all -1 starting point and is never a real distribution.
 	if needed is None or needed[0]:
