@@ -51,6 +51,38 @@ def _binned_median(x, bins, x_min, x_max, counts):
 
 
 @njit(cache=True)
+def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
+	"""`_binned_median` with the bin indices computed in their own pass.
+
+	The index expression is unchanged, so every index is the same; in its own
+	loop it vectorizes, leaving only the scatter-add serial. `zb` is scratch
+	of at least len(x) integers. `halfway` is sum(counts) / 2, which is the
+	same for every query column and so is passed in. Bitwise equal to
+	`_binned_median`.
+	"""
+
+	n, n_bins = len(x), len(bins)
+	bins[:] = 0
+
+	x_max -= x_min
+	for i in range(n):
+		zb[i] = int((x[i] - x_min) / x_max * (n_bins - 1))
+
+	for i in range(n):
+		z = zb[i]
+		bins[z, 0] += counts[i]
+		bins[z, 1] += x[i] * counts[i]
+
+	count = 0
+	for i in range(n_bins):
+		count += bins[i, 0]
+		if count >= halfway:
+			return bins[i, 1] / bins[i, 0]
+			
+	return -99999
+
+
+@njit(cache=True)
 def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians, 
 	median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins):
 	"""An internal function for integerized scores and the histogram.
@@ -72,6 +104,11 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	n_a, n_y = Y.shape[0], Y.shape[-1]
 	g = gamma.reshape((gamma.shape[1], gamma.shape[0]))
 	x2 = numpy.empty(n_a, dtype=numpy.float64)
+	zb = numpy.empty(n_y, dtype=numpy.int32)
+	halfway = 0
+	for j in range(n_y):
+		halfway += Y_counts[j]
+	halfway /= 2
 
 	# Calculate the Euclidean distance between query and targets. The terms are
 	# subtracted in the same order as before; `2 * X` is hoisted, which is the
@@ -109,7 +146,8 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 			z_min_ = min(z_min_, z)
 		
 		# Subtract out the median from each row
-		m = _binned_median(g[i], median_bins, z_min_, z_max_, Y_counts)
+		m = _binned_median_z(g[i], median_bins, z_min_, z_max_, Y_counts,
+			zb, halfway)
 		medians[i] = m
 
 		z_min = min(z_min, z_min_ - m)
