@@ -530,8 +530,6 @@ def test_read_meme_lpm_no_spaces(tmp_path):
 	assert numpy.array_equal(motifs['a'], _PWM_A)
 
 
-@pytest.mark.skip(reason="BUG: n_motifs=0 is checked only after a motif is "
-	"added, so it returns every motif instead of none")
 def test_read_meme_n_motifs_zero(tmp_path):
 	motifs = _read_text(tmp_path, _HEADER + _MOTIF_A + "\n" + _MOTIF_B + "\n",
 		n_motifs=0)

@@ -27,6 +27,10 @@ def read_meme(filename, n_motifs=None):
 
 	motifs = {}
 
+	# The limit is checked after each motif is added, which never stops at 0.
+	if n_motifs == 0:
+		return motifs
+
 	with open(filename, "r") as infile:
 		motif, width, i = None, None, 0
 
