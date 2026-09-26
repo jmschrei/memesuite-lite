@@ -805,6 +805,59 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 
 
 @njit(cache=True)
+def _sums_rows(t_sums, gamma, rr_inv, start, nt, W):
+	"""Adds row rr_inv[start+k] of gamma into t_sums[k:k+W] for each k < nt.
+
+	W is compiled as a literal, so the row loop is fully unrolled. t_sums
+	must already hold the fill value.
+	"""
+
+	numba.literally(W)
+	for k in range(nt):
+		k = uint64(k)
+		k_idx = uint64(rr_inv[start + k])
+		for l in range(W):
+			l = uint64(l)
+			t_sums[k+l] += gamma[k_idx, l]
+
+
+@njit(cache=True)
+def _sums_window(t_sums, gamma, rr_inv, start, nt, W):
+	"""Writes t_sums[0:nt+W-1] for a query of width W <= 6, a literal.
+
+	t_sums[0] must hold the fill value on entry. The W sums that row k can
+	still reach are kept in scalars w0..w5: row k is added to them, w0 is
+	then final and stored, and the window moves down one position. Every
+	position receives the fill value plus the same rows in increasing k as
+	in the loop it replaces. Scalars at or above W stay at the fill value.
+	"""
+
+	numba.literally(W)
+	b = t_sums[0]
+	w0 = w1 = w2 = w3 = w4 = w5 = int64(b)
+	for k in range(nt):
+		k = uint64(k)
+		r = uint64(rr_inv[start + k])
+		w0 += gamma[r, 0]
+		if W > 1:
+			w1 += gamma[r, 1]
+		if W > 2:
+			w2 += gamma[r, 2]
+		if W > 3:
+			w3 += gamma[r, 3]
+		if W > 4:
+			w4 += gamma[r, 4]
+		if W > 5:
+			w5 += gamma[r, 5]
+		t_sums[k] = w0
+		w0, w1, w2, w3, w4, w5 = w1, w2, w3, w4, w5, int64(b)
+
+	for j in range(W-1):
+		t_sums[nt+uint64(j)] = w0
+		w0, w1, w2, w3, w4 = w1, w2, w3, w4, w5
+
+
+@njit(cache=True)
 def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	reverse_complement, t_sums):
 	"""An internal function for calculating the best match and p-values.
@@ -832,16 +885,42 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 			total_offset += nt
 			continue
 
-		for k in range(nt+nq-1):
-			k = uint64(k)
-			t_sums[k] = nq * offset
+		# Narrow queries use kernels compiled for their literal width, which
+		# have no per-row loop setup. Each t_sums entry gets the same terms.
+		if nq <= 6:
+			t_sums[0] = nq * offset
+			if nq == 1:
+				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 1)
+			elif nq == 2:
+				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 2)
+			elif nq == 3:
+				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 3)
+			elif nq == 4:
+				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 4)
+			elif nq == 5:
+				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 5)
+			else:
+				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 6)
+		else:
+			for k in range(nt+nq-1):
+				k = uint64(k)
+				t_sums[k] = nq * offset
 
-		for k in range(nt):
-			k = uint64(k)
-			k_idx = uint64(rr_inv[total_offset + k])
-			for l in range(nq):	
-				l = uint64(l)
-				t_sums[k+l] += gamma[k_idx, l]
+			if nq == 7:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 7)
+			elif nq == 8:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 8)
+			elif nq == 9:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 9)
+			elif nq == 10:
+				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 10)
+			else:
+				for k in range(nt):
+					k = uint64(k)
+					k_idx = uint64(rr_inv[total_offset + k])
+					for l in range(nq):
+						l = uint64(l)
+						t_sums[k+l] += gamma[k_idx, l]
 
 		# Only a position holding the maximum can be the final winner: the
 		# first one overwrites every field set by an earlier, lower score.
