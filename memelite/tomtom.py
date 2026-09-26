@@ -67,24 +67,49 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	simultaneously with the binned score matrix. 
 	"""
 	
-	# Calculate the Euclidean distance between query and targets
+	# `gamma` is private scratch, so its buffer is used as (n_rows, n_y): each
+	# query column's distances are then contiguous for every loop below.
+	n_a, n_y = Y.shape[0], Y.shape[-1]
+	g = gamma.reshape((gamma.shape[1], gamma.shape[0]))
+	x2 = numpy.empty(n_a, dtype=numpy.float64)
+
+	# Calculate the Euclidean distance between query and targets. The terms are
+	# subtracted in the same order as before; `2 * X` is hoisted, which is the
+	# same product. The min/max pass is separate so the distance loop
+	# vectorizes; min/max visit the same values in the same order.
 	z_min, z_max = 9999999.9, -9999999.9
 	for i in range(nq):
 		z_min_, z_max_ = 9999999.9, -9999999.9
-		for j in range(Y.shape[-1]):
-			z = X_norm[i + nq_csum] + Y_norm[j]
-			
-			for k in range(Y.shape[0]):
-				z -= 2 * X[k, i + nq_csum] * Y[k, j]
-			  
-			z = -math.sqrt(z) if z > 0 else 0
+		xn = X_norm[i + nq_csum]
+
+		if n_a == 4:
+			x0 = 2 * X[0, i + nq_csum]
+			x1 = 2 * X[1, i + nq_csum]
+			x2_ = 2 * X[2, i + nq_csum]
+			x3 = 2 * X[3, i + nq_csum]
+			for j in range(n_y):
+				z = xn + Y_norm[j]
+				z -= x0 * Y[0, j]
+				z -= x1 * Y[1, j]
+				z -= x2_ * Y[2, j]
+				z -= x3 * Y[3, j]
+				g[i, j] = -math.sqrt(z) if z > 0 else 0
+		else:
+			for k in range(n_a):
+				x2[k] = 2 * X[k, i + nq_csum]
+			for j in range(n_y):
+				z = xn + Y_norm[j]
+				for k in range(n_a):
+					z -= x2[k] * Y[k, j]
+				g[i, j] = -math.sqrt(z) if z > 0 else 0
+
+		for j in range(n_y):
+			z = g[i, j]
 			z_max_ = max(z_max_, z)
 			z_min_ = min(z_min_, z)
-			gamma[j, i] = z
 		
 		# Subtract out the median from each row
-		m = _binned_median(gamma[:, i], median_bins, z_min_, z_max_, 
-			Y_counts)
+		m = _binned_median(g[i], median_bins, z_min_, z_max_, Y_counts)
 		medians[i] = m
 
 		z_min = min(z_min, z_min_ - m)
@@ -100,15 +125,19 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	
 	f[:] = 0
 	ys = numpy.sum(Y_counts)
+	w = numpy.empty(n_y, dtype=numpy.float64)
+	for j in range(n_y):
+		w[j] = Y_counts[j] / ys
 
 	# Convert the distances to bins and record the histogram of counts
 	for i in range(nq):
 		k = nq - i - 1
-		for j in range(Y.shape[-1]):
-			x = math.floor((gamma[j, i] - medians[i]) * bin_scale + 0.5)
+		mi = medians[i]
+		for j in range(n_y):
+			x = math.floor((g[i, j] - mi) * bin_scale + 0.5)
 
 			gamma_int[j, k] = x - offset
-			f[i, uint64(x)] += Y_counts[j] / ys
+			f[i, uint64(x)] += w[j]
 
 	return uint64(offset)
 
