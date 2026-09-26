@@ -322,6 +322,68 @@ def _A_cumsum(A, A_csum, nq, n_bins, offset, n):
 
 
 @njit(cache=True)
+def _convolve_span(prev, row, f, k_lo, k_hi, prev_base, row_base):
+	"""An internal function for one step of the span convolution.
+
+	Adds prev[k + prev_base] * f[s] into row[k + row_base + s] for every k in
+	[k_lo, k_hi] and s in [0, len(f)). Each element of row receives its terms
+	in ascending k, exactly as a scalar scatter over k would add them.
+
+	Four k are taken per pass over f, so each element of row is loaded and
+	stored once per four terms instead of once per term. Within a pass the
+	four terms are still added in ascending k and each is the same product,
+	so the result is bitwise the same. A term with prev == 0, which the
+	scatter skipped, adds +0.0 to a non-negative value and changes nothing.
+	"""
+
+	L = f.shape[0]
+	k = k_lo
+
+	if L >= 4:
+		n = L - 3
+		f0, f1, f2, f3 = f[3:3+n], f[2:2+n], f[1:1+n], f[0:n]
+
+		while k + 3 <= k_hi:
+			a0, a1 = prev[k+prev_base], prev[k+1+prev_base]
+			a2, a3 = prev[k+2+prev_base], prev[k+3+prev_base]
+			b = k + row_base
+
+			# The first and last three outputs lack some of the four terms.
+			for s in range(3):
+				x = row[b+s]
+				for r in range(s+1):
+					x += prev[k+r+prev_base] * f[s-r]
+				row[b+s] = x
+
+			# Contiguous 1-D views keep every index a non-negative loop
+			# counter, which is what lets this loop vectorize.
+			dst = row[b+3:b+L]
+			for t in range(n):
+				x = dst[t]
+				x += a0 * f0[t]
+				x += a1 * f1[t]
+				x += a2 * f2[t]
+				x += a3 * f3[t]
+				dst[t] = x
+
+			for s in range(L, L+3):
+				x = row[b+s]
+				for r in range(s-L+1, 4):
+					x += prev[k+r+prev_base] * f[s-r]
+				row[b+s] = x
+
+			k += 4
+
+	while k <= k_hi:
+		a = prev[k+prev_base]
+		if a != 0:
+			dst = row[k+row_base:k+row_base+L]
+			for s in range(L):
+				dst[s] += a * f[s]
+		k += 1
+
+
+@njit(cache=True)
 def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset, 
 	needed=None):
 	"""An internal function that calculates the backgrounds for p-values.
@@ -376,16 +438,8 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 			else:
 				l_lo, l_hi = f_lo[j], f_hi[j]
 
-				for k in range(max(k_lo, 0), min(k_hi, numpy.int64(n_bins*j)) + 1):
-					k = uint64(k)
-					a = A[i, j-1, k+c+offset]
-					
-					if a == 0:
-						continue
-						
-					for l in range(l_lo, l_hi+1):
-						l = uint64(l)
-						A[i, j, l+k+c] += a * f[j, l]
+				_convolve_span(A[i, j-1], A[i, j], f[j, l_lo:l_hi+1], max(k_lo, 0),
+					min(k_hi, numpy.int64(n_bins*j)), int64(c+offset), int64(c)+l_lo)
 
 				k_lo, k_hi = k_lo + l_lo, k_hi + l_hi
 
