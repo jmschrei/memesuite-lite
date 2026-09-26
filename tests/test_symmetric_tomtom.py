@@ -212,10 +212,11 @@ def test_symmetric_tomtom_reverse_complement_false():
 	assert_array_almost_equal(p[mask], p.T[mask], 4)
 	assert_array_almost_equal(scores[mask], scores.T[mask], 4)
 
-	assert_array_almost_equal(p[0], [1., 1., 0.22434333, 1., 1., 1., 1., 1., 1.,
-		0.2691859 , 1., 0.56274301], 4)
-	assert_array_almost_equal(scores[0], [0., 0., 297., 0., 0., 0., 0., 0., 0.,
-		245., 0., 304.])
+	assert_array_almost_equal(p[0], [1., 0.41578076, 0.22434333, 0.9327786,
+		0.21418851, 0.33604588, 0.18450619, 0.8864786, 0.69718784, 0.2691859,
+		0.83894771, 0.56274301], 4)
+	assert_array_almost_equal(scores[0], [0., 490., 297., 977., 554., 506.,
+		456., 980., 766., 245., 443., 304.])
 
 
 ###
@@ -404,11 +405,6 @@ def test_symmetric_tomtom_matches_tomtom_kwargs(kwargs):
 	assert_off_diagonal_equal(observed, expected)
 
 
-@pytest.mark.skip(reason="BUG: with reverse_complement=False, `_p_values` "
-	"still skips targets in [N//2, N//2 + iq] as if the target list held "
-	"reverse complements, so those pairs come back as p=1, score=0. The "
-	"existing test_symmetric_tomtom_reverse_complement_false golden values "
-	"contain these skipped pairs.")
 def test_symmetric_tomtom_matches_tomtom_no_rc():
 	pwms = generate_distinct_length_meme([4, 6, 8, 10, 12, 14, 16, 18])
 

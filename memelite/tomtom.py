@@ -218,7 +218,8 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 			
 
 @njit(cache=True)
-def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results):
+def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
+	reverse_complement=1):
 	"""An internal function for calculating the best match and p-values.
 
 	This function will take in the integerized score matrix `gamma` and
@@ -227,9 +228,12 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results):
 	alignment, minus a penalty for each unaligned column. After finding
 	a new best overlap, the p-value is calculated by comparing the
 	score to the background distribution.
+
+	Targets 0..iq are skipped, and so are their reverse complements, which
+	start at len(T_lens) // 2 only when `reverse_complement` is 1.
 	"""
 
-	n = len(T_lens) // 2
+	n = len(T_lens) // 2 if reverse_complement == 1 else len(T_lens)
 	total_offset = uint64(0)
 
 	# Sized by the longest target, not by gamma, whose rows are the unique
@@ -357,7 +361,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			offset)
 
 		_p_values(_gamma_int[pid], B, rr_inv, T_lens, -1, nq, offset, 
-			_results[pid])
+			_results[pid], reverse_complement)
 
 		if reverse_complement == 1:
 			_merge_rc_results(_results[pid])
