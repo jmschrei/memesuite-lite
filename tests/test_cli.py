@@ -572,9 +572,6 @@ def test_run_tomtom_aligned_middle_length(capsys):
 		assert len(row["aligned_middle"]) == len("GAACAGAATGTTC")
 
 
-@pytest.mark.skip(reason="BUG: `_run_tomtom` always unpacks five outputs "
-	"from tomtom, but tomtom returns six when `n_nearest` is set, so -n "
-	"raises 'ValueError: too many values to unpack (expected 5)'.")
 def test_run_tomtom_n_nearest(capsys):
 	args = _tomtom_namespace(query=QUERIES, thresh=1.0, n_nearest=2)
 	_run_tomtom(args)

@@ -64,28 +64,35 @@ def _run_tomtom(args):
 
 	query_seqs = numpy.array([characters(x, force=True) for x in query_pwms])
 
-	p, scores, offsets, overlaps, strands = tomtom(query_pwms, target_pwms, 
+	results = tomtom(query_pwms, target_pwms, 
 		n_nearest=args.n_nearest, n_score_bins=args.n_score_bins, 
 		n_median_bins=args.n_median_bins, n_target_bins=args.n_target_bins, 
 		n_cache=args.n_cache, reverse_complement=not args.norc, 
 		n_jobs=args.n_jobs)
+
+	# With n_nearest, column j of each row is the target in the sixth output
+	# rather than target j.
+	p, scores, offsets, overlaps, strands = results[:5]
+	target_idxs = results[5].astype(int) if len(results) == 6 else None
 
 
 	q_names, q_seqs = [], []
 	t_names, t_seqs, t_ps, t_scores, t_offsets = [], [], [], [], []
 	t_overlaps, t_strands = [], []
 
-	for qidx, tidx in zip(*numpy.where(p <= args.thresh)):
+	for qidx, j in zip(*numpy.where(p <= args.thresh)):
+		tidx = j if target_idxs is None else target_idxs[qidx, j]
+
 		q_names.append(query_names[qidx])
 		q_seqs.append(query_seqs[qidx])
 
 		t_names.append(target_names[tidx])
 		t_seqs.append(target_seqs[tidx])
-		t_ps.append(p[qidx, tidx])
-		t_scores.append(int(scores[qidx, tidx]))
-		t_offsets.append(int(offsets[qidx, tidx]))
-		t_overlaps.append(int(overlaps[qidx, tidx]))
-		t_strands.append('+-'[int(strands[qidx, tidx])])
+		t_ps.append(p[qidx, j])
+		t_scores.append(int(scores[qidx, j]))
+		t_offsets.append(int(offsets[qidx, j]))
+		t_overlaps.append(int(overlaps[qidx, j]))
+		t_strands.append('+-'[int(strands[qidx, j])])
 
 	if len(q_names) == 0:
 		print("No hits found at p-value threshold {}.".format(args.thresh))
