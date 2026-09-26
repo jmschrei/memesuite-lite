@@ -1,6 +1,7 @@
 # io.py
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
+import re
 import numpy
 
 
@@ -38,7 +39,7 @@ def read_meme(filename, n_motifs=None):
 
 			elif width is None:
 				if line[:6] == 'letter':
-					width = int(line.split()[5])
+					width = int(re.search(r'\bw=\s*(\d+)', line).group(1))
 					pwm = numpy.zeros((width, 4))
 
 			else:

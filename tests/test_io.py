@@ -523,8 +523,6 @@ def test_read_meme_no_separator(tmp_path):
 	_assert_ab(_read_text(tmp_path, text))
 
 
-@pytest.mark.skip(reason="BUG: read_meme takes the width from the sixth "
-	"whitespace token, so 'alength=4 w=2' (no space after '=') is misparsed")
 def test_read_meme_lpm_no_spaces(tmp_path):
 	text = _MOTIF_A.replace("alength= 4 w= 2", "alength=4 w=2")
 	motifs = _read_text(tmp_path, _HEADER + text + "\n")
