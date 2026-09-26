@@ -604,8 +604,6 @@ def test_one_hot_encode_string_alphabet():
 		one_hot_encode(seq))
 
 
-@pytest.mark.skip(reason="BUG: one_hot_encode documents tuple alphabets but "
-	"raises TypeError because only lists are joined into a string")
 def test_one_hot_encode_tuple_alphabet():
 	seq = _random_sequence(50, 'ACGT', random_state=0)
 	assert numpy.array_equal(one_hot_encode(seq, alphabet=('A', 'C', 'G', 'T')),

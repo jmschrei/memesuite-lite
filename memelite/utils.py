@@ -137,7 +137,7 @@ def one_hot_encode(sequence, alphabet=['A', 'C', 'G', 'T'], dtype=numpy.int8,
 			raise ValueError("Character {} in the alphabet ".format(char) + 
 				"and also in the list of ignored characters.")
 
-	if isinstance(alphabet, list):
+	if isinstance(alphabet, (list, tuple)):
 		alphabet = ''.join(alphabet)
 
 	ignore = ''.join(ignore)
