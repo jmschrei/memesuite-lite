@@ -157,10 +157,11 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 		for j in range(i, nq):
 			j, c = uint64(j), uint64(offset * (nq - j + i - 1))
 
-			# Only A[i, j, :n] with i <= j is ever read (here, by the
-			# convolution for j+1, and by `_pairwise_max` below), so clear
-			# only that rather than the whole Q_max x Q_max x n_len workspace.
-			A[i, j, :n] = 0
+			# Only rows A[i, j] with i <= j < nq are used, so clear those
+			# rather than the whole Q_max x Q_max x n_len workspace. The whole
+			# row is cleared, not just the first n bins that are read, so that
+			# each row still holds a complete distribution.
+			A[i, j] = 0
 			
 			if i == j:
 				for l in range(1, n_bins+1):
