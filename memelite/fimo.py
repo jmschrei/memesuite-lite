@@ -384,7 +384,10 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	if return_counts == True:
 		counts = numpy.zeros(n_, dtype='int32')
 		for i in range(n_):
-			counts[i] = len(hits[i]) + len(hits[i+n_])
+			counts[i] = len(hits[i])
+			if reverse_complement:
+				counts[i] += len(hits[i+n_])
+
 		return counts
 
 	for i in range(n_):

@@ -1132,10 +1132,7 @@ def test_fimo_row_order():
 
 
 @pytest.mark.parametrize("threshold", [1e-4, 1e-3, 0.05])
-@pytest.mark.parametrize("reverse_complement", [True, pytest.param(False,
-	marks=pytest.mark.skip(reason="BUG: return_counts=True with "
-	"reverse_complement=False indexes hits[i + n_] past the end of the list "
-	"and raises IndexError"))])
+@pytest.mark.parametrize("reverse_complement", [True, False])
 def test_fimo_return_counts_matches_rows(threshold, reverse_complement):
 	motifs = _random_pwms(12, 2, 20, random_state=21)
 	X = _random_sequences(10, 90, n_frac=0.05, random_state=22)
