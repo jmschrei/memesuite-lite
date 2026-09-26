@@ -167,13 +167,19 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	for j in range(n_y):
 		w[j] = Y_counts[j] / ys
 
-	# Convert the distances to bins and record the histogram of counts
+	# Convert the distances to bins and record the histogram of counts. The
+	# bin indices are computed in their own loop, which vectorizes, and the
+	# scatter-add then runs in the original order. Every index lies in
+	# [0, n_bins], because f has n_bins + 1 columns, so int32 holds it exactly.
+	zb = numpy.empty(n_y, dtype=numpy.int32)
 	for i in range(nq):
 		k = nq - i - 1
 		mi = medians[i]
 		for j in range(n_y):
-			x = math.floor((g[i, j] - mi) * bin_scale + 0.5)
+			zb[j] = math.floor((g[i, j] - mi) * bin_scale + 0.5)
 
+		for j in range(n_y):
+			x = zb[j]
 			gamma_int[j, k] = x - offset
 			f[i, uint64(x)] += w[j]
 
@@ -686,9 +692,11 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	_gamma_int = numpy.empty((n_threads, nt, Q_max), dtype='int16')
 	_f = numpy.empty((n_threads, Q_max, n_score_bins+1), dtype='float64')
 
-	_A = numpy.empty((n_threads, Q_max, Q_max, n_len), dtype='float64')
+	# A and A_csum are flat per thread; each query takes a contiguous
+	# (nq, nq, n) view so its working set is not strided by n_len.
+	_A = numpy.empty((n_threads, Q_max*Q_max*n_len), dtype='float64')
 	_B = numpy.empty((n_threads, T_max+1, n_len), dtype='float64')
-	_A_csum = numpy.empty((n_threads, Q_max, Q_max, n_len), dtype='float64')
+	_A_csum = numpy.empty((n_threads, Q_max*Q_max*n_len), dtype='float64')
 
 	_medians = numpy.empty((n_threads, Q_max), dtype='float64')
 	_median_bins = numpy.empty((n_threads, n_median_bins, 2), dtype='float64')
@@ -714,7 +722,10 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			B = numpy.empty((T_max+1, n_needed), dtype='float64')
 			A_csum = numpy.empty((nq, nq, n_needed), dtype='float64')
 		else:
-			A, B, A_csum = _A[pid], _B[pid], _A_csum[pid]
+			n_a = nq*nq*n_needed
+			A = _A[pid, :n_a].reshape((nq, nq, n_needed))
+			A_csum = _A_csum[pid, :n_a].reshape((nq, nq, n_needed))
+			B = _B[pid]
 
 		_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, T_max, 
 			offset, needed)
