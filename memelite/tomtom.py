@@ -151,9 +151,25 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 	"""
 
 	n = n_bins*nq + nq*offset
+
+	# First and last nonzero bin of each query column's histogram. Every term
+	# is non-negative, so a skipped zero term would only have added +0.0, and
+	# the remaining terms are still added in the same order: bitwise-exact.
+	f_lo = numpy.empty(nq, dtype='int64')
+	f_hi = numpy.empty(nq, dtype='int64')
+	for j in range(nq):
+		f_lo[j], f_hi[j] = n_bins+1, 0
+		for l in range(1, n_bins+1):
+			if f[j, l] != 0:
+				f_hi[j] = l
+				if f_lo[j] > n_bins:
+					f_lo[j] = l
 	
 	for i in range(nq):
 		i = uint64(i)
+
+		# Bounds on the nonzero support of A[i, j-1], in the `k` coordinate
+		k_lo, k_hi = 0, -1
 		for j in range(i, nq):
 			j, c = uint64(j), uint64(offset * (nq - j + i - 1))
 
@@ -167,17 +183,23 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 				for l in range(1, n_bins+1):
 					l = uint64(l)
 					A[i, j, l+c] = f[j, l]
-			else:            
-				for k in range(n_bins*j+1):
+
+				k_lo, k_hi = f_lo[j], f_hi[j]
+			else:
+				l_lo, l_hi = f_lo[j], f_hi[j]
+
+				for k in range(max(k_lo, 0), min(k_hi, numpy.int64(n_bins*j)) + 1):
 					k = uint64(k)
 					a = A[i, j-1, k+c+offset]
 					
 					if a == 0:
 						continue
 						
-					for l in range(1, n_bins+1):
+					for l in range(l_lo, l_hi+1):
 						l = uint64(l)
 						A[i, j, l+k+c] += a * f[j, l]
+
+				k_lo, k_hi = k_lo + l_lo, k_hi + l_hi
 					
 			A_csum[i, j, n_bins*(j+1)+c:] = 1
 			for k in range(n_bins*(j+1)+c):
