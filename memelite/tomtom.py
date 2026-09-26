@@ -55,30 +55,51 @@ def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 	"""`_binned_median` with the bin indices computed in their own pass.
 
 	The index expression is unchanged, so every index is the same; in its own
-	loop it vectorizes, leaving only the scatter-add serial. `zb` is scratch
-	of at least len(x) integers. `halfway` is sum(counts) / 2, which is the
-	same for every query column and so is passed in. Bitwise equal to
-	`_binned_median`.
+	loop it vectorizes. `zb` is scratch of at least len(x) integers. `halfway`
+	is sum(counts) / 2, which is the same for every query column and so is
+	passed in.
+
+	Only the bin where the scan stops has its values summed. The counts are
+	integers, so they are histogrammed as int64 in `bins`'s own memory, and
+	the scan finds the stopping bin from them. That bin's sum is then taken
+	over the elements that fall in it, in ascending order starting from 0.0,
+	which is the same sequence of additions `bins[z, 1] += x[i] * counts[i]`
+	made. Blocks of 64 elements with no element in the bin are skipped after
+	a check that vectorizes. Bitwise equal to `_binned_median`. `bins` must be
+	C-contiguous.
 	"""
 
 	n, n_bins = len(x), len(bins)
-	bins[:] = 0
-
 	x_max -= x_min
 	for i in range(n):
 		zb[i] = int((x[i] - x_min) / x_max * (n_bins - 1))
 
+	cnt = bins.reshape(-1).view(numpy.int64)[:n_bins]
+	cnt[:] = 0
 	for i in range(n):
-		z = zb[i]
-		bins[z, 0] += counts[i]
-		bins[z, 1] += x[i] * counts[i]
+		cnt[zb[i]] += counts[i]
 
 	count = 0
-	for i in range(n_bins):
-		count += bins[i, 0]
+	for b in range(n_bins):
+		count += cnt[b]
 		if count >= halfway:
-			return bins[i, 1] / bins[i, 0]
-			
+			s = 0.0
+			n_64 = n - n % 64
+			for i0 in range(0, n_64, 64):
+				hit = 0
+				for i in range(i0, i0 + 64):
+					hit |= zb[i] == b
+				if hit:
+					for i in range(i0, i0 + 64):
+						if zb[i] == b:
+							s += x[i] * counts[i]
+
+			for i in range(n_64, n):
+				if zb[i] == b:
+					s += x[i] * counts[i]
+
+			return s / cnt[b]
+
 	return -99999
 
 
@@ -563,20 +584,61 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 	# extreme right tail (the very best matches) the CDF can land just above
 	# 1.0. A survival probability cannot be negative, so clamp the round-off
 	# to zero to avoid returning tiny negative p-values.
+	rows = numpy.empty(t_max+1, dtype=numpy.int64)
+	nr = 0
 	for i in range(1, t_max+1):
-		if needed is not None and not needed[i]:
-			continue
+		if needed is None or needed[i]:
+			rows[nr] = i
+			nr += 1
 
-		for j in range(L+1, H):
-			B[i, j] += B[i, j-1]
+	# Each row's running sum is its own serial chain of additions, in the same
+	# order as `B[i, j] += B[i, j-1]` (a + b == b + a bitwise). Four rows are
+	# summed at once so that four independent chains overlap their latency,
+	# and each survival value is computed from the sum as it is produced.
+	r = 0
+	while r + 4 <= nr:
+		b0, b1, b2, b3 = B[rows[r+0]], B[rows[r+1]], B[rows[r+2]], B[rows[r+3]]
+		if H > L:
+			a0, a1, a2, a3 = b0[L], b1[L], b2[L], b3[L]
+			s = 1 - a0
+			b0[L] = s if s > 0 else 0.0
+			s = 1 - a1
+			b1[L] = s if s > 0 else 0.0
+			s = 1 - a2
+			b2[L] = s if s > 0 else 0.0
+			s = 1 - a3
+			b3[L] = s if s > 0 else 0.0
+			for j in range(L+1, H):
+				a0 = b0[j] + a0
+				a1 = b1[j] + a1
+				a2 = b2[j] + a2
+				a3 = b3[j] + a3
+				s0 = 1 - a0
+				b0[j] = s0 if s0 > 0 else 0.0
+				s1 = 1 - a1
+				b1[j] = s1 if s1 > 0 else 0.0
+				s2 = 1 - a2
+				b2[j] = s2 if s2 > 0 else 0.0
+				s3 = 1 - a3
+				b3[j] = s3 if s3 > 0 else 0.0
+		r += 4
 
+	while r < nr:
+		b0 = B[rows[r]]
+		if H > L:
+			a0 = b0[L]
+			s = 1 - a0
+			b0[L] = s if s > 0 else 0.0
+			for j in range(L+1, H):
+				a0 = b0[j] + a0
+				s = 1 - a0
+				b0[j] = s if s > 0 else 0.0
+		r += 1
+
+	for r in range(nr):
+		i = rows[r]
 		for j in range(L):
 			B[i, j] = 1.0
-
-		for j in range(L, H):
-			b = 1 - B[i, j]
-			B[i, j] = b if b > 0 else 0.0
-
 		tail = B[i, H-1] if H > 0 else 1.0
 		for j in range(H, n):
 			B[i, j] = tail
