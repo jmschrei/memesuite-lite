@@ -850,7 +850,18 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 		for k in range(1, nt+nq-1):
 			M = max(M, t_sums[k])
 
-		for k in range(nt+nq-1):
+		# The first and last positions holding M, by branchless integer
+		# min/max, which vectorize; every position equal to M lies in
+		# kf..kl and is still visited in increasing k.
+		m = int64(nt) + int64(nq) - 1
+		kf = m
+		kl = int64(0)
+		for k in range(m):
+			e = t_sums[k] == M
+			kf = min(kf, k if e else m)
+			kl = max(kl, k if e else 0)
+
+		for k in range(kf, kl+1):
 			score = t_sums[k]
 			if score != M:
 				continue
