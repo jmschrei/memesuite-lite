@@ -900,9 +900,6 @@ def test_tomtom_shape_grid_no_rc(regime):
 	_assert_valid(out, Qs, Ts, reverse_complement=False)
 
 
-@pytest.mark.skip(reason="BUG: n_nearest larger than the number of targets "
-	"returns uninitialized memory (values like 1e-315) in the surplus columns "
-	"instead of raising or clipping to the number of targets.")
 def test_tomtom_n_nearest_larger_than_targets():
 	Qs = _random_pwms([6, 8, 10], random_state=0)
 	Ts = _random_pwms([5, 7, 9, 11, 4], random_state=1)

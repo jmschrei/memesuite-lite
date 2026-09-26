@@ -410,7 +410,8 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		The number of nearest targets to keep for each query, where nearness is
 		defined by the p-value. Setting this can significant reduce memory
 		because, otherwise, you get a len(Qs) by len(Ts) complete matrix. If
-		None, return the complete matrix. Default is None.
+		None, return the complete matrix. Values larger than len(Ts) are
+		clipped to len(Ts). Default is None.
 
 	n_score_bins: int, optional
 		The number of bins to use when discretizing scores. A higher number is 
@@ -483,8 +484,12 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	else:
 		n_jobs = _n_jobs = numba.get_num_threads()
 
+	# Asking for more neighbors than there are targets returns every target;
+	# the surplus columns would otherwise be left uninitialized.
 	if n_nearest is None:
 		n_nearest = -1
+	else:
+		n_nearest = min(n_nearest, len(Ts))
 
 	if not isinstance(Qs[0], numpy.ndarray):
 		Qs = [Q.numpy() for Q in Qs]
