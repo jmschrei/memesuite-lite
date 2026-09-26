@@ -109,7 +109,7 @@ def _run_tomtom(args):
 		"\tScore\tOffset\tOverlap\tStrand")
 
 	for i in numpy.argsort(t_ps):
-		nq = query_pwms[0].shape[-1]
+		nq = len(q_seqs[i])
 		seq, offset, overlap = t_seqs[i], t_offsets[i], t_overlaps[i]
 
 		# When the reverse complement is the best match the offset and overlap

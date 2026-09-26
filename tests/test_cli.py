@@ -580,10 +580,6 @@ def test_run_tomtom_n_nearest(capsys):
 	assert len(rows) == 2 * len(read_meme(QUERIES))
 
 
-@pytest.mark.skip(reason="BUG: `_run_tomtom` sets `nq` from the first query "
-	"for every row, so in a multi-query file with different lengths the "
-	"aligned target sequence is formatted with the wrong query length (e.g. "
-	"the FOXL1 row in test2.meme drops the '.att' suffix).")
 def test_run_tomtom_multi_query_display(tmp_path, capsys):
 	# Each row of a multi-query run must be displayed exactly as in a
 	# single-query run of that query.
