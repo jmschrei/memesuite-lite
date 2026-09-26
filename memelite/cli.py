@@ -134,6 +134,10 @@ def _run_tomtom(args):
 			s2 = '-'*-offset + seq[:overlap]
 			s3 = seq[overlap:]
 
+			# A target that ends before the query does leaves query columns
+			# on the right unmatched as well.
+			s2 += '-' * (nq - len(s2))
+
 		s2 = [c if c == c0 else c.lower() for c, c0 in zip(s2, q_seqs[i])]
 		s2 = ''.join(s2)
 		

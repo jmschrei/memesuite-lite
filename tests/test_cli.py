@@ -561,10 +561,6 @@ def test_run_tomtom_aligned_middle_case(capsys):
 				assert c.isupper() == (c == c0)
 
 
-@pytest.mark.skip(reason="BUG: when the target lies strictly inside the "
-	"query (negative offset and offset + target length < query length) the "
-	"aligned middle is padded with dashes on the left only, e.g. query "
-	"GAACAGAATGTTC vs TEAD3_TEA_2 prints '---tgGAATGT' (11 of 13 columns).")
 def test_run_tomtom_aligned_middle_length(capsys):
 	_run_tomtom(_tomtom_namespace(query="GAACAGAATGTTC", thresh=0.5))
 
