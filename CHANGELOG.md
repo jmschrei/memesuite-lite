@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `fimo` now scores the last window of every sequence. The scan stopped one
+  position early, so a motif ending at the last base of a sequence was never
+  reported, and a sequence exactly as long as the motif was never scanned.
+- `tomtom` and `symmetric_tomtom` no longer write out of bounds, which could
+  corrupt memory, hang, or crash the process:
+  - When a query's histogram offset exceeded `n_cache` (e.g. `n_cache=20`, or
+    `n_score_bins` above about 200 with the default `n_cache`), the p-value
+    backgrounds overran the shared workspace. Such queries now get their own
+    workspace, so `n_cache` no longer affects results and the "Offset is
+    larger than `n_cache`" message is gone.
+  - With coarse target hashing (e.g. `n_target_bins=2`) the number of unique
+    target columns could be smaller than the longest target, overrunning the
+    alignment-score buffer in `_p_values`.
+  - `symmetric_tomtom` on motifs that all have length 1 wrote past its
+    background workspace.
+  - Integer scores are now held in `int16`/`int64` instead of `int8`/`int16`,
+    which overflowed for large `n_score_bins` or long motifs.
+
+### Changed
+
+- `symmetric_tomtom`'s numba kernels are now cached to disk like `tomtom`'s,
+  so they are no longer recompiled in every new process (about 4-6 s each).
+  The thread count is passed into the kernel instead of read inside it, which
+  had prevented caching.
+
+### Added
+
+- A much larger unit test suite: brute-force references for `fimo`, exact
+  p-value enumeration for short motifs, invariance and shape-grid tests for
+  `tomtom` and `symmetric_tomtom`, CLI flag coverage, `read_meme` format
+  robustness, and golden-output regression tests (`tests/test_golden.py`,
+  regenerated with `tests/generate_golden.py --force`). Known bugs that are
+  not yet fixed are covered by tests marked `skip` with the bug as the reason.
+
 ## [0.4.0]
 
 ### Fixed

@@ -19,7 +19,7 @@ from .tomtom import _p_values
 from .tomtom import tomtom
 
  
-@njit
+@njit(cache=True)
 def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 	"""An internal function that calculates the backgrounds for p-values.
 
@@ -101,9 +101,9 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 			B[i, j] = 1 - B[i, j]
 			
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
-	n_score_bins, n_median_bins, n_cache, reverse_complement):
+	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement):
 	"""An internal function implementing the TOMTOM algorithm.
 
 	This internal function is necessary to handle the numba component of the
@@ -125,16 +125,18 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 
 	# Re-usable workspace for each thread instead of re-allocating
 	# and freeing large arrays for each example.
-	n = numba.get_num_threads()
+	n = n_threads
 	n_len = Q_max*n_score_bins + Q_max*n_cache
 	
 	_gamma = numpy.empty((n, nt, Q_max), dtype='float64')
-	_gamma_int = numpy.empty((n, nt, Q_max), dtype='int8')
+	_gamma_int = numpy.empty((n, nt, Q_max), dtype='int16')
 	_f = numpy.empty((n, Q_max, n_score_bins+1), dtype='float64')
 
-	_A = numpy.empty((n, Q_max, Q_max, n_len), dtype='float64')
+	# `_p_value_backgrounds` uses A[0] and A[1], so the second axis is 2
+	# rather than Q_max, which is too small when every motif has length 1.
+	_A = numpy.empty((n, 2, Q_max, n_len), dtype='float64')
 	_B = numpy.empty((n, T_max+1, n_len), dtype='float64')
-	_A_csum = numpy.empty((n, Q_max, Q_max, n_len), dtype='float64')
+	_A_csum = numpy.empty((n, 2, Q_max, n_len), dtype='float64')
 
 	_medians = numpy.empty((n, Q_max), dtype='float64')
 	_median_bins = numpy.empty((n, n_median_bins, 2), dtype='float64')
@@ -151,14 +153,21 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			_gamma_int[pid], _f[pid], _medians[pid], _median_bins[pid], Q_norm, 
 			T_norm, rr_counts, Q_offsets[i], nq, n_score_bins)
 
-		if offset > n_cache:
-			print("Offset is larger than `n_cache`. Please increase `n_cache`"
-				" to at least ", offset)
+		# The backgrounds span nq*(n_score_bins+offset) bins. When the offset
+		# exceeds `n_cache` this can overrun the shared workspace, so allocate
+		# a large enough one for this query instead.
+		n_needed = nq*n_score_bins + nq*offset
+		if n_needed > n_len:
+			A = numpy.empty((2, nq, n_needed), dtype='float64')
+			B = numpy.empty((T_max+1, n_needed), dtype='float64')
+			A_csum = numpy.empty((2, nq, n_needed), dtype='float64')
+		else:
+			A, B, A_csum = _A[pid], _B[pid], _A_csum[pid]
 
-		_p_value_backgrounds(_f[pid], _A[pid], _B[pid], _A_csum[pid], nq, 
-			n_score_bins, T_max, offset)
+		_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, T_max, 
+			offset)
 
-		_p_values(_gamma_int[pid], _B[pid], rr_inv, T_lens, i, nq, offset, 
+		_p_values(_gamma_int[pid], B, rr_inv, T_lens, i, nq, offset, 
 			_results[pid])
 
 		if reverse_complement == 1:
@@ -242,7 +251,9 @@ def symmetric_tomtom(Xs, n_score_bins=100, n_median_bins=1000,
 	n_cache: int, optional
 		A cache size to use when allocating the scratchpad. A higher number will
 		linearly increase the amount of memory used but will not increase the
-		amount of compute needed. Default is 250.
+		amount of compute needed. A query that needs more than this is given
+		its own larger scratchpad, so this does not change the results.
+		Default is 100.
 
 	reverse_complement: bool, optional
 		Whether to automatically compare each query to targets and also the
@@ -322,7 +333,8 @@ def symmetric_tomtom(Xs, n_score_bins=100, n_median_bins=1000,
 	###
 	
 	results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, 
-		-1, n_score_bins, n_median_bins, n_cache, int(reverse_complement))
+		-1, n_score_bins, n_median_bins, n_cache, numba.get_num_threads(), 
+		int(reverse_complement))
 
 	if n_jobs != -1:
 		numba.set_num_threads(_n_jobs)

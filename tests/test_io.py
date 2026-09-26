@@ -4,6 +4,7 @@
 import os
 
 import numpy
+import pytest
 
 from memelite.io import read_meme
 from memelite.io import write_meme
@@ -263,3 +264,281 @@ def test_differing_widths(tmp_path):
 	assert motifs2["long"].shape == (4, 11)
 	assert_array_almost_equal(motifs2["short"], pwm_a, 4)
 	assert_array_almost_equal(motifs2["long"], pwm_b, 4)
+
+
+### randomized round-trips
+
+
+def _random_pwms(n, min_len=1, max_len=50, random_state=0):
+	state = numpy.random.RandomState(random_state)
+
+	pwms = []
+	for i in range(n):
+		length = state.randint(min_len, max_len+1)
+		pwm = state.dirichlet(numpy.ones(4) * 0.5, size=length).T
+		pwms.append(pwm)
+
+	return pwms
+
+
+@pytest.mark.parametrize("n", [1, 2, 7, 100])
+@pytest.mark.parametrize("random_state", [0, 1, 2])
+def test_round_trip_random_dict_exact(tmp_path, n, random_state):
+	pwms = _random_pwms(n, random_state=random_state)
+	motifs = {"motif_{}".format(i): pwm for i, pwm in enumerate(pwms)}
+	filename = str(tmp_path / "out.meme")
+
+	write_meme(filename, motifs)
+	motifs2 = read_meme(filename)
+
+	assert list(motifs2.keys()) == list(motifs.keys())
+
+	# `write_meme` formats floats with repr, which round-trips exactly.
+	for name, pwm in motifs.items():
+		assert motifs2[name].shape == pwm.shape
+		assert motifs2[name].dtype == numpy.float64
+		assert numpy.array_equal(motifs2[name], pwm)
+
+
+@pytest.mark.parametrize("n", [1, 5, 50])
+def test_round_trip_random_list_exact(tmp_path, n):
+	pwms = _random_pwms(n, random_state=3)
+	filename = str(tmp_path / "out.meme")
+
+	write_meme(filename, pwms)
+	motifs2 = read_meme(filename)
+
+	assert list(motifs2.keys()) == [str(i) for i in range(n)]
+	for pwm, pwm2 in zip(pwms, motifs2.values()):
+		assert numpy.array_equal(pwm, pwm2)
+
+
+@pytest.mark.parametrize("width", [1, 2, 3, 8, 21, 50])
+def test_round_trip_widths(tmp_path, width):
+	pwm = _random_pwms(1, min_len=width, max_len=width, random_state=width)[0]
+	filename = str(tmp_path / "out.meme")
+
+	write_meme(filename, {"m": pwm})
+	motifs2 = read_meme(filename)
+
+	assert motifs2["m"].shape == (4, width)
+	assert numpy.array_equal(motifs2["m"], pwm)
+
+
+def test_round_trip_extreme_values(tmp_path):
+	# Exact zeros, exact ones, subnormal-scale and many-digit values.
+	pwm = numpy.array([
+		[0.0, 1.0, 0.1234567890123456, 1e-300, 0.25],
+		[1.0, 0.0, 0.8765432109876544, 1 - 1e-16, 0.25],
+		[0.0, 0.0, 0.0, 5e-324, 0.25],
+		[0.0, 0.0, 0.0, 0.0, 0.25]
+	])
+	filename = str(tmp_path / "out.meme")
+
+	write_meme(filename, {"m": pwm})
+	motifs2 = read_meme(filename)
+
+	assert numpy.array_equal(motifs2["m"], pwm)
+
+
+@pytest.mark.parametrize("name", ["simple", "with space", "MA0001.1 AGL3",
+	"a/b:c|d", "FOSL2+JUND", "x-y_z(1)", "weird[]{};'\""])
+def test_round_trip_names(tmp_path, name):
+	pwm = numpy.full((4, 3), 0.25)
+	filename = str(tmp_path / "out.meme")
+
+	write_meme(filename, {name: pwm})
+	motifs2 = read_meme(filename)
+
+	assert list(motifs2.keys()) == [name]
+
+
+def test_round_trip_n_motifs_random(tmp_path):
+	pwms = _random_pwms(30, random_state=4)
+	filename = str(tmp_path / "out.meme")
+	write_meme(filename, pwms)
+
+	for k in [1, 2, 15, 29, 30, 31]:
+		motifs2 = read_meme(filename, n_motifs=k)
+		assert list(motifs2.keys()) == [str(i) for i in range(min(k, 30))]
+
+		for pwm, pwm2 in zip(pwms, motifs2.values()):
+			assert numpy.array_equal(pwm, pwm2)
+
+
+### write_meme exact text
+
+
+def test_write_meme_golden_text(tmp_path):
+	pwm = numpy.array([[0.5, 0.0], [0.25, 1.0], [0.125, 0.0], [0.125, 0.0]])
+	filename = str(tmp_path / "out.meme")
+
+	write_meme(filename, {"t": pwm})
+
+	with open(filename, "r") as infile:
+		contents = infile.read()
+
+	assert contents == ("MEME version 4\n\n"
+		"ALPHABET= ACGT\n\n"
+		"strands: + -\n\n"
+		"Background letter frequencies\n"
+		"A 0.25 C 0.25 G 0.25 T 0.25\n\n"
+		"MOTIF t\n"
+		"letter-probability matrix: alength= 4 w= 2 nsites= 1 E= 0\n"
+		"0.5 0.25 0.125 0.125\n"
+		"0.0 1.0 0.0 0.0\n"
+		"URL BLANK\n\n")
+
+
+def test_write_meme_rows_per_motif(tmp_path):
+	pwms = _random_pwms(10, random_state=5)
+	filename = str(tmp_path / "out.meme")
+	write_meme(filename, pwms)
+
+	with open(filename, "r") as infile:
+		lines = infile.read().split("\n")
+
+	starts = [i for i, line in enumerate(lines) if line.startswith("MOTIF")]
+	assert len(starts) == 10
+
+	for start, pwm in zip(starts, pwms):
+		assert lines[start+1] == ("letter-probability matrix: alength= 4 "
+			"w= {} nsites= 1 E= 0".format(pwm.shape[1]))
+
+		rows = lines[start+2:start+2+pwm.shape[1]]
+		assert all(len(row.split()) == 4 for row in rows)
+		assert lines[start+2+pwm.shape[1]] == "URL BLANK"
+
+
+def test_write_meme_empty(tmp_path):
+	filename = str(tmp_path / "out.meme")
+	write_meme(filename, {})
+
+	assert read_meme(filename) == {}
+	write_meme(filename, [])
+	assert read_meme(filename) == {}
+
+
+### read_meme format robustness
+
+
+_HEADER = "MEME version 4\n\nALPHABET= ACGT\n\n"
+_MOTIF_A = ("MOTIF a\n"
+	"letter-probability matrix: alength= 4 w= 2 nsites= 1 E= 0\n"
+	"0.1 0.2 0.3 0.4\n"
+	"0.25 0.25 0.25 0.25\n")
+_MOTIF_B = ("MOTIF b\n"
+	"letter-probability matrix: alength= 4 w= 1 nsites= 1 E= 0\n"
+	"1 0 0 0\n")
+
+_PWM_A = numpy.array([[0.1, 0.25], [0.2, 0.25], [0.3, 0.25], [0.4, 0.25]])
+_PWM_B = numpy.array([[1.0], [0.0], [0.0], [0.0]])
+
+
+def _read_text(tmp_path, text, **kwargs):
+	filename = str(tmp_path / "in.meme")
+	with open(filename, "w", newline="") as outfile:
+		outfile.write(text)
+
+	return read_meme(filename, **kwargs)
+
+
+def _assert_ab(motifs):
+	assert list(motifs.keys()) == ['a', 'b']
+	assert numpy.array_equal(motifs['a'], _PWM_A)
+	assert numpy.array_equal(motifs['b'], _PWM_B)
+
+
+def test_read_meme_standard_text(tmp_path):
+	motifs = _read_text(tmp_path, _HEADER + _MOTIF_A + "URL x\n\n" + _MOTIF_B
+		+ "URL y\n")
+	_assert_ab(motifs)
+
+
+def test_read_meme_crlf(tmp_path):
+	text = _HEADER + _MOTIF_A + "URL x\n\n" + _MOTIF_B + "URL y\n"
+	motifs = _read_text(tmp_path, text.replace("\n", "\r\n"))
+	_assert_ab(motifs)
+
+
+def test_read_meme_extra_blank_lines(tmp_path):
+	motifs = _read_text(tmp_path, _HEADER + "\n\n" + _MOTIF_A + "\n\n\n"
+		+ _MOTIF_B + "\n\n\n")
+	_assert_ab(motifs)
+
+
+def test_read_meme_tab_separated(tmp_path):
+	text = _MOTIF_A.replace("0.1 0.2 0.3 0.4", "0.1\t0.2\t0.3\t0.4")
+	motifs = _read_text(tmp_path, _HEADER + text + "\n")
+
+	assert numpy.array_equal(motifs['a'], _PWM_A)
+
+
+def test_read_meme_row_whitespace(tmp_path):
+	text = _MOTIF_A.replace("0.1 0.2 0.3 0.4", "  0.1  0.2 0.3 0.4  ")
+	motifs = _read_text(tmp_path, _HEADER + text + "\n")
+
+	assert numpy.array_equal(motifs['a'], _PWM_A)
+
+
+def test_read_meme_scientific_notation(tmp_path):
+	text = _MOTIF_A.replace("0.1 0.2", "1e-1 2.0E-01")
+	motifs = _read_text(tmp_path, _HEADER + text + "\n")
+
+	assert numpy.array_equal(motifs['a'], _PWM_A)
+
+
+def test_read_meme_lpm_extra_fields(tmp_path):
+	text = _MOTIF_A.replace("E= 0", "E= 1.2e-5 extra 7")
+	motifs = _read_text(tmp_path, _HEADER + text + "\n")
+
+	assert numpy.array_equal(motifs['a'], _PWM_A)
+
+
+def test_read_meme_alternate_name(tmp_path):
+	# The key is the full remainder of the MOTIF line, including an alternate
+	# name when one is given.
+	text = _MOTIF_A.replace("MOTIF a", "MOTIF MA0001.1 AGL3")
+	motifs = _read_text(tmp_path, _HEADER + text + "\n")
+
+	assert list(motifs.keys()) == ['MA0001.1 AGL3']
+
+
+def test_read_meme_empty_file(tmp_path):
+	assert _read_text(tmp_path, "") == {}
+
+
+def test_read_meme_header_only(tmp_path):
+	assert _read_text(tmp_path, _HEADER) == {}
+
+
+@pytest.mark.skip(reason="BUG: read_meme drops the last motif when the file "
+	"ends right after its final matrix row")
+@pytest.mark.parametrize("trailing", ["", "\n"])
+def test_read_meme_ends_after_matrix(tmp_path, trailing):
+	text = _HEADER + _MOTIF_A + "\n" + _MOTIF_B.rstrip("\n") + trailing
+	_assert_ab(_read_text(tmp_path, text))
+
+
+@pytest.mark.skip(reason="BUG: read_meme consumes a MOTIF line that directly "
+	"follows the previous matrix as the terminator and drops that motif")
+def test_read_meme_no_separator(tmp_path):
+	text = _HEADER + _MOTIF_A + _MOTIF_B + "\n"
+	_assert_ab(_read_text(tmp_path, text))
+
+
+@pytest.mark.skip(reason="BUG: read_meme takes the width from the sixth "
+	"whitespace token, so 'alength=4 w=2' (no space after '=') is misparsed")
+def test_read_meme_lpm_no_spaces(tmp_path):
+	text = _MOTIF_A.replace("alength= 4 w= 2", "alength=4 w=2")
+	motifs = _read_text(tmp_path, _HEADER + text + "\n")
+
+	assert numpy.array_equal(motifs['a'], _PWM_A)
+
+
+@pytest.mark.skip(reason="BUG: n_motifs=0 is checked only after a motif is "
+	"added, so it returns every motif instead of none")
+def test_read_meme_n_motifs_zero(tmp_path):
+	motifs = _read_text(tmp_path, _HEADER + _MOTIF_A + "\n" + _MOTIF_B + "\n",
+		n_motifs=0)
+	assert motifs == {}
