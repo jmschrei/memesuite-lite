@@ -1135,7 +1135,24 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	_fill_column_cache(Q, T, Q_norm, T_norm, rr_counts, q_cached, G_cache,
 		S_cache, n_median_bins)
 
-	for i in prange(len(Q_lens)):
+	# Queries are visited in increasing width, so consecutive iterations
+	# share kernel branches and workspace shapes. prange hands each thread a
+	# contiguous block, so the sorted queries are dealt round-robin into
+	# n_threads blocks: each block is still in width order and the blocks get
+	# similar mixes of widths. With one thread this is the sorted order. Each
+	# query's arithmetic and its output row i are unchanged.
+	n_q = len(Q_lens)
+	by_width = numpy.argsort(Q_lens, kind='mergesort')
+	order = numpy.empty(n_q, dtype='int64')
+	n_blocks = max(1, min(n_threads, n_q))
+	start = 0
+	for t in range(n_blocks):
+		for j in range(t, n_q, n_blocks):
+			order[start] = by_width[j]
+			start += 1
+
+	for ii in prange(len(Q_lens)):
+		i = order[ii]
 		nq = Q_lens[i]
 		pid = numba.get_thread_id()
 
