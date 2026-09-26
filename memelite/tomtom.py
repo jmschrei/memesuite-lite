@@ -657,6 +657,34 @@ def _merge_rc_results(results):
 			results[i, 4] = 1
 			
 
+@njit(cache=True)
+def _merge_rc_results_into(results, out):
+	"""Like `_merge_rc_results`, but writes the merged rows into `out`.
+
+	`results` holds both strands; `out` has one row per forward target. Each
+	element of `out` is written once, with the same values and tie rule.
+	"""
+
+	n = out.shape[0]
+
+	for i in range(n):
+		p = min(results[i, 0], results[i+n, 0])
+		p = 1 - (1 - p) ** 2
+
+		out[i, 0] = p
+		
+		if results[i, 1] <= results[i+n, 1]:                
+			out[i, 1] = results[i+n, 1]
+			out[i, 2] = results[i+n, 2]
+			out[i, 3] = results[i+n, 3]
+			out[i, 4] = 1
+		else:
+			out[i, 1] = results[i, 1]
+			out[i, 2] = results[i, 2]
+			out[i, 3] = results[i, 3]
+			out[i, 4] = 0
+
+
 @njit(parallel=True, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
 	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement):
@@ -733,17 +761,21 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		_p_values(_gamma_int[pid], B, rr_inv, T_lens, -1, nq, offset, 
 			_results[pid], reverse_complement)
 
-		if reverse_complement == 1:
-			_merge_rc_results(_results[pid])
+		# The full-matrix, two-strand case merges straight into the output.
+		if reverse_complement == 1 and n_nearest == -1:
+			_merge_rc_results_into(_results[pid], results[i])
 		else:
-			_results[pid, :, 4] = 0
+			if reverse_complement == 1:
+				_merge_rc_results(_results[pid])
+			else:
+				_results[pid, :, 4] = 0
 
-		if n_nearest == -1:
-			results[i] = _results[pid, :n_in_targets]
-		else:
-			idxs = numpy.argsort(_results[pid, :n_in_targets, 0])[:n_nearest]
-			results[i, :, :5] = _results[pid, idxs]
-			results[i, :, 5] = idxs
+			if n_nearest == -1:
+				results[i] = _results[pid, :n_in_targets]
+			else:
+				idxs = numpy.argsort(_results[pid, :n_in_targets, 0])[:n_nearest]
+				results[i, :, :5] = _results[pid, idxs]
+				results[i, :, 5] = idxs
 
 
 	return results            
