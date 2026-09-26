@@ -371,58 +371,72 @@ def _convolve_span(prev, row, f, k_lo, k_hi, prev_base, row_base):
 	[k_lo, k_hi] and s in [0, len(f)). Each element of row receives its terms
 	in ascending k, exactly as a scalar scatter over k would add them.
 
-	Four k are taken per pass over f, so each element of row is loaded and
-	stored once per four terms instead of once per term. Within a pass the
-	four terms are still added in ascending k and each is the same product,
-	so the result is bitwise the same. A term with prev == 0, which the
-	scatter skipped, adds +0.0 to a non-negative value and changes nothing.
+	With a = prev[k_lo + prev_base:] and out = row[k_lo + row_base:], this is
+	out[q] = sum over k' of a[k'] * f[q - k']. For a fixed q, ascending k' is
+	descending s = q - k', so the passes run over s from high to low, each
+	adding f[s] * a[t] into out[t + s]. The vector then runs over a, which is
+	several times longer than f. Four s are taken per pass, highest first, so
+	each element of out is loaded and stored once per four terms. Each term is
+	the same product (f[s] * a == a * f[s]) added in the same order, so the
+	result is bitwise the same. A term with a zero factor, which the scatter
+	skipped, adds +0.0 to a non-negative value and changes nothing.
 	"""
 
 	L = f.shape[0]
-	k = k_lo
+	nk = k_hi - k_lo + 1
 
-	if L >= 4:
-		n = L - 3
-		f0, f1, f2, f3 = f[3:3+n], f[2:2+n], f[1:1+n], f[0:n]
+	if nk < 4 or L < 4:
+		for k in range(k_lo, k_hi+1):
+			a = prev[k+prev_base]
+			if a != 0:
+				dst = row[k+row_base:k+row_base+L]
+				for s in range(L):
+					dst[s] += a * f[s]
+		return
 
-		while k + 3 <= k_hi:
-			a0, a1 = prev[k+prev_base], prev[k+1+prev_base]
-			a2, a3 = prev[k+2+prev_base], prev[k+3+prev_base]
-			b = k + row_base
+	a = prev[k_lo+prev_base:k_hi+prev_base+1]
+	out = row[k_lo+row_base:k_hi+row_base+L]
+	n = nk - 3
+	v0, v1, v2, v3 = a[0:n], a[1:1+n], a[2:2+n], a[3:3+n]
 
-			# The first and last three outputs lack some of the four terms.
-			for s in range(3):
-				x = row[b+s]
-				for r in range(s+1):
-					x += prev[k+r+prev_base] * f[s-r]
-				row[b+s] = x
+	s0 = L - 1
+	while s0 >= 3:
+		c0, c1, c2, c3 = f[s0], f[s0-1], f[s0-2], f[s0-3]
+		b = s0 - 3
 
-			# Contiguous 1-D views keep every index a non-negative loop
-			# counter, which is what lets this loop vectorize.
-			dst = row[b+3:b+L]
-			for t in range(n):
-				x = dst[t]
-				x += a0 * f0[t]
-				x += a1 * f1[t]
-				x += a2 * f2[t]
-				x += a3 * f3[t]
-				dst[t] = x
+		# The first and last three outputs lack some of the four terms.
+		for e in range(3):
+			x = out[b+e]
+			for r in range(3-e, 4):
+				x += f[s0-r] * a[e-3+r]
+			out[b+e] = x
 
-			for s in range(L, L+3):
-				x = row[b+s]
-				for r in range(s-L+1, 4):
-					x += prev[k+r+prev_base] * f[s-r]
-				row[b+s] = x
+		# Contiguous 1-D views keep every index a non-negative loop
+		# counter, which is what lets this loop vectorize.
+		dst = out[b+3:b+3+n]
+		for t in range(n):
+			x = dst[t]
+			x += c0 * v0[t]
+			x += c1 * v1[t]
+			x += c2 * v2[t]
+			x += c3 * v3[t]
+			dst[t] = x
 
-			k += 4
+		for e in range(3):
+			x = out[b+nk+e]
+			for r in range(3-e):
+				x += f[s0-r] * a[n+e+r]
+			out[b+nk+e] = x
 
-	while k <= k_hi:
-		a = prev[k+prev_base]
-		if a != 0:
-			dst = row[k+row_base:k+row_base+L]
-			for s in range(L):
-				dst[s] += a * f[s]
-		k += 1
+		s0 -= 4
+
+	while s0 >= 0:
+		c = f[s0]
+		if c != 0:
+			dst = out[s0:s0+nk]
+			for t in range(nk):
+				dst[t] += c * a[t]
+		s0 -= 1
 
 
 @njit(cache=True)
