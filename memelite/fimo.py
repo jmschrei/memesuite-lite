@@ -289,20 +289,20 @@ def _qmer_codes(X, n_rows, q):
 
 
 @numba.njit(inline='always')
-def _qmer_tables(tab, pwm, off, n, q, n_codes, n_groups):
-	"""tab[g * n_codes + c] = the summed weights of columns g*q .. g*q + q-1
+def _qmer_tables(tab, pwm, off, n, q, stride, n_groups):
+	"""tab[g * stride + c] = the summed weights of columns g*q .. g*q + q-1
 	of the motif whose columns start at `off`, for the q letters with code c.
-	Columns at or past `n` weigh 0.0. Each group's table is built in place,
-	from its last column to its first, each column multiplying its size by
-	the number of rows."""
+	`stride` is at least the number of codes, n_rows**q. Columns at or past
+	`n` weigh 0.0. Each group's table is built in place, from its last column
+	to its first, each column multiplying its size by the number of rows."""
 
 	n_rows = numpy.int64(pwm.shape[0])
 	q = numpy.int64(q)
 	n = numpy.int64(n)
 	off = numpy.int64(off)
-	n_codes = numpy.int64(n_codes)
+	stride = numpy.int64(stride)
 	for g in range(numpy.int64(n_groups)):
-		t0 = g * n_codes
+		t0 = g * stride
 		tab[t0] = 0.0
 		size = numpy.int64(1)
 		for d in range(q - 1, -1, -1):
@@ -347,9 +347,6 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 	n_motifs = len(pwm_lengths) - 1
 	n_chroms = len(chrom_lengths) - 1
 	q = numpy.uint64(q)
-	n_codes = numpy.uint64(1)
-	for _ in range(q):
-		n_codes *= numpy.uint64(pwm.shape[0])
 
 	hits = []
 	for i in range(n_motifs):
@@ -366,6 +363,13 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 		off = numpy.uint64(pwm_lengths[k])
 		p = numpy.uint64(min(numpy.uint64(2) * q, n))
 
+		# Every group's table starts `_TABLE_MAX` entries after the last,
+		# whatever the number of codes, so the second lookup of the prefix is a
+		# constant offset from the table's start and needs no register of its
+		# own. It is set inside the prange body because a value set outside is
+		# passed into the body as an argument, which LLVM cannot fold.
+		stride = numpy.uint64(_TABLE_MAX)
+
 		# Skip a motif whose best possible score cannot pass its threshold.
 		if tops[k] > cut:
 			# One table per group of q columns, and at least two, so that the
@@ -373,29 +377,45 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 			# all 0.0. An N reads the all-zero last row of `pwm` and adds
 			# +0.0, in the tables and in the rescoring loop below.
 			n_groups = max((n + q - numpy.uint64(1)) // q, numpy.uint64(2))
-			tab = numpy.empty(n_groups * n_codes, dtype=numpy.float64)
-			_qmer_tables(tab, pwm, off, n, q, n_codes, n_groups)
+			tab = numpy.empty(n_groups * stride, dtype=numpy.float64)
+			_qmer_tables(tab, pwm, off, n, q, stride, n_groups)
 			rest_p = rest[off+p]
 
 			for l in range(n_chroms):        
 				start = numpy.uint64(chrom_lengths[l])
 				end = numpy.uint64(chrom_lengths[l+1])
 				
-				for i in range(end-start-n+1):
-					i = numpy.uint64(i)
-					base = start + i
+				# Windows start at positions x from `start` to `xe` - 1.
+				m = numpy.uint64(max(numpy.int64(end - start) -
+					numpy.int64(n) + 1, 0))
+				xe = start + m
+				x = start
+				while x < xe:
+					# The first 2q columns in two lookups, in a loop of its own
+					# that moves to the next window until one survives this
+					# test, which about 1% of windows do on real motifs. With
+					# nothing else in the loop, its pointers, position and
+					# bounds stay in registers; in one loop with the code
+					# below, LLVM reloaded and spilled them for every window.
+					# Only the bound test uses these columns.
+					bound = 0.0
+					while x < xe:
+						bound = tab[numpy.uint64(codes[x])] + tab[stride +
+							numpy.uint64(codes[x+q])]
+						if bound + rest_p <= cut:
+							x += numpy.uint64(1)
+							continue
+						break
 
-					# The first 2q columns in two lookups. Only the bound test
-					# uses them.
-					bound = tab[numpy.uint64(codes[base])] + tab[n_codes +
-						numpy.uint64(codes[base+q])]
-					if bound + rest_p <= cut:
-						continue
+					if x >= xe:
+						break
 
+					base = x
+					i = x - start
 					alive = True
 					g = numpy.uint64(2)
 					while g < n_groups:
-						bound += tab[g * n_codes + numpy.uint64(codes[base+g*q])]
+						bound += tab[g * stride + numpy.uint64(codes[base+g*q])]
 						j1 = min((g + numpy.uint64(1)) * q, n)
 						if bound + rest[off+j1] <= cut:
 							alive = False
@@ -403,6 +423,7 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 						g += numpy.uint64(1)
 
 					if not alive:
+						x += numpy.uint64(1)
 						continue
 
 					# A window that survives is scored strictly left to right,
@@ -422,6 +443,8 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 						score_idx += score_to_pval_lengths[k]
 						hits[k].append((numpy.int64(l), i, i+n, score, 
 							2.0 ** score_to_pvals[score_idx]))
+
+					x += numpy.uint64(1)
 
 	# `numpy.zeros` and a prange each start a parallel region, which costs
 	# about 20 us, so the offsets are filled serially and a small number of
