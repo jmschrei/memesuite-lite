@@ -1470,9 +1470,9 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, NB):
 	sums receive the same integer terms as in `_p_values_sums`, and every
 	query in the batch must satisfy its int32 bound.
 
-	Position p is final once row p has been added, so each query's maximum
-	M and the first and last positions holding it are tracked as the rows
-	go: the same M, kf and kl as the separate scans in `_p_values_sums`.
+	Each query's maximum M and the first and last positions holding it are
+	tracked over the target's positions once its rows are added: the same M,
+	kf and kl as the separate scans in `_p_values_sums`.
 	That update always runs over 16 lanes, which LLVM vectorizes with
 	selects; over NB < 16 lanes the selects became data-dependent branches.
 	Lanes at or above NB read the next position and are ignored, so t_sums
@@ -1522,12 +1522,45 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, NB):
 					j = uint64(j)
 					t_sums[base + j] += G[r, j]
 
+		# The tracking runs after the target's rows are added, four positions
+		# per pass over the 16 lanes, so mv, fv and lv are loaded and stored
+		# once per four positions instead of once per position; each lane
+		# still sees the positions in increasing k with the same comparisons.
+		k = uint64(0)
+		while k + uint64(4) <= m:
+			base = k * nb
+			k1, k2, k3 = k + uint64(1), k + uint64(2), k + uint64(3)
+			for b in range(16):
+				ub = uint64(b)
+				mb, fb, lb = mv[b], fv[b], lv[b]
+				v = t_sums[base + ub]
+				fb = numpy.int32(k) if v > mb else fb
+				lb = numpy.int32(k) if v >= mb else lb
+				mb = max(mb, v)
+				v = t_sums[base + nb + ub]
+				fb = numpy.int32(k1) if v > mb else fb
+				lb = numpy.int32(k1) if v >= mb else lb
+				mb = max(mb, v)
+				v = t_sums[base + uint64(2) * nb + ub]
+				fb = numpy.int32(k2) if v > mb else fb
+				lb = numpy.int32(k2) if v >= mb else lb
+				mb = max(mb, v)
+				v = t_sums[base + uint64(3) * nb + ub]
+				fb = numpy.int32(k3) if v > mb else fb
+				lb = numpy.int32(k3) if v >= mb else lb
+				mb = max(mb, v)
+				mv[b], fv[b], lv[b] = mb, fb, lb
+			k += uint64(4)
+
+		while k < m:
+			base = k * nb
 			for b in range(16):
 				v = t_sums[base + uint64(b)]
 				mb = mv[b]
 				fv[b] = numpy.int32(k) if v > mb else fv[b]
 				lv[b] = numpy.int32(k) if v >= mb else lv[b]
 				mv[b] = max(mb, v)
+			k += uint64(1)
 
 		for b in range(NB):
 			if not active[b]:
