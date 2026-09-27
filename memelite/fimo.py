@@ -284,6 +284,15 @@ def _all_pwm_to_mapping(motifs, motif_lengths, bin_size):
 _QMAX = 5
 _TABLE_MAX = 3125
 
+# `_fast_hits` runs the first test on this many consecutive windows at a time
+# and branches once per block. Chosen by measurement on the benchmark (AMD Zen
+# 5): at 16 the block compiles to scalar code without the loop's increment,
+# compare and branch for every window, and the call was 0.006 s faster than
+# with one window at a time; 8 was no different from 16. From 32 LLVM
+# vectorizes the block with gathers, which cost about 0.9 cycles per table
+# entry on this machine, and at 64 the call was 0.027 s slower.
+_N_LANE = 16
+
 
 def _score_bounds(pwm, pwm_lengths, thresholds):
 	"""Upper bounds that let `_fast_hits` abandon a window early.
@@ -588,8 +597,10 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 		# whatever the number of codes, so the second lookup of the first test
 		# is a constant offset from the table's start and needs no register of
 		# its own. It is set inside the prange body because a value set outside
-		# is passed into the body as an argument, which LLVM cannot fold.
+		# is passed into the body as an argument, which LLVM cannot fold; so is
+		# the number of windows per block of the first test.
 		stride = numpy.uint64(_TABLE_MAX)
+		n_lane = numpy.uint64(_N_LANE)
 
 		# Skip a motif whose best possible score cannot pass its threshold.
 		if tops[k] > cut:
@@ -615,15 +626,39 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 				xe = start + m
 				x = start
 				while x < xe:
-					# The first test, in a loop of its own that moves to the
-					# next window until one survives it, which about 0.3% of
-					# windows do on real motifs. With nothing else in the loop,
-					# its pointers, position and bounds stay in registers; in
-					# one loop with the code below, LLVM reloaded and spilled
-					# them for every window. Only the bound test uses these
-					# columns.
+					# The first test on `n_lane` consecutive windows at a
+					# time, with one branch per block of windows: a block
+					# is skipped when none of its windows survives, and
+					# 1.6% of blocks on the benchmark have one that does.
+					# The trip count is a constant, so LLVM unrolls the loop
+					# fully; numba does not run LLVM's SLP vectorizer, so
+					# the unrolled test is scalar. Each window's test is the
+					# one below, perhaps added in another order, which the
+					# margin in `_score_bounds` covers, so a skipped block
+					# holds no window that could be a hit.
+					while x + n_lane <= xe:
+						any_alive = False
+						for v in range(n_lane):
+							xv = x + numpy.uint64(v)
+							b = tab[numpy.uint64(codes[xv+o1])] + tab[stride +
+								numpy.uint64(codes[xv+o2])]
+							any_alive = any_alive | (b + rest_p > cut)
+						if any_alive:
+							break
+						x += n_lane
+
+					# The windows of a block that has a survivor, and the
+					# last windows of a segment, go through the first test
+					# one at a time, in a loop of its own that moves to the
+					# next window until one survives it. With nothing else
+					# in the loop, its pointers, position and bounds stay in
+					# registers; in one loop with the code below, LLVM
+					# reloaded and spilled them for every window, and it
+					# also does so without the `bound = 0.0` before the
+					# loop. Only the bound test uses these columns.
+					xb = min(x + n_lane, xe)
 					bound = 0.0
-					while x < xe:
+					while x < xb:
 						bound = tab[numpy.uint64(codes[x+o1])] + tab[stride +
 							numpy.uint64(codes[x+o2])]
 						if bound + rest_p <= cut:
@@ -631,8 +666,8 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 							continue
 						break
 
-					if x >= xe:
-						break
+					if x >= xb:
+						continue
 
 					base = x
 					i = x - start
