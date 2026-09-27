@@ -154,12 +154,17 @@ def _all_pwm_to_mapping(motifs, motif_lengths, bin_size):
 	return smallests, logpdfs
 
 
-# How often `_fast_hits` tests whether a window can still reach its threshold:
-# once after the first `_PREFIX` columns, then after every `_STEP` columns.
-# Chosen by measurement on the benchmark; a test after every column was slower
+# How `_fast_hits` bounds a window. Every sequence position gets a code for
+# the q letters starting there, and each motif gets tables of the summed
+# weights of q consecutive columns for every code, so q columns cost one
+# lookup. q is the largest value up to `_QMAX` whose tables have at most
+# `_TABLE_MAX` entries: 5 for DNA, whose 4 letters plus N give 5**5 = 3125.
+# A window is tested once after the first two groups of q columns, then after
+# every group. Chosen by measurement on the benchmark: two groups of 5 beat
+# two or three groups of 4 or 3, and a test after every column was slower
 # than no test at all, because the branch that leaves the window mispredicts.
-_PREFIX = 8
-_STEP = 4
+_QMAX = 5
+_TABLE_MAX = 3125
 
 
 def _score_bounds(pwm, pwm_lengths, thresholds):
@@ -174,7 +179,10 @@ def _score_bounds(pwm, pwm_lengths, thresholds):
 	largest score motif k can reach at all.
 
 	A window is abandoned only when its partial score plus the remaining bound
-	is at most `cuts[k]`, the threshold minus a margin. Every float sum
+	is at most `cuts[k]`, the threshold minus a margin. The partial score is a
+	sum of table entries that each sum q columns (with +0.0 for columns past
+	the motif's end, which is exact), so it is one more order of addition of
+	the same terms. Every float sum
 	involved (the partial score, the bounds, and the full score, in any order
 	of addition) has at most n terms of magnitude at most
 	W = sum over columns of the largest finite |entry|, and any order of
@@ -227,6 +235,78 @@ def _score_bounds(pwm, pwm_lengths, thresholds):
 	return rest, cuts, tops
 
 
+def _qmer_width(n_rows):
+	"""The number of letters per code, for a PWM with `n_rows` rows including
+	the zero row for N: the largest q up to `_QMAX` with n_rows**q entries at
+	most `_TABLE_MAX`."""
+
+	q = 1
+	while q < _QMAX and n_rows ** (q + 1) <= _TABLE_MAX:
+		q += 1
+	return q
+
+
+@numba.njit(cache=True)
+def _qmer_codes(X, n_rows, q):
+	"""The code of the q letters starting at each position of `X`,
+	X[i] + n_rows * X[i+1] + ... + n_rows**(q-1) * X[i+q-1], built one letter
+	at a time from the last so that each pass vectorizes. Positions past the
+	end of `X` read as N (n_rows - 1), and there are 2q codes more than
+	positions, so a read at a window's start plus q is always in bounds. A code
+	that runs past the end of its sequence is only ever read through table
+	columns that weigh 0.0."""
+
+	L = X.shape[0]
+	n_codes = L + 2 * q
+	codes = numpy.empty(n_codes, dtype=numpy.uint16)
+	b = numpy.uint16(n_rows)
+	letter_n = numpy.uint16(n_rows - 1)
+
+	m = max(min(L - (q - 1), n_codes), 0)
+	for i in range(m):
+		codes[i] = numpy.uint16(X[i + q - 1])
+	for i in range(m, n_codes):
+		codes[i] = letter_n
+
+	for d in range(q - 2, -1, -1):
+		m = max(min(L - d, n_codes), 0)
+		for i in range(m):
+			codes[i] = codes[i] * b + numpy.uint16(X[i + d])
+		for i in range(m, n_codes):
+			codes[i] = codes[i] * b + letter_n
+
+	return codes
+
+
+@numba.njit(inline='always')
+def _qmer_tables(tab, pwm, off, n, q, n_codes, n_groups):
+	"""tab[g * n_codes + c] = the summed weights of columns g*q .. g*q + q-1
+	of the motif whose columns start at `off`, for the q letters with code c.
+	Columns at or past `n` weigh 0.0. Each group's table is built in place,
+	from its last column to its first, each column multiplying its size by
+	the number of rows."""
+
+	n_rows = numpy.int64(pwm.shape[0])
+	q = numpy.int64(q)
+	n = numpy.int64(n)
+	off = numpy.int64(off)
+	n_codes = numpy.int64(n_codes)
+	for g in range(numpy.int64(n_groups)):
+		t0 = g * n_codes
+		tab[t0] = 0.0
+		size = numpy.int64(1)
+		for d in range(q - 1, -1, -1):
+			col = g * q + d
+			for t in range(size - 1, -1, -1):
+				v = tab[t0 + t]
+				for s in range(n_rows - 1, -1, -1):
+					w = 0.0
+					if col < n:
+						w = numpy.float64(pwm[s, off + col])
+					tab[t0 + t * n_rows + s] = v + w
+			size *= n_rows
+
+
 @numba.njit(inline='always')
 def _copy_hits(hits, o, seqs, starts, ends, scores, pvals):
 	"""Copy one motif's hits into rows `o` onwards of the hit columns."""
@@ -241,18 +321,25 @@ def _copy_hits(hits, o, seqs, starts, ends, scores, pvals):
 
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
-def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size, 
-	smallest, score_to_pvals, score_to_pval_lengths, rest, cuts, tops, order):
+def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold, 
+	bin_size, smallest, score_to_pvals, score_to_pval_lengths, rest, cuts, tops, 
+	order):
 	"""Scan every motif over every sequence and return the hits as columns.
 
-	The hits of each motif are collected in a list while it is scanned, then
-	copied into flat arrays in the order given by `order`, so that the hits of
-	motif `order[t]` are rows `offsets[t]` to `offsets[t+1]` of the returned
-	sequence index, start, end, score and p-value arrays.
+	`codes` and `q` come from `_qmer_codes`: the bound that abandons a window
+	reads q columns per table lookup. The hits of each motif are collected in
+	a list while it is scanned, then copied into flat arrays in the order given
+	by `order`, so that the hits of motif `order[t]` are rows `offsets[t]` to
+	`offsets[t+1]` of the returned sequence index, start, end, score and
+	p-value arrays.
 	"""
 
 	n_motifs = len(pwm_lengths) - 1
 	n_chroms = len(chrom_lengths) - 1
+	q = numpy.uint64(q)
+	n_codes = numpy.uint64(1)
+	for _ in range(q):
+		n_codes *= numpy.uint64(pwm.shape[0])
 
 	hits = []
 	for i in range(n_motifs):
@@ -267,10 +354,19 @@ def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size,
 		thresh = score_threshold[k]
 		cut = cuts[k]
 		off = numpy.uint64(pwm_lengths[k])
-		p = numpy.uint64(min(numpy.uint64(_PREFIX), n))
+		p = numpy.uint64(min(numpy.uint64(2) * q, n))
 
 		# Skip a motif whose best possible score cannot pass its threshold.
 		if tops[k] > cut:
+			# One table per group of q columns, and at least two, so that the
+			# first test always reads two. Groups past the motif's end are
+			# all 0.0. An N reads the all-zero last row of `pwm` and adds
+			# +0.0, in the tables and in the rescoring loop below.
+			n_groups = max((n + q - numpy.uint64(1)) // q, numpy.uint64(2))
+			tab = numpy.empty(n_groups * n_codes, dtype=numpy.float64)
+			_qmer_tables(tab, pwm, off, n, q, n_codes, n_groups)
+			rest_p = rest[off+p]
+
 			for l in range(n_chroms):        
 				start = numpy.uint64(chrom_lengths[l])
 				end = numpy.uint64(chrom_lengths[l+1])
@@ -279,40 +375,22 @@ def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size,
 					i = numpy.uint64(i)
 					base = start + i
 
-					# The first p columns as two interleaved partial sums, which
-					# halves the chain of dependent additions. Only the bound
-					# test uses them. An N reads the all-zero last row of `pwm`
-					# and adds +0.0, here and in both loops below.
-					a = 0.0
-					b = 0.0
-					j = numpy.uint64(0)
-					while j + numpy.uint64(1) < p:
-						idx = numpy.uint64(X[base+j])
-						a += pwm[idx, off+j]
-						idx = numpy.uint64(X[base+j+numpy.uint64(1)])
-						b += pwm[idx, off+j+numpy.uint64(1)]
-						j += numpy.uint64(2)
-					if j < p:
-						idx = numpy.uint64(X[base+j])
-						a += pwm[idx, off+j]
-
-					bound = a + b
-					if bound + rest[off+p] <= cut:
+					# The first 2q columns in two lookups. Only the bound test
+					# uses them.
+					bound = tab[numpy.uint64(codes[base])] + tab[n_codes + 
+						numpy.uint64(codes[base+q])]
+					if bound + rest_p <= cut:
 						continue
 
 					alive = True
-					j0 = p
-					while j0 < n:
-						j1 = min(j0 + numpy.uint64(_STEP), n)
-						for j in range(j0, j1):
-							j = numpy.uint64(j)
-							idx = numpy.uint64(X[base+j])
-							bound += pwm[idx, off+j]
-
+					g = numpy.uint64(2)
+					while g < n_groups:
+						bound += tab[g * n_codes + numpy.uint64(codes[base+g*q])]
+						j1 = min((g + numpy.uint64(1)) * q, n)
 						if bound + rest[off+j1] <= cut:
 							alive = False
 							break
-						j0 = j1
+						g += numpy.uint64(1)
 
 					if not alive:
 						continue
@@ -553,11 +631,16 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	if reverse_complement:
 		order = order.reshape(2, n_).T.flatten()
 
+	# The code of the q letters at every position, shared by every motif.
+	q = _qmer_width(n_alpha + 1)
+	codes = _qmer_codes(X, n_alpha + 1, q)
+
 	_rest, _cuts, _tops = _score_bounds(motif_pwms, motif_lengths,
 		_score_thresholds)
-	offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, X_lengths, 
-		pwms_n, motif_lengths, _score_thresholds, bin_size, _smallest, 
-		_score_to_pvals, _score_to_pvals_lengths, _rest, _cuts, _tops, order)
+	offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes, q, 
+		X_lengths, pwms_n, motif_lengths, _score_thresholds, bin_size, 
+		_smallest, _score_to_pvals, _score_to_pvals_lengths, _rest, _cuts, 
+		_tops, order)
 
 	if return_counts == True:
 		return numpy.diff(offsets[::step]).astype('int32')
