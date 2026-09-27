@@ -226,9 +226,30 @@ def _score_bounds(pwm, pwm_lengths, thresholds):
 	return rest, cuts, tops
 
 
+@numba.njit(inline='always')
+def _copy_hits(hits, o, seqs, starts, ends, scores, pvals):
+	"""Copy one motif's hits into rows `o` onwards of the hit columns."""
+
+	for h in range(len(hits)):
+		l, start, end, score, pval = hits[h]
+		seqs[o+h] = l
+		starts[o+h] = numpy.int64(start)
+		ends[o+h] = numpy.int64(end)
+		scores[o+h] = score
+		pvals[o+h] = pval
+
+
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size, 
-	smallest, score_to_pvals, score_to_pval_lengths, rest, cuts, tops):
+	smallest, score_to_pvals, score_to_pval_lengths, rest, cuts, tops, order):
+	"""Scan every motif over every sequence and return the hits as columns.
+
+	The hits of each motif are collected in a list while it is scanned, then
+	copied into flat arrays in the order given by `order`, so that the hits of
+	motif `order[t]` are rows `offsets[t]` to `offsets[t+1]` of the returned
+	sequence index, start, end, score and p-value arrays.
+	"""
+
 	n_motifs = len(pwm_lengths) - 1
 	n_chroms = len(chrom_lengths) - 1
 
@@ -318,7 +339,31 @@ def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size,
 						hits[k].append((numpy.int64(l), i, i+n, score, 
 							2.0 ** score_to_pvals[score_idx]))
 
-	return hits
+	# `numpy.zeros` and a prange each start a parallel region, which costs
+	# about 20 us, so the offsets are filled serially and a small number of
+	# hits is copied serially.
+	offsets = numpy.empty(n_motifs + 1, dtype=numpy.int64)
+	offsets[0] = 0
+	for t in range(n_motifs):
+		offsets[t+1] = offsets[t] + len(hits[order[t]])
+
+	n_total = offsets[n_motifs]
+	seqs = numpy.empty(n_total, dtype=numpy.int64)
+	starts = numpy.empty(n_total, dtype=numpy.int64)
+	ends = numpy.empty(n_total, dtype=numpy.int64)
+	scores = numpy.empty(n_total, dtype=numpy.float64)
+	pvals = numpy.empty(n_total, dtype=numpy.float64)
+
+	if n_total < 1024:
+		for t in range(n_motifs):
+			_copy_hits(hits[order[t]], offsets[t], seqs, starts, ends, scores, 
+				pvals)
+	else:
+		for t in numba.prange(n_motifs):
+			_copy_hits(hits[order[t]], offsets[t], seqs, starts, ends, scores, 
+				pvals)
+
+	return offsets, seqs, starts, ends, scores, pvals
 
 
 @numba.njit(cache=True)
@@ -492,45 +537,87 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		X = X.astype(numpy.int8).flatten()
 		X_lengths = X_lengths.astype(numpy.int64)
 
-	# Use a fast numba function to run the core algorithm
+	# Use a fast numba function to run the core algorithm. The hits come back
+	# as flat columns ordered by output DataFrame: each motif's forward hits,
+	# then, if scanned, the hits of its reverse complement.
+	n_ = n_motifs // 2 if reverse_complement else n_motifs
+	step = 2 if reverse_complement else 1
+
+	order = numpy.arange(n_motifs, dtype=numpy.int64)
+	if reverse_complement:
+		order = order.reshape(2, n_).T.flatten()
+
 	_rest, _cuts, _tops = _score_bounds(motif_pwms, motif_lengths,
 		_score_thresholds)
-	hits = _fast_hits(X, X_lengths, motif_pwms, motif_lengths, 
-		_score_thresholds, bin_size, _smallest, _score_to_pvals, 
-		_score_to_pvals_lengths, _rest, _cuts, _tops)
-
-
-	# Convert the results to pandas DataFrames
-	names = ['sequence_name', 'start', 'end', 'score', 'p-value']
-	n_ = n_motifs // 2 if reverse_complement else n_motifs
+	offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, X_lengths, 
+		motif_pwms, motif_lengths, _score_thresholds, bin_size, _smallest, 
+		_score_to_pvals, _score_to_pvals_lengths, _rest, _cuts, _tops, order)
 
 	if return_counts == True:
-		counts = numpy.zeros(n_, dtype='int32')
-		for i in range(n_):
-			counts[i] = len(hits[i])
-			if reverse_complement:
-				counts[i] += len(hits[i+n_])
+		return numpy.diff(offsets[::step]).astype('int32')
 
-		return counts
+	# Convert the results to pandas DataFrames
+	names = ['motif_name', 'motif_idx', 'sequence_name', 'start', 'end', 
+		'strand', 'score', 'p-value']
 
+	# Names that are all strings go in an object column directly; anything
+	# else is passed as a list so pandas infers the column's dtype.
+	string_names = motif_names.dtype.kind == 'U'
+	if sequence_names is not None:
+		sequence_names_ = sequence_names.astype(object)
+
+	hits, empty = [], None
 	for i in range(n_):
-		if reverse_complement:
-			hits_ = pandas.DataFrame(hits[i] + hits[i + n_], columns=names)
-			hits_['strand'] = ['+'] * len(hits[i]) + ['-'] * len(hits[i+n_])
-		else:
-			hits_ = pandas.DataFrame(hits[i], columns=names)
-			hits_['strand'] = ['+'] * len(hits[i])
+		a, b = offsets[step*i], offsets[step*i + step]
+		n_fwd = offsets[step*i + 1] - a
+		n = b - a
 
-		hits_['motif_name'] = [motif_names[i] for _ in range(len(hits_))]
-		hits_['motif_idx'] = numpy.ones(len(hits_), dtype='int64') * i
+		# Every DataFrame without hits is the same, so build one, in the way
+		# that sets its dtypes, and copy it for the rest.
+		if n == 0:
+			if empty is None:
+				empty = pandas.DataFrame([], columns=['sequence_name', 
+					'start', 'end', 'score', 'p-value'])
+				empty['strand'] = []
+				empty['motif_name'] = []
+				empty['motif_idx'] = numpy.ones(0, dtype='int64')
+
+				if sequence_names is not None:
+					empty['sequence_name'] = sequence_names[
+						empty['sequence_name']]
+
+				empty = empty[names]
+				hits.append(empty)
+			else:
+				hits.append(empty.copy())
+
+			continue
+
+		if string_names:
+			names_ = numpy.empty(n, dtype=object)
+			names_[:] = motif_names[i]
+		else:
+			names_ = [motif_names[i]] * n
+
+		strands = numpy.empty(n, dtype=object)
+		strands[:n_fwd] = '+'
+		strands[n_fwd:] = '-'
 
 		if sequence_names is not None:
-			hits_['sequence_name'] = sequence_names[hits_['sequence_name']]
-			
-		hits[i] = hits_[['motif_name', 'motif_idx', 'sequence_name', 'start', 
-			'end', 'strand', 'score', 'p-value']]
+			sequence_idxs = sequence_names_[seqs[a:b]]
+		else:
+			sequence_idxs = seqs[a:b]
 
-	hits = hits[:n_]
+		hits.append(pandas.DataFrame({
+			'motif_name': names_,
+			'motif_idx': numpy.full(n, i, dtype=numpy.int64),
+			'sequence_name': sequence_idxs,
+			'start': starts[a:b],
+			'end': ends[a:b],
+			'strand': strands,
+			'score': scores[a:b],
+			'p-value': pvals[a:b]
+		}))
 
 	if dim == 1:
 		hits = [df for df in hits if len(df) > 0]
