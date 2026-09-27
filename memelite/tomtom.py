@@ -194,14 +194,39 @@ def _column_stats(g_row, mxb, mnb, zb, median_bins, Y_counts, halfway):
 	return z_min_, z_max_, m
 
 
+@njit(cache=True, inline='always')
+def _distance4(xn, x0, x1, x2, x3, yn, y0, y1, y2, y3):
+	"""One element of a distance row: the 4-letter loop's operations, in its
+	order, from `_column_distances`."""
+
+	z = xn + yn
+	z -= x0 * y0
+	z -= x1 * y1
+	z -= x2 * y2
+	z -= x3 * y3
+	return -math.sqrt(z) if z > 0 else 0.0
+
+
 @njit(cache=True)
-def _distances_block4(X, Y, Y_norm, X_norm, c0, c1, c2, c3, r0, r1, r2, r3):
-	"""Distance rows of four query columns in one sweep over the targets.
+def _distances_block4(X, Y, Y_norm, X_norm, c0, c1, c2, c3, r0, r1, r2, r3,
+	L):
+	"""Distance rows of four query columns in one sweep over the targets,
+	with each row's min and max.
 
 	Each target column's four values and norm are loaded once for the four
 	query columns. Every row element gets exactly the operations of the
 	4-letter loop in `_column_distances`, in the same order, so the rows are
 	bitwise the same; only the loop nest is reorganized.
+
+	Returns (min0, max0, min1, max1, min2, max2, min3, max3). The targets
+	run in tiles of 64, and element t of a tile updates lane t of each row's
+	running max and min in `L` (8 x 64 scratch) in the same loop that writes
+	it, which vectorizes: the lanes are 8 masked read-modify-writes per
+	8 targets that stay in L1. A separate pass over each row (as
+	`_column_stats` does) re-reads 4 rows of 150 kB. Every value is -sqrt(z)
+	with z > 0 or +0.0, never NaN and never -0.0, so max and min over the
+	lanes, the tail and the +-9999999.9 starting values give the bits
+	`_column_stats` gives, in any order.
 
 	Y must have four rows. For an F-ordered Y (`symmetric_tomtom`, or
 	`tomtom` with n_target_bins=None) the check below is what fixes the
@@ -210,43 +235,71 @@ def _distances_block4(X, Y, Y_norm, X_norm, c0, c1, c2, c3, r0, r1, r2, r3):
 	"""
 
 	n_a, n_y = Y.shape[0], Y.shape[-1]
+	lo, hi = 9999999.9, -9999999.9
 	if n_a != 4:
-		return
+		return lo, hi, lo, hi, lo, hi, lo, hi
+
 	a0, a1, a2, a3 = 2 * X[0, c0], 2 * X[1, c0], 2 * X[2, c0], 2 * X[3, c0]
 	b0, b1, b2, b3 = 2 * X[0, c1], 2 * X[1, c1], 2 * X[2, c1], 2 * X[3, c1]
 	d0, d1, d2, d3 = 2 * X[0, c2], 2 * X[1, c2], 2 * X[2, c2], 2 * X[3, c2]
 	e0, e1, e2, e3 = 2 * X[0, c3], 2 * X[1, c3], 2 * X[2, c3], 2 * X[3, c3]
 	xa, xb, xd, xe = X_norm[c0], X_norm[c1], X_norm[c2], X_norm[c3]
-	for j in range(n_y):
+
+	M0, N0, M1, N1, M2, N2, M3, N3 = L[0], L[1], L[2], L[3], L[4], L[5], \
+		L[6], L[7]
+	for t in range(64):
+		M0[t], M1[t], M2[t], M3[t] = hi, hi, hi, hi
+		N0[t], N1[t], N2[t], N3[t] = lo, lo, lo, lo
+
+	nb = n_y - n_y % 64
+	for j0 in range(0, nb, 64):
+		for t in range(64):
+			j = j0 + t
+			y0, y1, y2, y3, yn = Y[0, j], Y[1, j], Y[2, j], Y[3, j], Y_norm[j]
+
+			g = _distance4(xa, a0, a1, a2, a3, yn, y0, y1, y2, y3)
+			r0[j] = g
+			M0[t] = g if g > M0[t] else M0[t]
+			N0[t] = g if g < N0[t] else N0[t]
+
+			g = _distance4(xb, b0, b1, b2, b3, yn, y0, y1, y2, y3)
+			r1[j] = g
+			M1[t] = g if g > M1[t] else M1[t]
+			N1[t] = g if g < N1[t] else N1[t]
+
+			g = _distance4(xd, d0, d1, d2, d3, yn, y0, y1, y2, y3)
+			r2[j] = g
+			M2[t] = g if g > M2[t] else M2[t]
+			N2[t] = g if g < N2[t] else N2[t]
+
+			g = _distance4(xe, e0, e1, e2, e3, yn, y0, y1, y2, y3)
+			r3[j] = g
+			M3[t] = g if g > M3[t] else M3[t]
+			N3[t] = g if g < N3[t] else N3[t]
+
+	mn0, mx0, mn1, mx1, mn2, mx2, mn3, mx3 = lo, hi, lo, hi, lo, hi, lo, hi
+	for j in range(nb, n_y):
 		y0, y1, y2, y3, yn = Y[0, j], Y[1, j], Y[2, j], Y[3, j], Y_norm[j]
+		g = _distance4(xa, a0, a1, a2, a3, yn, y0, y1, y2, y3)
+		r0[j] = g
+		mn0, mx0 = min(mn0, g), max(mx0, g)
+		g = _distance4(xb, b0, b1, b2, b3, yn, y0, y1, y2, y3)
+		r1[j] = g
+		mn1, mx1 = min(mn1, g), max(mx1, g)
+		g = _distance4(xd, d0, d1, d2, d3, yn, y0, y1, y2, y3)
+		r2[j] = g
+		mn2, mx2 = min(mn2, g), max(mx2, g)
+		g = _distance4(xe, e0, e1, e2, e3, yn, y0, y1, y2, y3)
+		r3[j] = g
+		mn3, mx3 = min(mn3, g), max(mx3, g)
 
-		z = xa + yn
-		z -= a0 * y0
-		z -= a1 * y1
-		z -= a2 * y2
-		z -= a3 * y3
-		r0[j] = -math.sqrt(z) if z > 0 else 0
+	for t in range(64):
+		mx0, mn0 = max(mx0, M0[t]), min(mn0, N0[t])
+		mx1, mn1 = max(mx1, M1[t]), min(mn1, N1[t])
+		mx2, mn2 = max(mx2, M2[t]), min(mn2, N2[t])
+		mx3, mn3 = max(mx3, M3[t]), min(mn3, N3[t])
 
-		z = xb + yn
-		z -= b0 * y0
-		z -= b1 * y1
-		z -= b2 * y2
-		z -= b3 * y3
-		r1[j] = -math.sqrt(z) if z > 0 else 0
-
-		z = xd + yn
-		z -= d0 * y0
-		z -= d1 * y1
-		z -= d2 * y2
-		z -= d3 * y3
-		r2[j] = -math.sqrt(z) if z > 0 else 0
-
-		z = xe + yn
-		z -= e0 * y0
-		z -= e1 * y1
-		z -= e2 * y2
-		z -= e3 * y3
-		r3[j] = -math.sqrt(z) if z > 0 else 0
+	return mn0, mx0, mn1, mx1, mn2, mx2, mn3, mx3
 
 
 @njit(cache=True)
@@ -450,6 +503,7 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	zb = numpy.empty(n_y, dtype=numpy.int32)
 	mxb = numpy.empty(64, dtype=numpy.float64)
 	mnb = numpy.empty(64, dtype=numpy.float64)
+	L = numpy.empty((8, 64), dtype=numpy.float64)
 	if halfway_pre is None:
 		halfway = _halfway(Y_counts)
 	else:
@@ -459,8 +513,8 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	# reduction over columns runs afterwards in column order. With four
 	# letters, columns without a cached row are computed four at a time by
 	# `_distances_block4`, so one sweep over the targets serves four query
-	# columns; each block's rows get their min/max/median right away, while
-	# they are still in cache. Of the up to three columns left over, a pair
+	# columns and gives their min and max; each block's rows get their median
+	# right away, while they are still in cache. Of the up to three columns left over, a pair
 	# goes through `_distances_block2` and a single one alone.
 	smin = numpy.empty(nq, dtype=numpy.float64)
 	smax = numpy.empty(nq, dtype=numpy.float64)
@@ -480,13 +534,15 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 			todo[n_todo] = i
 			n_todo += 1
 			if n_todo == 4:
-				_distances_block4(X, Y, Y_norm, X_norm, todo[0] + nq_csum, 
-					todo[1] + nq_csum, todo[2] + nq_csum, todo[3] + nq_csum,
-					g[todo[0]], g[todo[1]], g[todo[2]], g[todo[3]])
+				i0, i1, i2, i3 = todo[0], todo[1], todo[2], todo[3]
+				(smin[i0], smax[i0], smin[i1], smax[i1], smin[i2], smax[i2],
+					smin[i3], smax[i3]) = _distances_block4(X, Y, Y_norm,
+					X_norm, i0 + nq_csum, i1 + nq_csum, i2 + nq_csum,
+					i3 + nq_csum, g[i0], g[i1], g[i2], g[i3], L)
 				for u in range(4):
 					iu = todo[u]
-					smin[iu], smax[iu], medians[iu] = _column_stats(g[iu], mxb,
-						mnb, zb, median_bins, Y_counts, halfway)
+					medians[iu] = _binned_median_z(g[iu], median_bins, 
+						smin[iu], smax[iu], Y_counts, zb, halfway)
 				n_todo = 0
 		else:
 			smin[i], smax[i], medians[i] = _column_distances(X, c, Y, Y_norm,
