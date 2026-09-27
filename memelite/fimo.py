@@ -1145,6 +1145,14 @@ def _one_hot_to_index(sequences):
 	return X, X_lengths
 
 
+# `fimo` puts the hits of consecutive motifs into one DataFrame, this many rows
+# or a little more at a time (the last may hold fewer), and cuts each motif's
+# DataFrame from it. Each such DataFrame is freed when the next one replaces
+# it, so later ones reuse the memory of earlier ones instead of touching new
+# pages.
+_CHUNK_ROWS = 32768
+
+
 def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1, 
 	eps=0.0001, threshold=0.0001, reverse_complement=True, return_counts=False, 
 	dim=0):
@@ -1375,36 +1383,22 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	if sequence_names is not None:
 		sequence_names_ = sequence_names.astype(object)
 
-	# When the names are all strings, every hit goes into one DataFrame, in
-	# output order, and each motif's DataFrame is a copy of its rows: one
-	# constructor call per fimo call instead of one per motif. Every column
-	# gets the values, and the dtype, it gets when each DataFrame is built
-	# alone. Any other names are passed per DataFrame as a list, so that pandas
-	# infers each motif_name column's dtype from that motif's name alone.
-	n_total = offsets[-1]
-	if string_names and n_total > 0:
-		counts = numpy.diff(offsets[::step])
+	# When the names are all strings, the hits of consecutive motifs go into
+	# one DataFrame, in output order, `_CHUNK_ROWS` or more at a time, and each
+	# motif's DataFrame is a copy of its rows: one constructor call per chunk
+	# instead of one per motif. Every column gets the values, and the dtype, it
+	# gets when each DataFrame is built alone. Any other names are passed per
+	# DataFrame as a list, so that pandas infers each motif_name column's dtype
+	# from that motif's name alone.
+	if string_names and offsets[-1] > 0:
+		bounds = offsets[::step]
+		counts = numpy.diff(bounds)
 		labels = numpy.array(list(motif_names[:n_]), dtype=object)
 		strands = numpy.array(['+', '-'][:step] * n_, dtype=object)
-
-		if sequence_names is not None:
-			sequence_idxs = sequence_names_[seqs]
-		else:
-			sequence_idxs = seqs
-
-		table = pandas.DataFrame({
-			'motif_name': numpy.repeat(labels, counts),
-			'motif_idx': numpy.repeat(numpy.arange(n_, dtype=numpy.int64),
-				counts),
-			'sequence_name': sequence_idxs,
-			'start': starts,
-			'end': ends,
-			'strand': numpy.repeat(strands, numpy.diff(offsets)),
-			'score': scores,
-			'p-value': pvals
-		})
+		strand_counts = numpy.diff(offsets)
 
 	hits, empty = [], None
+	c0 = c1 = 0
 	for i in range(n_):
 		a, b = offsets[step*i], offsets[step*i + step]
 		n_fwd = offsets[step*i + 1] - a
@@ -1434,10 +1428,36 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 			continue
 
 		if string_names:
-			if n == n_total:
+			# A chunk starts at the first motif with hits past the last chunk
+			# and takes the motifs after it until it holds `_CHUNK_ROWS` rows,
+			# or the motifs run out. It holds rows c0 up to c1 of the flat columns.
+			if b > c1:
+				j = min(int(numpy.searchsorted(bounds, a + _CHUNK_ROWS)), n_)
+				c0, c1 = a, bounds[j]
+
+				if sequence_names is not None:
+					sequence_idxs = sequence_names_[seqs[c0:c1]]
+				else:
+					sequence_idxs = seqs[c0:c1]
+
+				table = pandas.DataFrame({
+					'motif_name': numpy.repeat(labels[i:j], counts[i:j]),
+					'motif_idx': numpy.repeat(numpy.arange(i, j,
+						dtype=numpy.int64), counts[i:j]),
+					'sequence_name': sequence_idxs,
+					'start': starts[c0:c1],
+					'end': ends[c0:c1],
+					'strand': numpy.repeat(strands[step*i:step*j],
+						strand_counts[step*i:step*j]),
+					'score': scores[c0:c1],
+					'p-value': pvals[c0:c1]
+				})
+
+			# A motif whose rows are the whole chunk gets the chunk itself.
+			if a == c0 and b == c1:
 				hits.append(table)
 			else:
-				hits.append(table.iloc[a:b].reset_index(drop=True))
+				hits.append(table.iloc[a-c0:b-c0].reset_index(drop=True))
 
 			continue
 
