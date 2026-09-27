@@ -125,6 +125,95 @@ def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 	return -99999
 
 
+@njit(cache=True)
+def _median_from_counts(x, cnt, zb, counts, halfway):
+	"""The scan and stopping-bin sum of `_binned_median_z`, given its counts
+	`cnt` and bin indices `zb`: the same operations in the same order."""
+
+	n, n_bins = len(x), len(cnt)
+	count = 0
+	for b in range(n_bins):
+		count += cnt[b]
+		if count >= halfway:
+			s = 0.0
+			n_64 = n - n % 64
+			b32 = numpy.int32(b)
+			for i0 in range(0, n_64, 64):
+				d = numpy.uint32(0xFFFFFFFF)
+				for i in range(i0, i0 + 64):
+					d = min(d, numpy.uint32(zb[i] ^ b32))
+				if d != 0:
+					continue
+
+				m = uint64(0)
+				for t in range(64):
+					m |= uint64(zb[i0 + t] == b32) << uint64(t)
+				while m != 0:
+					low = m & (~m + uint64(1))
+					i = i0 + _DEBRUIJN[(low * uint64(0x03f79d71b4cb0a89)) >> uint64(58)]
+					s += x[i] * counts[i]
+					m ^= low
+
+			for i in range(n_64, n):
+				if zb[i] == b:
+					s += x[i] * counts[i]
+
+			return s / cnt[b]
+
+	return -99999
+
+
+@njit(cache=True)
+def _binned_median_block4(r0, r1, r2, r3, mn0, mx0, mn1, mx1, mn2, mx2, mn3,
+	mx3, bins, counts, counts32, zb4, halfway):
+	"""`_binned_median_z` of four rows, bitwise the same.
+
+	Each row's bin indices are `_binned_median_z`'s expression, in its own
+	loop. The four count histograms are filled in one loop over the targets,
+	so each target's count is loaded once for four scatters. They count in
+	int32 from `counts32`, the same counts; the caller passes `counts32`
+	only when sum(counts) fits int32, so no bin or partial count overflows.
+	The histograms live in `bins`'s own memory, which holds 4 x n_bins
+	int32. The scan and the stopping-bin sum are `_binned_median_z`'s, per
+	row, and read the int64 `counts`.
+	"""
+
+	n, n_bins = len(r0), len(bins)
+	z0, z1, z2, z3 = zb4[0], zb4[1], zb4[2], zb4[3]
+	mx0 -= mn0
+	for i in range(n):
+		z0[i] = int((r0[i] - mn0) / mx0 * (n_bins - 1))
+	mx1 -= mn1
+	for i in range(n):
+		z1[i] = int((r1[i] - mn1) / mx1 * (n_bins - 1))
+	mx2 -= mn2
+	for i in range(n):
+		z2[i] = int((r2[i] - mn2) / mx2 * (n_bins - 1))
+	mx3 -= mn3
+	for i in range(n):
+		z3[i] = int((r3[i] - mn3) / mx3 * (n_bins - 1))
+
+	c4 = bins.reshape(-1).view(numpy.int32)
+	c0 = c4[0:n_bins]
+	c1 = c4[n_bins:2 * n_bins]
+	c2 = c4[2 * n_bins:3 * n_bins]
+	c3 = c4[3 * n_bins:4 * n_bins]
+	for b in range(4 * n_bins):
+		c4[b] = 0
+	# Every index lies in [0, n_bins); see `_binned_median_z`.
+	for i in range(n):
+		ci = counts32[i]
+		c0[uint64(z0[i])] += ci
+		c1[uint64(z1[i])] += ci
+		c2[uint64(z2[i])] += ci
+		c3[uint64(z3[i])] += ci
+
+	return (_median_from_counts(r0, c0, z0, counts, halfway),
+		_median_from_counts(r1, c1, z1, counts, halfway),
+		_median_from_counts(r2, c2, z2, counts, halfway),
+		_median_from_counts(r3, c3, z3, counts, halfway))
+
+
 @njit(cache=True, inline='always')
 def _column_distances(X, c, Y, Y_norm, xn, g_row, x2, mxb, mnb, zb, 
 	median_bins, Y_counts, halfway):
@@ -552,7 +641,7 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 @njit(cache=True)
 def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 	Y_counts, nq_csum, nq, n_bins, q_slot=None, S_cache=None,
-	halfway_pre=None):
+	halfway_pre=None, Y_counts32=None):
 	"""Steps (1) and (2) of `_integer_distances_and_histogram`: each query
 	column's distance row (into `gamma`) and median (into `medians`), and
 	the query's (i_min, bin_scale, offset).
@@ -568,7 +657,8 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 	n_a, n_y = Y.shape[0], Y.shape[-1]
 	g = gamma.reshape((gamma.shape[1], gamma.shape[0]))
 	x2 = numpy.empty(n_a, dtype=numpy.float64)
-	zb = numpy.empty(n_y, dtype=numpy.int32)
+	zb4 = numpy.empty((4, n_y), dtype=numpy.int32)
+	zb = zb4[0]
 	mxb = numpy.empty(64, dtype=numpy.float64)
 	mnb = numpy.empty(64, dtype=numpy.float64)
 	L = numpy.empty((8, 64), dtype=numpy.float64)
@@ -616,10 +706,17 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 					smin[i3], smax[i3]) = _distances_block4(X, Y, Y_norm,
 					X_norm, i0 + nq_csum, i1 + nq_csum, i2 + nq_csum,
 					i3 + nq_csum, g[i0], g[i1], g[i2], g[i3], L)
-				for u in range(4):
-					iu = todo[u]
-					medians[iu] = _binned_median_z(g[iu], median_bins, 
-						smin[iu], smax[iu], Y_counts, zb, halfway)
+				if Y_counts32 is not None and len(Y_counts32) == n_y:
+					(medians[i0], medians[i1], medians[i2],
+						medians[i3]) = _binned_median_block4(g[i0], g[i1],
+						g[i2], g[i3], smin[i0], smax[i0], smin[i1], smax[i1],
+						smin[i2], smax[i2], smin[i3], smax[i3], median_bins,
+						Y_counts, Y_counts32, zb4, halfway)
+				else:
+					for u in range(4):
+						iu = todo[u]
+						medians[iu] = _binned_median_z(g[iu], median_bins, 
+							smin[iu], smax[iu], Y_counts, zb, halfway)
 				n_todo = 0
 		else:
 			rest[n_rest] = i
@@ -2383,6 +2480,15 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	# `_integer_distances_and_histogram` would use, and read by every query.
 	halfway = _halfway(rr_counts)
 	ys = numpy.sum(rr_counts)
+	# The block medians count in int32 when every count, and so every bin
+	# and partial count, fits; otherwise an empty array sends them to the
+	# int64 path.
+	if ys <= 2147483647:
+		counts32 = numpy.empty(nt, dtype=numpy.int32)
+		for j in range(nt):
+			counts32[j] = rr_counts[j]
+	else:
+		counts32 = numpy.empty(0, dtype=numpy.int32)
 	w = numpy.empty(nt, dtype=numpy.float64)
 	for j in range(nt):
 		w[j] = rr_counts[j] / ys
@@ -2460,7 +2566,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			i_min, bin_scale, off_s = _distances_and_medians(Q, T, 
 				_gamma[pid], _medians[pid], _median_bins[pid], Q_norm, T_norm,
 				rr_counts, Q_offsets[i], nq, n_score_bins, q_slot, S_cache,
-				halfway)
+				halfway, counts32)
 			in_g3 = g_max < 0 or _fits_gamma(off_s, n_score_bins, g_max)
 			alone = nb == 1 or not in_g3
 			if not in_g3:
