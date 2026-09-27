@@ -1113,8 +1113,7 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 
 
 @njit(cache=True)
-def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
-	t_sums, fill, mv, fv, lv, NB):
+def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, NB):
 	"""`_p_values` for NB queries of the same width nq, in one target loop.
 
 	NB is a literal. Row r of `G` holds the NB queries' `gamma_int` rows
@@ -1128,10 +1127,11 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 
 	Position p is final once row p has been added, so each query's maximum
 	M and the first and last positions holding it are tracked as the rows
-	go. At NB >= 16 the loop over b vectorizes with selects; below that the
-	selects compile to data-dependent branches, so they are written as
-	arithmetic. Either way these are the same M, kf and kl as the separate scans
-	in `_p_values_sums`. The tie-rule scan over kf..kl, the p-value from
+	go: the same M, kf and kl as the separate scans in `_p_values_sums`.
+	That update always runs over 16 lanes, which LLVM vectorizes with
+	selects; over NB < 16 lanes the selects became data-dependent branches.
+	Lanes at or above NB read the next position and are ignored, so t_sums
+	has 16 spare entries. The tie-rule scan over kf..kl, the p-value from
 	Bs[b] and the outputs are the per-query ones, in the same order.
 	Queries with active[b] False are accumulated but not scanned, and their
 	`results[b]` is left alone. There is no target skipping (iq is -1).
@@ -1141,6 +1141,15 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 	nb = uint64(NB)
 	w = uint64(nq) * nb
 	n_fill = (uint64(T_lens.max()) + uint64(nq) - 1) * nb
+
+	# Allocated here, not as per-thread rows of a shared array: mv, fv and
+	# lv are written at every position, and neighbouring threads' rows
+	# sharing a cache line made 8 threads up to 25x slower.
+	t_sums = numpy.empty(n_fill + 16, dtype=numpy.int32)
+	fill = numpy.empty(n_fill, dtype=numpy.int32)
+	mv = numpy.empty(16, dtype=numpy.int32)
+	fv = numpy.empty(16, dtype=numpy.int32)
+	lv = numpy.empty(16, dtype=numpy.int32)
 	for p in range(n_fill // nb):
 		for b in range(NB):
 			fill[uint64(p)*nb + uint64(b)] = nq * offsets[b]
@@ -1154,7 +1163,7 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 			k = uint64(k)
 			t_sums[k] = fill[k]
 
-		for b in range(NB):
+		for b in range(16):
 			mv[b] = numpy.int32(-2147483648)
 			fv[b] = 0
 			lv[b] = 0
@@ -1168,15 +1177,11 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 					j = uint64(j)
 					t_sums[base + j] += G[r, j]
 
-			for b in range(NB):
+			for b in range(16):
 				v = t_sums[base + uint64(b)]
 				mb = mv[b]
-				if NB >= 16:
-					fv[b] = numpy.int32(k) if v > mb else fv[b]
-					lv[b] = numpy.int32(k) if v >= mb else lv[b]
-				else:
-					fv[b] += (numpy.int32(k) - fv[b]) * numpy.int32(v > mb)
-					lv[b] += (numpy.int32(k) - lv[b]) * numpy.int32(v >= mb)
+				fv[b] = numpy.int32(k) if v > mb else fv[b]
+				lv[b] = numpy.int32(k) if v >= mb else lv[b]
 				mv[b] = max(mb, v)
 
 		for b in range(NB):
@@ -1299,20 +1304,10 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	# Up to n_batch queries of the same width share one `_p_values_batch`
 	# target loop. Their `gamma_int` matrices are interleaved in _G (see
 	# `_p_values_batch`), and each keeps its own backgrounds and results.
-	# A batch is 2, 4, 8 or 16 queries: `_p_values_batch` is compiled for
-	# each, and at 16 its per-position update vectorizes. Iteration 74's
-	# sweep found 16 faster than 8 or 32.
+	# A batch is 2, 4, 8 or 16 queries, and `_p_values_batch` is compiled
+	# for each. 16 was faster than 8 or 32 (iteration 74).
 	n_batch = 16
 	_G = numpy.empty((n_threads, nt*Q_max*n_batch), dtype='int16')
-	n_tsum = (T_max + Q_max - 1) * n_batch
-	_t_sums = numpy.empty((n_threads, n_tsum), dtype='int32')
-	_fill = numpy.empty((n_threads, n_tsum), dtype='int32')
-	_bq = numpy.empty((n_threads, n_batch), dtype='int64')
-	_boff = numpy.empty((n_threads, n_batch), dtype='uint64')
-	_bact = numpy.empty((n_threads, n_batch), dtype=numpy.bool_)
-	_mv = numpy.empty((n_threads, n_batch), dtype='int32')
-	_fv = numpy.empty((n_threads, n_batch), dtype='int32')
-	_lv = numpy.empty((n_threads, n_batch), dtype='int32')
 	_f = numpy.empty((n_threads, Q_max, n_score_bins+1), dtype='float64')
 
 	# A and A_csum are flat per thread; each query takes a contiguous
@@ -1355,124 +1350,134 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	# n_threads blocks: each block is still in width order and the blocks get
 	# similar mixes of widths. With one thread this is the sorted order. Each
 	# query's arithmetic and its output row i are unchanged.
+	# Queries are visited in increasing width, so consecutive iterations
+	# share kernel branches and workspace shapes. The sorted queries are
+	# dealt round-robin into n_threads blocks: each block is still in width
+	# order and the blocks get similar mixes of widths. With one thread this
+	# is the sorted order.
 	n_q = len(Q_lens)
 	by_width = numpy.argsort(Q_lens, kind='mergesort')
+	order = numpy.empty(n_q, dtype='int64')
 	n_blocks = max(1, min(n_threads, n_q))
+	start = 0
+	for t in range(n_blocks):
+		for j in range(t, n_q, n_blocks):
+			order[start] = by_width[j]
+			start += 1
 
-	# Block t holds by_width[t], by_width[t + n_blocks], ...: still in width
-	# order, with similar mixes of widths across blocks. Within a block, runs
-	# of up to n_batch queries of one width form a batch. Each query's
-	# arithmetic and its output row are unchanged.
-	for t in prange(n_blocks):
+	# Consecutive queries of one width in `order` form batches: the largest
+	# power of two, at most n_batch, of those left in the run. The parallel
+	# loop runs over batches, and each query's arithmetic and output row are
+	# unchanged. There are many batches, so the scheduler can balance them;
+	# a loop over only n_threads blocks put several blocks on one thread.
+	b_start = numpy.empty(n_q+1, dtype='int64')
+	n_b = 0
+	u = 0
+	while u < n_q:
+		nq = Q_lens[order[u]]
+		n_run = 0
+		while u + n_run < n_q and n_run < n_batch and \
+				Q_lens[order[u + n_run]] == nq:
+			n_run += 1
+		n_take = 1
+		while n_take * 2 <= n_run:
+			n_take *= 2
+		b_start[n_b] = u
+		n_b += 1
+		u += n_take
+	b_start[n_b] = n_q
+
+	for bi in prange(n_b):
 		pid = numba.get_thread_id()
-		qb = _bq[pid]
-		offs = _boff[pid]
-		act = _bact[pid]
+		qb = numpy.empty(n_batch, dtype='int64')
+		offs = numpy.empty(n_batch, dtype='uint64')
+		act = numpy.empty(n_batch, dtype=numpy.bool_)
 
-		u = t + 0
-		while u < n_q:
-			nq = Q_lens[by_width[u]]
+		u0 = b_start[bi]
+		nb = b_start[bi+1] - u0
+		for b in range(nb):
+			qb[b] = order[u0 + b]
+		nq = Q_lens[qb[0]]
 
-			# The batch is the largest power of two, at most n_batch, of
-			# the queries of this width left in the block.
-			n_run = 0
-			v = u
-			while v < n_q and n_run < n_batch and Q_lens[by_width[v]] == nq:
-				n_run += 1
-				v += n_blocks
-			n_take = 1
-			while n_take * 2 <= n_run:
-				n_take *= 2
+		G3 = _G[pid, :nt*nq*nb].reshape((nt, nq, nb))
 
-			nb = 0
-			while nb < n_take:
-				qb[nb] = by_width[u]
-				nb += 1
-				u += n_blocks
-
-			G3 = _G[pid, :nt*nq*nb].reshape((nt, nq, nb))
-
-			for b in range(nb):
-				i = qb[b]
-				if nb > 1:
-					gamma_int = G3[:, :, b]
-				else:
-					gamma_int = _gamma_int[pid, :nt*nq].reshape((nt, nq))
-
-				offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
-					gamma_int, _f[pid], _medians[pid], _median_bins[pid], 
-					Q_norm, T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, 
-					q_slot, G_cache, S_cache, _H_keys[pid], _H_filled[pid], 
-					_H_int[pid], _H_f[pid])
-				offs[b] = offset
-
-				# The backgrounds span nq*(n_score_bins+offset) bins. When the
-				# offset exceeds `n_cache` this can overrun the shared
-				# workspace, so allocate a large enough one for this query.
-				n_needed = nq*n_score_bins + nq*offset
-				fits32 = int64(nq) * (int64(offset) + 32768) <= 2147483647
-				if n_needed > n_len:
-					A = numpy.empty((nq, nq, n_needed), dtype='float64')
-					B = numpy.empty((T_max+1, n_needed), dtype='float64')
-					A_csum = numpy.empty((nq, nq, n_needed), dtype='float64')
-				else:
-					n_a = nq*nq*n_needed
-					A = _A[pid, :n_a].reshape((nq, nq, n_needed))
-					A_csum = _A_csum[pid, :n_a].reshape((nq, nq, n_needed))
-					B = _B[pid, b]
-
-				_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, 
-					T_max, offset, needed)
-
-				# A single query, or one the batch cannot hold, runs alone
-				# from a packed copy of its gamma_int.
-				act[b] = nb > 1 and n_needed <= n_len and fits32
-				if not act[b]:
-					g1 = _gamma_int[pid, :nt*nq].reshape((nt, nq))
-					if nb > 1:
-						g1[:] = gamma_int
-					_p_values(g1, B, rr_inv, T_lens, -1, nq, offset, 
-						_results[pid, b], reverse_complement)
-
+		for b in range(nb):
+			i = qb[b]
 			if nb > 1:
-				G2 = _G[pid, :nt*nq*nb].reshape((nt, nq*nb))
-				if nb == 2:
-					_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-						_results[pid], _t_sums[pid], _fill[pid], _mv[pid], 
-						_fv[pid], _lv[pid], 2)
-				elif nb == 4:
-					_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-						_results[pid], _t_sums[pid], _fill[pid], _mv[pid], 
-						_fv[pid], _lv[pid], 4)
-				elif nb == 8:
-					_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-						_results[pid], _t_sums[pid], _fill[pid], _mv[pid], 
-						_fv[pid], _lv[pid], 8)
+				gamma_int = G3[:, :, b]
+			else:
+				gamma_int = _gamma_int[pid, :nt*nq].reshape((nt, nq))
+
+			offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
+				gamma_int, _f[pid], _medians[pid], _median_bins[pid], 
+				Q_norm, T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, 
+				q_slot, G_cache, S_cache, _H_keys[pid], _H_filled[pid], 
+				_H_int[pid], _H_f[pid])
+			offs[b] = offset
+
+			# The backgrounds span nq*(n_score_bins+offset) bins. When the
+			# offset exceeds `n_cache` this can overrun the shared
+			# workspace, so allocate a large enough one for this query.
+			n_needed = nq*n_score_bins + nq*offset
+			fits32 = int64(nq) * (int64(offset) + 32768) <= 2147483647
+			if n_needed > n_len:
+				A = numpy.empty((nq, nq, n_needed), dtype='float64')
+				B = numpy.empty((T_max+1, n_needed), dtype='float64')
+				A_csum = numpy.empty((nq, nq, n_needed), dtype='float64')
+			else:
+				n_a = nq*nq*n_needed
+				A = _A[pid, :n_a].reshape((nq, nq, n_needed))
+				A_csum = _A_csum[pid, :n_a].reshape((nq, nq, n_needed))
+				B = _B[pid, b]
+
+			_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, 
+				T_max, offset, needed)
+
+			# A single query, or one the batch cannot hold, runs alone
+			# from a packed copy of its gamma_int.
+			act[b] = nb > 1 and n_needed <= n_len and fits32
+			if not act[b]:
+				g1 = _gamma_int[pid, :nt*nq].reshape((nt, nq))
+				if nb > 1:
+					g1[:] = gamma_int
+				_p_values(g1, B, rr_inv, T_lens, -1, nq, offset, 
+					_results[pid, b], reverse_complement)
+
+		if nb > 1:
+			G2 = _G[pid, :nt*nq*nb].reshape((nt, nq*nb))
+			if nb == 2:
+				_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
+					_results[pid], 2)
+			elif nb == 4:
+				_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
+					_results[pid], 4)
+			elif nb == 8:
+				_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
+					_results[pid], 8)
+			else:
+				_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
+					_results[pid], 16)
+
+		for b in range(nb):
+			i = qb[b]
+			res = _results[pid, b]
+
+			# The full-matrix, two-strand case merges straight into the
+			# output.
+			if reverse_complement == 1 and n_nearest == -1:
+				_merge_rc_results_into(res, results[i])
+			else:
+				if reverse_complement == 1:
+					_merge_rc_results(res)
 				else:
-					_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-						_results[pid], _t_sums[pid], _fill[pid], _mv[pid], 
-						_fv[pid], _lv[pid], 16)
+					res[:, 4] = 0
 
-			for b in range(nb):
-				i = qb[b]
-				res = _results[pid, b]
-
-				# The full-matrix, two-strand case merges straight into the
-				# output.
-				if reverse_complement == 1 and n_nearest == -1:
-					_merge_rc_results_into(res, results[i])
+				if n_nearest == -1:
+					results[i] = res[:n_in_targets]
 				else:
-					if reverse_complement == 1:
-						_merge_rc_results(res)
-					else:
-						res[:, 4] = 0
-
-					if n_nearest == -1:
-						results[i] = res[:n_in_targets]
-					else:
-						idxs = numpy.argsort(res[:n_in_targets, 0])[:n_nearest]
-						results[i, :, :5] = res[idxs]
-						results[i, :, 5] = idxs
+					idxs = numpy.argsort(res[:n_in_targets, 0])[:n_nearest]
+					results[i, :, :5] = res[idxs]
+					results[i, :, 5] = idxs
 
 
 	return results            
