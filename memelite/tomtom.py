@@ -124,7 +124,6 @@ def _column_distances(X, c, Y, Y_norm, xn, g_row, x2, mxb, mnb, zb,
 	"""
 
 	n_a, n_y = Y.shape[0], Y.shape[-1]
-	z_min_, z_max_ = 9999999.9, -9999999.9
 
 	if n_a == 4:
 		x0 = 2 * X[0, c]
@@ -147,6 +146,15 @@ def _column_distances(X, c, Y, Y_norm, xn, g_row, x2, mxb, mnb, zb,
 				z -= x2[k] * Y[k, j]
 			g_row[j] = -math.sqrt(z) if z > 0 else 0
 
+	return _column_stats(g_row, mxb, mnb, zb, median_bins, Y_counts, halfway)
+
+
+@njit(cache=True, inline='always')
+def _column_stats(g_row, mxb, mnb, zb, median_bins, Y_counts, halfway):
+	"""(min, max, binned median) of one distance row; see `_column_distances`."""
+
+	n_y = len(g_row)
+	z_min_, z_max_ = 9999999.9, -9999999.9
 	nb = n_y - n_y % 64
 	if nb > 0:
 		mxb[:] = g_row[:64]
@@ -165,6 +173,90 @@ def _column_distances(X, c, Y, Y_norm, xn, g_row, x2, mxb, mnb, zb,
 	m = _binned_median_z(g_row, median_bins, z_min_, z_max_, Y_counts,
 		zb, halfway)
 	return z_min_, z_max_, m
+
+
+@njit(cache=True)
+def _distances_block4(X, Y, Y_norm, X_norm, c0, c1, c2, c3, r0, r1, r2, r3):
+	"""Distance rows of four query columns in one sweep over the targets.
+
+	Each target column's four values and norm are loaded once for the four
+	query columns. Every row element gets exactly the operations of the
+	4-letter loop in `_column_distances`, in the same order, so the rows are
+	bitwise the same; only the loop nest is reorganized.
+
+	Y must have four rows. For an F-ordered Y (`symmetric_tomtom`, or
+	`tomtom` with n_target_bins=None) the check below is what fixes the
+	column stride at four values; without it the stride is a runtime value,
+	the loop stays scalar, and a whole tomtom call was 0.37 s slower.
+	"""
+
+	n_a, n_y = Y.shape[0], Y.shape[-1]
+	if n_a != 4:
+		return
+	a0, a1, a2, a3 = 2 * X[0, c0], 2 * X[1, c0], 2 * X[2, c0], 2 * X[3, c0]
+	b0, b1, b2, b3 = 2 * X[0, c1], 2 * X[1, c1], 2 * X[2, c1], 2 * X[3, c1]
+	d0, d1, d2, d3 = 2 * X[0, c2], 2 * X[1, c2], 2 * X[2, c2], 2 * X[3, c2]
+	e0, e1, e2, e3 = 2 * X[0, c3], 2 * X[1, c3], 2 * X[2, c3], 2 * X[3, c3]
+	xa, xb, xd, xe = X_norm[c0], X_norm[c1], X_norm[c2], X_norm[c3]
+	for j in range(n_y):
+		y0, y1, y2, y3, yn = Y[0, j], Y[1, j], Y[2, j], Y[3, j], Y_norm[j]
+
+		z = xa + yn
+		z -= a0 * y0
+		z -= a1 * y1
+		z -= a2 * y2
+		z -= a3 * y3
+		r0[j] = -math.sqrt(z) if z > 0 else 0
+
+		z = xb + yn
+		z -= b0 * y0
+		z -= b1 * y1
+		z -= b2 * y2
+		z -= b3 * y3
+		r1[j] = -math.sqrt(z) if z > 0 else 0
+
+		z = xd + yn
+		z -= d0 * y0
+		z -= d1 * y1
+		z -= d2 * y2
+		z -= d3 * y3
+		r2[j] = -math.sqrt(z) if z > 0 else 0
+
+		z = xe + yn
+		z -= e0 * y0
+		z -= e1 * y1
+		z -= e2 * y2
+		z -= e3 * y3
+		r3[j] = -math.sqrt(z) if z > 0 else 0
+
+
+@njit(cache=True)
+def _distances_block2(X, Y, Y_norm, X_norm, c0, c1, r0, r1):
+	"""`_distances_block4` for two query columns, used for a leftover pair."""
+
+	n_a, n_y = Y.shape[0], Y.shape[-1]
+	if n_a != 4:
+		return
+
+	a0, a1, a2, a3 = 2 * X[0, c0], 2 * X[1, c0], 2 * X[2, c0], 2 * X[3, c0]
+	b0, b1, b2, b3 = 2 * X[0, c1], 2 * X[1, c1], 2 * X[2, c1], 2 * X[3, c1]
+	xa, xb = X_norm[c0], X_norm[c1]
+	for j in range(n_y):
+		y0, y1, y2, y3, yn = Y[0, j], Y[1, j], Y[2, j], Y[3, j], Y_norm[j]
+
+		z = xa + yn
+		z -= a0 * y0
+		z -= a1 * y1
+		z -= a2 * y2
+		z -= a3 * y3
+		r0[j] = -math.sqrt(z) if z > 0 else 0
+
+		z = xb + yn
+		z -= b0 * y0
+		z -= b1 * y1
+		z -= b2 * y2
+		z -= b3 * y3
+		r1[j] = -math.sqrt(z) if z > 0 else 0
 
 
 @njit(cache=True)
@@ -223,6 +315,77 @@ def _binned_save(h_int, h_f, gamma_int, f_row, k):
 		h_f[x] = f_row[x]
 
 
+@njit(cache=True, inline='always')
+def _binned_column(row, mi, bin_scale, offset, w, zb, gamma_int, k, f_row):
+	"""The binned stage of one query column: its bin indices, its
+	`gamma_int[:, k]` column and its histogram row `f_row`."""
+
+	n_y = len(w)
+	for j in range(n_y):
+		zb[j] = math.floor((row[j] - mi) * bin_scale + 0.5)
+
+	for j in range(n_y):
+		x = zb[j]
+		gamma_int[j, k] = x - offset
+		f_row[uint64(x)] += w[j]
+
+
+@njit(cache=True)
+def _binned_block4(r0, r1, r2, r3, m0, m1, m2, m3, bin_scale, offset, w,
+	zb4, gamma_int, k0, k1, k2, k3, f0, f1, f2, f3):
+	"""The binned stage of four query columns in one sweep over the targets.
+
+	Each row's bin indices are the expression of the single-column loop in
+	`_integer_distances_and_histogram`. The store/scatter loop then handles
+	the four columns per target: their `gamma_int[j, k]` stores share one
+	row, and each `f` row receives its additions in ascending j, as before,
+	so every sum is bitwise the same.
+	"""
+
+	n_y = len(w)
+	z0, z1, z2, z3 = zb4[0], zb4[1], zb4[2], zb4[3]
+	for j in range(n_y):
+		z0[j] = math.floor((r0[j] - m0) * bin_scale + 0.5)
+	for j in range(n_y):
+		z1[j] = math.floor((r1[j] - m1) * bin_scale + 0.5)
+	for j in range(n_y):
+		z2[j] = math.floor((r2[j] - m2) * bin_scale + 0.5)
+	for j in range(n_y):
+		z3[j] = math.floor((r3[j] - m3) * bin_scale + 0.5)
+
+	for j in range(n_y):
+		x0, x1, x2, x3 = z0[j], z1[j], z2[j], z3[j]
+		gamma_int[j, k0] = x0 - offset
+		gamma_int[j, k1] = x1 - offset
+		gamma_int[j, k2] = x2 - offset
+		gamma_int[j, k3] = x3 - offset
+		wj = w[j]
+		f0[uint64(x0)] += wj
+		f1[uint64(x1)] += wj
+		f2[uint64(x2)] += wj
+		f3[uint64(x3)] += wj
+
+
+@njit(cache=True)
+def _binned_block2(r0, r1, m0, m1, bin_scale, offset, w,
+	zb4, gamma_int, k0, k1, f0, f1):
+	"""`_binned_block4` for two query columns, used for a leftover pair."""
+
+	n_y = len(w)
+	z0, z1 = zb4[0], zb4[1]
+	for j in range(n_y):
+		z0[j] = math.floor((r0[j] - m0) * bin_scale + 0.5)
+	for j in range(n_y):
+		z1[j] = math.floor((r1[j] - m1) * bin_scale + 0.5)
+	for j in range(n_y):
+		x0, x1 = z0[j], z1[j]
+		gamma_int[j, k0] = x0 - offset
+		gamma_int[j, k1] = x1 - offset
+		wj = w[j]
+		f0[uint64(x0)] += wj
+		f1[uint64(x1)] += wj
+
+
 @njit(cache=True)
 def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians, 
 	median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins, q_slot=None,
@@ -265,7 +428,17 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	mnb = numpy.empty(64, dtype=numpy.float64)
 	halfway = _halfway(Y_counts)
 
-	z_min, z_max = 9999999.9, -9999999.9
+	# Each column's (min, max, median) goes into smin/smax/medians, and the
+	# reduction over columns runs afterwards in column order. With four
+	# letters, columns without a cached row are computed four at a time by
+	# `_distances_block4`, so one sweep over the targets serves four query
+	# columns; each block's rows get their min/max/median right away, while
+	# they are still in cache. Of the up to three columns left over, a pair
+	# goes through `_distances_block2` and a single one alone.
+	smin = numpy.empty(nq, dtype=numpy.float64)
+	smax = numpy.empty(nq, dtype=numpy.float64)
+	todo = numpy.empty(4, dtype=numpy.int64)
+	n_todo = 0
 	for i in range(nq):
 		c = i + nq_csum
 		slot = -1
@@ -273,16 +446,46 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 			slot = q_slot[c]
 
 		if slot >= 0:
-			z_min_ = S_cache[slot, 0]
-			z_max_ = S_cache[slot, 1]
-			m = S_cache[slot, 2]
+			smin[i] = S_cache[slot, 0]
+			smax[i] = S_cache[slot, 1]
+			medians[i] = S_cache[slot, 2]
+		elif n_a == 4:
+			todo[n_todo] = i
+			n_todo += 1
+			if n_todo == 4:
+				_distances_block4(X, Y, Y_norm, X_norm, todo[0] + nq_csum, 
+					todo[1] + nq_csum, todo[2] + nq_csum, todo[3] + nq_csum,
+					g[todo[0]], g[todo[1]], g[todo[2]], g[todo[3]])
+				for u in range(4):
+					iu = todo[u]
+					smin[iu], smax[iu], medians[iu] = _column_stats(g[iu], mxb,
+						mnb, zb, median_bins, Y_counts, halfway)
+				n_todo = 0
 		else:
-			z_min_, z_max_, m = _column_distances(X, c, Y, Y_norm, X_norm[c], 
-				g[i], x2, mxb, mnb, zb, median_bins, Y_counts, halfway)
-		
-		medians[i] = m
-		z_min = min(z_min, z_min_ - m)
-		z_max = max(z_max, z_max_ - m)
+			smin[i], smax[i], medians[i] = _column_distances(X, c, Y, Y_norm,
+				X_norm[c], g[i], x2, mxb, mnb, zb, median_bins, Y_counts, 
+				halfway)
+
+	if n_todo >= 2:
+		_distances_block2(X, Y, Y_norm, X_norm, todo[0] + nq_csum, 
+			todo[1] + nq_csum, g[todo[0]], g[todo[1]])
+		for u in range(2):
+			iu = todo[u]
+			smin[iu], smax[iu], medians[iu] = _column_stats(g[iu], mxb, mnb, 
+				zb, median_bins, Y_counts, halfway)
+		todo[0] = todo[2]
+		n_todo -= 2
+	for u in range(n_todo):
+		iu = todo[u]
+		c = iu + nq_csum
+		smin[iu], smax[iu], medians[iu] = _column_distances(X, c, Y, Y_norm,
+			X_norm[c], g[iu], x2, mxb, mnb, zb, median_bins, Y_counts, halfway)
+
+	z_min, z_max = 9999999.9, -9999999.9
+	for i in range(nq):
+		m = medians[i]
+		z_min = min(z_min, smin[i] - m)
+		z_max = max(z_max, smax[i] - m)
 			
 	# Find the minimum value and the number of bins needed to get there
 	i_min = int(math.floor(z_min)) #offset
@@ -316,15 +519,36 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	# bin indices are computed in their own loop, which vectorizes, and the
 	# scatter-add then runs in the original order. Every index lies in
 	# [0, n_bins], because f has n_bins + 1 columns, so int32 holds it exactly.
+	#
+	# Columns without a cached row, for a 4-letter alphabet, are binned four
+	# at a time by `_binned_block4`; consecutive ones
+	# have consecutive k, so their four stores land in one gamma_int row.
+	# Of up to three left over, a pair goes through `_binned_block2` and a
+	# single one through `_binned_column`.
 	zb = numpy.empty(n_y, dtype=numpy.int32)
+	zb4 = numpy.empty((4, n_y), dtype=numpy.int32)
+	n_todo = 0
 	for i in range(nq):
 		k = nq - i - 1
 		mi = medians[i]
 		row = g[i]
+		slot = -1
 		if q_slot is not None:
 			slot = q_slot[i + nq_csum]
 			if slot >= 0:
 				row = G_cache[slot]
+
+		if slot < 0 and n_a == 4:
+			todo[n_todo] = i
+			n_todo += 1
+			if n_todo == 4:
+				i0, i1, i2, i3 = todo[0], todo[1], todo[2], todo[3]
+				_binned_block4(g[i0], g[i1], g[i2], g[i3], medians[i0],
+					medians[i1], medians[i2], medians[i3], bin_scale, offset,
+					w, zb4, gamma_int, nq - i0 - 1, nq - i1 - 1, nq - i2 - 1,
+					nq - i3 - 1, f[i0], f[i1], f[i2], f[i3])
+				n_todo = 0
+			continue
 
 		hs = -1
 		if H_keys is not None:
@@ -334,17 +558,22 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 					_binned_load(H_int[h, hs], H_f[h, hs], gamma_int, f[i], k)
 					continue
 
-		for j in range(n_y):
-			zb[j] = math.floor((row[j] - mi) * bin_scale + 0.5)
-
-		for j in range(n_y):
-			x = zb[j]
-			gamma_int[j, k] = x - offset
-			f[i, uint64(x)] += w[j]
+		_binned_column(row, mi, bin_scale, offset, w, zb, gamma_int, k, f[i])
 
 		if hs >= 0:
 			_binned_save(H_int[h, hs], H_f[h, hs], gamma_int, f[i], k)
 			H_filled[h, hs] = True
+
+	if n_todo >= 2:
+		i0, i1 = todo[0], todo[1]
+		_binned_block2(g[i0], g[i1], medians[i0], medians[i1], bin_scale,
+			offset, w, zb4, gamma_int, nq - i0 - 1, nq - i1 - 1, f[i0], f[i1])
+		todo[0] = todo[2]
+		n_todo -= 2
+	for u in range(n_todo):
+		i = todo[u]
+		_binned_column(g[i], medians[i], bin_scale, offset, w, zb, gamma_int,
+			nq - i - 1, f[i])
 
 	return uint64(offset)
 
@@ -1629,7 +1858,10 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		_, rr_idxs, rr_inv, rr_counts = numpy.unique(T_ints.flatten(), 
 			return_index=True, return_inverse=True, return_counts=True)
 
-		T = T[:, rr_idxs]
+		# Advanced indexing along the last axis returns an F-ordered array;
+		# a C-ordered T makes each letter's row contiguous for the blocked
+		# distance loops. The values are unchanged.
+		T = numpy.ascontiguousarray(T[:, rr_idxs])
 		T_norm = T_norm[rr_idxs]
 		rr_inv = rr_inv.astype('uint64')
 	else:
