@@ -1222,7 +1222,7 @@ def _pm_chain_packed(B, src, sa, sb, dst, n_steps, P, n_packed, L, H, a_lo,
 
 @njit(cache=True)
 def _backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
-	offset, needed, a_lo, a_hi, L, H):
+	offset, needed, a_lo, a_hi, L, H, base):
 	"""The span backgrounds, their cumulative sums and the rows of B before
 	the survival pass, with each span row stored as its nonzero window only.
 
@@ -1238,6 +1238,11 @@ def _backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
 	window. The convolution adds the same terms in the same order into a
 	row cleared over its window, which is exactly where it writes, so every
 	stored value is bitwise the dense one.
+
+	Column c of a row of B holds bin c + base. The B build reads and writes
+	only bins in [L, H), and depends on bins only through their differences
+	and their order relative to the window ends and X, so it runs unchanged
+	on bins shifted down by base.
 	"""
 
 	a_off = numpy.empty((nq, nq), dtype='int64')
@@ -1287,6 +1292,16 @@ def _backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
 			for k in range(max(a_X[i, j] - a_lo[i, j], 0), w):
 				s[k] = 1.0
 
+	# From here bins are B's columns: bin - base.
+	c_lo = numpy.empty((nq, nq), dtype='int64')
+	c_hi = numpy.empty((nq, nq), dtype='int64')
+	for i in range(nq):
+		for j in range(i, nq):
+			c_lo[i, j] = a_lo[i, j] - base
+			c_hi[i, j] = a_hi[i, j] - base
+			a_X[i, j] -= base
+	Lc, Hc = L - base, H - base
+
 	# The B build of `_backgrounds_dense`, reading the packed rows. Pass 0
 	# builds the chain for rows nq..t_max and pass r > 0 row r; both end in
 	# the one call to `_pm_chain_packed`, which is inlined, so it is 
@@ -1302,10 +1317,10 @@ def _backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
 			if t_max < nq:
 				continue
 
-			b_lo, b_hi, src = L, H, 1
+			b_lo, b_hi, src = Lc, Hc, 1
 			if nq > 1:
-				b_lo, b_hi = _pm_packed(B[0], P, n_packed, 0, 0, B[1], L, H, 
-					a_lo, a_hi, a_off, a_K, a_X, b_lo, b_hi, True, False)
+				b_lo, b_hi = _pm_packed(B[0], P, n_packed, 0, 0, B[1], Lc, Hc, 
+					c_lo, c_hi, a_off, a_K, a_X, b_lo, b_hi, True, False)
 				sa[ns], sb[ns], dst[ns] = nq-1, nq-1, 1
 				ns += 1
 
@@ -1317,7 +1332,7 @@ def _backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
 			for i in range(nq, t_max+1):
 				if i == 1:
 					b_lo, b_hi = _pm_packed(B[0], P, n_packed, 0, nq-1, B[1], 
-						L, H, a_lo, a_hi, a_off, a_K, a_X, b_lo, b_hi, True, 
+						Lc, Hc, c_lo, c_hi, a_off, a_K, a_X, b_lo, b_hi, True, 
 						False)
 					continue
 				sa[ns], sb[ns], dst[ns] = 0, nq-1, i
@@ -1326,9 +1341,9 @@ def _backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
 			if needed is not None and not needed[r]:
 				continue
 
-			b_lo, b_hi, src = L, H, r
-			b_lo, b_hi = _pm_packed(B[r], P, n_packed, 0, r-1, B[r], L, H, 
-				a_lo, a_hi, a_off, a_K, a_X, L, H, True, True)
+			b_lo, b_hi, src = Lc, Hc, r
+			b_lo, b_hi = _pm_packed(B[r], P, n_packed, 0, r-1, B[r], Lc, Hc, 
+				c_lo, c_hi, a_off, a_K, a_X, Lc, Hc, True, True)
 
 			for j in range(1, nq - r + 1):
 				sa[ns], sb[ns], dst[ns] = j, j+r-1, r
@@ -1339,8 +1354,8 @@ def _backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
 				sa[ns+1], sb[ns+1], dst[ns+1] = nq-1-j, nq-1, r
 				ns += 2
 
-		b_lo, b_hi = _pm_chain_packed(B, src, sa, sb, dst, ns, P, n_packed, L,
-			H, a_lo, a_hi, a_off, a_K, a_X, b_lo, b_hi)
+		b_lo, b_hi = _pm_chain_packed(B, src, sa, sb, dst, ns, P, n_packed, Lc,
+			Hc, c_lo, c_hi, a_off, a_K, a_X, b_lo, b_hi)
 
 
 @njit(cache=True)
@@ -1439,8 +1454,8 @@ def _backgrounds_dense(f, f_lo, f_hi, A, B, A_csum, nq, n_bins, t_max, offset,
 
 
 @njit(cache=True)
-def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset, 
-	needed=None, packed=None):
+def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
+	needed, packed):
 	"""An internal function that calculates the backgrounds for p-values.
 
 	This method takes in the histogram of integerized scores `f` and returns 
@@ -1451,8 +1466,19 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 	probabilities are calculated for all spans across the query for when the
 	target is smaller than the query and has to be scanned against it.
 
-	When `needed` is given, only the rows `t` with `needed[t]` true are
-	finished; the others hold unspecified values.
+	Only the rows `t` with `needed[t]` true are finished; the others hold 
+	unspecified values. `needed` may be None, meaning every row.
+
+	The rows of B are stored in the flat array `Bf` as t_max+1 rows of S 
+	entries, and the function returns (lo, S). The survival value of a
+	target of length t at score s > 0, which the dense layout holds at 
+	B[t, s-1], is Bf[t*S + k] with k = s - lo clipped to [0, S-1] 
+	(`_b_index`). Normally a row holds only the bins [L, H) where the
+	survival function varies, with the constant 1.0 of the bins below L in
+	front and the constant of the bins from H on behind: S = H - L + 2 and
+	lo = L. A query that takes the dense path below, and any call that
+	needs row 0, which is not constant outside [L, H), gets the dense 
+	layout: S = n and lo = 1, so k = s - 1.
 
 	The span backgrounds A[i, j] and their cumulative sums are stored packed,
 	each row as its nonzero window only (see `_backgrounds_packed`), in
@@ -1523,19 +1549,28 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 			if a_lo[i, j] >= 0:
 				a_hi[i, j] = min(a_hi[i, j], H)
 
+	# Row 0 is not constant outside [L, H), so only the dense layout holds it.
+	if needed is None or needed[0]:
+		dense = True
+
+	lo, n_col = int64(1), int64(n)
+	n_packed = int64(0)
+	if packed is None:
+		P = A_csum.reshape(A_csum.size)
+	else:
+		P = packed
+
 	if not dense:
-		n_packed = int64(0)
 		for i in range(nq):
 			for j in range(i, nq):
 				n_packed += a_hi[i, j] - a_lo[i, j]
 
-		if packed is None:
-			P = A_csum.reshape(A_csum.size)
-		else:
-			P = packed
-		dense = 2*n_packed > P.shape[0]
+		dense = 2*n_packed > P.shape[0] or \
+			(int64(t_max) + 1) * (H - L + 2) > Bf.shape[0]
 
 	if dense:
+		B = Bf[:(t_max+1)*n].reshape((t_max+1, n))
+
 		# Never taken on JASPAR or on random motifs of widths 1-40, so
 		# `_backgrounds_dense` is called through object mode and compiled on
 		# first use rather than with every caller (3.5 s of a cold first
@@ -1549,6 +1584,16 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 		with numba.objmode():
 			_backgrounds_dense(f, f_lo, f_hi, A, B, A_csum, s_nq[0], s_nb[0],
 				s_tm[0], s_off[0], needed, a_lo, a_hi, s_L[0], s_H[0], s_n[0])
+
+		# Row 0 is the all -1 starting point and is never a real distribution.
+		if needed is None or needed[0]:
+			for j in range(n):
+				B[0, j] = -1
+			for j in range(1, n):
+				B[0, j] += B[0, j-1]
+			for j in range(n):
+				b = 1 - B[0, j]
+				B[0, j] = b if b > 0 else 0.0
 	else:
 		if packed is None:
 			c = int64(offset) * int64(nq - 1)
@@ -1557,18 +1602,14 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 				for l in range(1, n_bins+1):
 					A[i, i, l+c] = f[i, l]
 
+		# Column c of a row holds bin c + L - 1: the survival pass below runs
+		# over columns [1, H - L + 1), and the constants go in the two ends.
+		n_col = H - L + 2
+		B = Bf[:(t_max+1)*n_col].reshape((t_max+1, n_col))
 		_backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
-			offset, needed, a_lo, a_hi, L, H)
+			offset, needed, a_lo, a_hi, L, H, L - 1)
 
-	# Row 0 is the all -1 starting point and is never a real distribution.
-	if needed is None or needed[0]:
-		for j in range(n):
-			B[0, j] = -1
-		for j in range(1, n):
-			B[0, j] += B[0, j-1]
-		for j in range(n):
-			b = 1 - B[0, j]
-			B[0, j] = b if b > 0 else 0.0
+		lo, L, H = L, int64(1), n_col - 1
 
 	# `axis` is not implemented for cumsum. The pdf is zero below L, so the
 	# CDF is zero there and the survival 1, and it is flat from H on.
@@ -1634,13 +1675,59 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 		for j in range(L):
 			B[i, j] = 1.0
 		tail = B[i, H-1] if H > 0 else 1.0
-		for j in range(H, n):
+		for j in range(H, n_col):
 			B[i, j] = tail
+
+	return lo, n_col
+
+
+@njit(cache=True, inline='always')
+def _b_index(score, lo, n_col):
+	"""The column of a row of B holding the survival value at `score` > 0,
+	for a layout (lo, n_col) returned by `_p_value_backgrounds_windowed`."""
+
+	return uint64(min(max(int64(score) - lo, int64(0)), n_col - 1))
+
+
+@njit(cache=True)
+def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset, 
+	needed=None, packed=None):
+	"""`_p_value_backgrounds_windowed` with B returned in the dense layout:
+	B[t, j] is the survival value at score j + 1 for j < n, for every 
+	finished row t, and row 0 is finished when `needed` is None or 
+	needed[0]. B holds t_max+1 rows of at least n entries.
+	"""
+
+	n = n_bins*nq + nq*offset
+
+	nd = numpy.ones(t_max+1, dtype=numpy.bool_)
+	if needed is not None:
+		nd[:] = needed[:t_max+1]
+	row0 = nd[0]
+	nd[0] = False
+
+	Bf = numpy.empty((t_max+1) * (n+2), dtype=B.dtype)
+	lo, n_col = _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins,
+		t_max, offset, nd, packed)
+
+	for i in range(1, t_max+1):
+		if nd[i]:
+			for j in range(n):
+				B[i, j] = Bf[uint64(i*n_col) + _b_index(j+1, lo, n_col)]
+
+	if row0:
+		for j in range(n):
+			B[0, j] = -1
+		for j in range(1, n):
+			B[0, j] += B[0, j-1]
+		for j in range(n):
+			b = 1 - B[0, j]
+			B[0, j] = b if b > 0 else 0.0
 			
 
 @njit(cache=True)
 def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
-	reverse_complement=1):
+	reverse_complement=1, b_lo=1):
 	"""An internal function for calculating the best match and p-values.
 
 	Chooses the width of the running sums and calls `_p_values_sums`. Each
@@ -1661,12 +1748,12 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	if int64(nq) * (int64(offset) + 32768) <= 2147483647:
 		t_sums = numpy.full(n_sums, -2147483648, dtype='int32')
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
-			results, reverse_complement, t_sums, True)
+			results, reverse_complement, t_sums, True, b_lo)
 	else:
 		t_sums64 = numpy.full(n_sums, -9223372036854775807 - 1, 
 			dtype='int64')
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
-			results, reverse_complement, t_sums64, None)
+			results, reverse_complement, t_sums64, None, b_lo)
 
 
 @njit(cache=True)
@@ -1724,7 +1811,7 @@ def _sums_window(t_sums, gamma, rr_inv, start, nt, W):
 
 @njit(cache=True)
 def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
-	reverse_complement, t_sums, literal):
+	reverse_complement, t_sums, literal, b_lo):
 	"""An internal function for calculating the best match and p-values.
 
 	This function will take in the integerized score matrix `gamma` and
@@ -1740,7 +1827,14 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	`literal` is True to use the kernels compiled for a literal width, and
 	None for the generic loop. numba prunes a branch on `is None` at compile
 	time, so the int64 sums, which pass None, compile none of those kernels.
+
+	The p-value at score s > 0 is B_cdfs[nt, _b_index(s, b_lo, n_col)] for
+	B_cdfs's rows of n_col entries (see `_p_value_backgrounds_windowed`);
+	b_lo = 1 is the dense layout, B_cdfs[nt, s-1].
 	"""
+
+	b_lo = int64(b_lo)
+	n_col = int64(B_cdfs.shape[1])
 
 	n = len(T_lens) // 2 if reverse_complement == 1 else len(T_lens)
 	total_offset = uint64(0)
@@ -1850,7 +1944,7 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 		# first test (results[i, 1] is 0) and not the tie test, and write
 		# all four fields from it.
 		if kf == kl and M > 0:
-			results[i, 0] = B_cdfs[nt, uint64(M-1)]
+			results[i, 0] = B_cdfs[nt, _b_index(M, b_lo, n_col)]
 			results[i, 1] = M
 			results[i, 2] = kf - nq + 1
 			results[i, 3] = min(kf+1, nq) - max(0, kf-int64(nt)+1)
@@ -1867,7 +1961,7 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 				if score == results[i, 1] and results[i, 2] >= overlap:
 					continue
 
-				results[i, 0] = B_cdfs[nt, uint64(score-1)] if score > 0 else 1.0
+				results[i, 0] = B_cdfs[nt, _b_index(score, b_lo, n_col)] if score > 0 else 1.0
 				results[i, 1] = score
 				results[i, 2] = k - nq + 1
 				results[i, 3] = overlap
@@ -1877,7 +1971,7 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 
 @njit(cache=True)
 def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, nb,
-	s_proto):
+	s_proto, b_lo, b_col):
 	"""Allocates the running sums and calls `_p_values_batch_sums` with
 	NB = nb in {2, 4, 8, 16} as a literal.
 
@@ -1894,16 +1988,16 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, nb,
 	m_init = -(int64(1) << int64(8 * s_proto.itemsize - 1))
 	if nb == 2:
 		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
-			results, t_sums, fill, mv, m_init, 2)
+			results, t_sums, fill, mv, m_init, 2, b_lo, b_col)
 	elif nb == 4:
 		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
-			results, t_sums, fill, mv, m_init, 4)
+			results, t_sums, fill, mv, m_init, 4, b_lo, b_col)
 	elif nb == 8:
 		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
-			results, t_sums, fill, mv, m_init, 8)
+			results, t_sums, fill, mv, m_init, 8, b_lo, b_col)
 	else:
 		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
-			results, t_sums, fill, mv, m_init, 16)
+			results, t_sums, fill, mv, m_init, 16, b_lo, b_col)
 
 
 @njit(cache=True, inline='always')
@@ -1919,7 +2013,7 @@ def _sums_fit(nq, offset, g_max, s_max):
 
 @njit(cache=True)
 def _p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
-	t_sums, fill, mv, m_init, NB):
+	t_sums, fill, mv, m_init, NB, b_lo, b_col):
 	"""`_p_values` for NB queries of the same width nq, in one target loop.
 
 	NB is a literal. Row r of `G` holds the NB queries' `gamma_int` rows
@@ -1944,6 +2038,14 @@ def _p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 
 	`t_sums` (n_fill + 16 entries), `fill` (n_fill) and `mv` (16) share one
 	integer dtype, chosen by `_tomtom`; `m_init` is its minimum.
+
+	Bs[b] holds query b's rows of B flat, b_col[b] entries each, in the
+	layout (b_lo[b], b_col[b]) that `_p_value_backgrounds_windowed` returned.
+	The lookup clips the column only from below: a score is at most 
+	nq * n_score_bins <= n, the last column of the dense layout, and in the
+	windowed layout, which a query gets only when no column's histogram is
+	empty, at most H - 1, the largest score any overlap span's background
+	supports (every value in gamma_int has nonzero weight in f).
 	"""
 
 	numba.literally(NB)
@@ -2035,6 +2137,8 @@ def _p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 			B_cdfs = Bs[b]
 			res[i, 0] = 1
 			res[i, 1] = 0
+			lo_b, col_b = b_lo[b], b_col[b]
+			row_b = uint64(nt) * uint64(col_b)
 
 			ub = uint64(b)
 			M = mv[b]
@@ -2050,7 +2154,8 @@ def _p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 					if score == res[i, 1] and res[i, 2] >= overlap:
 						continue
 
-					res[i, 0] = B_cdfs[nt, uint64(score-1)] if score > 0 else 1.0
+					res[i, 0] = B_cdfs[row_b + uint64(max(int64(score) - lo_b, 
+						int64(0)))] if score > 0 else 1.0
 					res[i, 1] = score
 					res[i, 2] = k - nq + 1
 					res[i, 3] = overlap
@@ -2246,6 +2351,8 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		qb = numpy.empty(n_batch, dtype='int64')
 		offs = numpy.empty(n_batch, dtype='uint64')
 		act = numpy.empty(n_batch, dtype=numpy.bool_)
+		b_lo = numpy.empty(n_batch, dtype='int64')
+		b_col = numpy.empty(n_batch, dtype='int64')
 
 		u0 = b_start[bi]
 		nb = b_start[bi+1] - u0
@@ -2292,7 +2399,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 				fits = int64(nq) * (int64(offset) + 32768) <= 2147483647
 			if n_needed > n_len:
 				A = numpy.empty((nq, nq, n_needed), dtype='float64')
-				B = numpy.empty((T_max+1, n_needed), dtype='float64')
+				B = numpy.empty((T_max+1) * n_needed, dtype='float64')
 				A_csum = numpy.empty((nq, nq, n_needed), dtype='float64')
 			else:
 				n_a = nq*nq*n_needed
@@ -2301,8 +2408,10 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 				B = _B[pid, b]
 
 			# A_csum's memory holds the packed span rows; A[i, i] is not set.
-			_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, 
-				T_max, offset, needed, A_csum.reshape(A_csum.size))
+			# B's rows are stored flat in the layout (b_lo, b_col).
+			b_lo[b], b_col[b] = _p_value_backgrounds_windowed(_f[pid], A, B, 
+				A_csum, nq, n_score_bins, T_max, offset, needed, 
+				A_csum.reshape(A_csum.size))
 
 			# A single query, or one the batch cannot hold, runs alone
 			# from a packed copy of its gamma_int (already in g1 when alone).
@@ -2312,13 +2421,14 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 					for ri in range(nt):
 						for li in range(nq):
 							g1[ri, li] = G3[ri, li, b]
-				_p_values(g1, B, rr_inv, T_lens, -1, nq, offset, 
-					_results[pid, b], reverse_complement)
+				_p_values(g1, B[:(T_max+1)*b_col[b]].reshape((T_max+1, 
+					b_col[b])), rr_inv, T_lens, -1, nq, offset, 
+					_results[pid, b], reverse_complement, b_lo[b])
 
 		if nb > 1:
 			G2 = _G[pid, :nt*nq*nb].reshape((nt, nq*nb))
 			_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-				_results[pid], nb, s_proto)
+				_results[pid], nb, s_proto, b_lo, b_col)
 
 		for b in range(nb):
 			i = qb[b]
@@ -2544,7 +2654,7 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		n_nearest, 5 if n_nearest == -1 else 6), dtype='float64')
 	_A = numpy.empty((n_jobs, Q_max*Q_max*n_len), dtype='float64')
 	_A_csum = numpy.empty((n_jobs, Q_max*Q_max*n_len), dtype='float64')
-	_B = numpy.empty((n_jobs, 16, T_len_max+1, n_len), dtype='float64')
+	_B = numpy.empty((n_jobs, 16, (T_len_max+1)*n_len), dtype='float64')
 	_G = numpy.empty((n_jobs, nt*Q_max*16), dtype='int8' if narrow else 'int16')
 	G_cache = numpy.empty((len(q_cached), nt), dtype='float64')
 
