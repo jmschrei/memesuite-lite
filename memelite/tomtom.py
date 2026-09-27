@@ -2712,6 +2712,13 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	Q_lens = numpy.array([Q.shape[-1] for Q in Qs], dtype='int64')
 	Q = numpy.concatenate(Qs, axis=-1)
 	Q_norm = (Q ** 2).sum(axis=0)
+
+	# `_tomtom` is compiled once per layout of Q, and Q's layout follows the
+	# inputs': (4, w) motifs from `read_meme` give an F-ordered Q, C-ordered
+	# motifs a C-ordered one, and each layout costs a full compile (~30 s
+	# cold). Q is passed F-ordered always; Q_norm is computed above from the
+	# array as given, so no value changes. A no-op for F-ordered inputs.
+	Q = numpy.asfortranarray(Q)
 	
 	if reverse_complement:        
 		Ts = Ts + [T[::-1, ::-1] for T in Ts]
@@ -2740,8 +2747,12 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		T_norm = T_norm[rr_idxs]
 		rr_inv = rr_inv.astype('uint64')
 	else:
-		rr_inv = numpy.arange(T.shape[-1])
-		rr_counts = numpy.ones_like(rr_inv)
+		# The same layout and dtypes as the hashed branch, so both reuse one
+		# compiled `_tomtom` (an F-ordered T and an int64 `rr_inv` compiled
+		# a second one, ~33 s cold). T_norm is computed above.
+		T = numpy.ascontiguousarray(T)
+		rr_inv = numpy.arange(T.shape[-1], dtype='uint64')
+		rr_counts = numpy.ones(T.shape[-1], dtype='int64')
 	
 	# Query columns with identical bytes give identical distance rows, minima,
 	# maxima and medians, so a column that occurs more than once has those
