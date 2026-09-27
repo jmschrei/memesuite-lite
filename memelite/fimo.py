@@ -154,9 +154,81 @@ def _all_pwm_to_mapping(motifs, motif_lengths, bin_size):
 	return smallests, logpdfs
 
 
+# How often `_fast_hits` tests whether a window can still reach its threshold:
+# once after the first `_PREFIX` columns, then after every `_STEP` columns.
+# Chosen by measurement on the benchmark; a test after every column was slower
+# than no test at all, because the branch that leaves the window mispredicts.
+_PREFIX = 8
+_STEP = 4
+
+
+def _score_bounds(pwm, pwm_lengths, thresholds):
+	"""Upper bounds that let `_fast_hits` abandon a window early.
+
+	A column can add at most its largest entry to a window's score, or 0.0 when
+	the position is an N, which adds nothing. For global column c = s + j of
+	the motif whose columns start at s, `rest[c + 1]` is the most that columns
+	j+1 onwards can still add, so `rest[s + p]` bounds what remains after the
+	first p columns (`rest[s + n]` and `rest[0]` are 0.0). `tops[k]` is the
+	largest score motif k can reach at all.
+
+	A window is abandoned only when its partial score plus the remaining bound
+	is at most `cuts[k]`, the threshold minus a margin. Every float sum
+	involved (the partial score, the bounds, and the full score in whatever
+	order fastmath adds it) has at most n terms of magnitude at most
+	W = sum over columns of the largest finite |entry|, and any order of
+	summation is within (n - 1) * 2**-53 * W of the exact sum (to first order).
+	Chaining these through the test, plus the rounding of the test's own
+	addition and of the cut, puts the full score of an abandoned window at most
+	(3n + 1) * 2**-53 * (W + |threshold|) above threshold - margin. The margin,
+	(n + 2) * 1e-12 * (1 + W + |threshold|), is over 3,000 times that, and far
+	below the smallest gap between a window's score and its threshold on real
+	motifs (4.7e-5 on the benchmark).
+
+	An unreachable threshold (+inf) gets a cut of +inf, so every window is
+	abandoned, as `_fast_hits` would report none of them. Any other non-finite
+	cut, and a motif with no columns, gets -inf: nothing is abandoned and the
+	full score decides, as before.
+	"""
+
+	lengths = numpy.asarray(pwm_lengths, dtype=numpy.int64)
+	widths = numpy.diff(lengths)
+	n_motifs = len(widths)
+	max_width = int(widths.max()) if n_motifs > 0 else 0
+	mask = numpy.arange(max_width) < widths[:, None]
+
+	with numpy.errstate(invalid='ignore'):
+		col_max = pwm.max(axis=0)
+		col_max = numpy.where(numpy.isnan(col_max), numpy.inf,
+			numpy.maximum(col_max, 0.0))
+		col_abs = numpy.where(numpy.isfinite(pwm), numpy.abs(pwm), 0.0).max(
+			axis=0)
+
+	# One row per motif, zero-padded, so each suffix sums only its own motif.
+	padded = numpy.zeros((n_motifs, max_width + 1))
+	padded[:, :max_width][mask] = col_max
+	suffix = numpy.cumsum(padded[:, ::-1], axis=1)[:, ::-1]
+
+	rest = numpy.zeros(int(lengths[-1]) + 1)
+	rest[1:] = suffix[:, 1:][mask]
+	tops = numpy.where(widths > 0, suffix[:, 0], numpy.inf)
+
+	padded = numpy.zeros((n_motifs, max_width))
+	padded[mask] = col_abs
+	magnitude = padded.sum(axis=1)
+
+	t = numpy.asarray(thresholds, dtype=numpy.float64)
+	with numpy.errstate(invalid='ignore', over='ignore'):
+		margin = (widths + 2) * 1e-12 * (1.0 + magnitude + numpy.abs(t))
+		cuts = t - margin
+	cuts = numpy.where(numpy.isfinite(cuts) & (widths > 0), cuts, -numpy.inf)
+	cuts = numpy.where((t == numpy.inf) & (widths > 0), numpy.inf, cuts)
+	return rest, cuts, tops
+
+
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size, 
-	smallest, score_to_pvals, score_to_pval_lengths):
+	smallest, score_to_pvals, score_to_pval_lengths, rest, cuts, tops):
 	n_motifs = len(pwm_lengths) - 1
 	n_chroms = len(chrom_lengths) - 1
 
@@ -171,31 +243,80 @@ def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size,
 		n = pwm_lengths[k+1] - pwm_lengths[k]
 		k = numpy.uint64(k)
 		thresh = score_threshold[k]
-		
-		for l in range(n_chroms):        
-			start = numpy.uint64(chrom_lengths[l])
-			end = numpy.uint64(chrom_lengths[l+1])
-			
-			for i in range(end-start-n+1):
-				i = numpy.uint64(i)
+		cut = cuts[k]
+		off = numpy.uint64(pwm_lengths[k])
+		p = numpy.uint64(min(numpy.uint64(_PREFIX), n))
+
+		# Skip a motif whose best possible score cannot pass its threshold.
+		if tops[k] > cut:
+			for l in range(n_chroms):        
+				start = numpy.uint64(chrom_lengths[l])
+				end = numpy.uint64(chrom_lengths[l+1])
 				
-				score = 0.0
-				for j in range(n):
-					j = numpy.uint64(j)
-					
-					idx = X[start+i+j]
-					if idx == -1:
+				for i in range(end-start-n+1):
+					i = numpy.uint64(i)
+					base = start + i
+
+					# The first p columns as two interleaved partial sums, which
+					# halves the chain of dependent additions. Only the bound
+					# test uses them.
+					a = 0.0
+					b = 0.0
+					j = numpy.uint64(0)
+					while j + numpy.uint64(1) < p:
+						idx = X[base+j]
+						if idx != -1:
+							a += pwm[numpy.uint64(idx), off+j]
+						idx = X[base+j+numpy.uint64(1)]
+						if idx != -1:
+							b += pwm[numpy.uint64(idx), off+j+numpy.uint64(1)]
+						j += numpy.uint64(2)
+					if j < p:
+						idx = X[base+j]
+						if idx != -1:
+							a += pwm[numpy.uint64(idx), off+j]
+
+					bound = a + b
+					if bound + rest[off+p] <= cut:
 						continue
 
-					m_idx = numpy.uint64(j + pwm_lengths[k])
-					idx = numpy.uint64(idx)
-					score += pwm[idx, m_idx]
+					alive = True
+					j0 = p
+					while j0 < n:
+						j1 = min(j0 + numpy.uint64(_STEP), n)
+						for j in range(j0, j1):
+							j = numpy.uint64(j)
+							idx = X[base+j]
+							if idx != -1:
+								bound += pwm[numpy.uint64(idx), off+j]
 
-				if score > thresh:
-					score_idx = int(score / bin_size) - smallest[k]                    
-					score_idx += score_to_pval_lengths[k]
-					hits[k].append((numpy.int64(l), i, i+n, score, 
-						2.0 ** score_to_pvals[score_idx]))
+						if bound + rest[off+j1] <= cut:
+							alive = False
+							break
+						j0 = j1
+
+					if not alive:
+						continue
+
+					# A window that survives is scored exactly as before, so its
+					# score and the decision below are unchanged.
+					score = 0.0
+					for j in range(n):
+						j = numpy.uint64(j)
+						
+						idx = X[start+i+j]
+						if idx == -1:
+							continue
+
+						m_idx = numpy.uint64(j + pwm_lengths[k])
+						idx = numpy.uint64(idx)
+						score += pwm[idx, m_idx]
+
+					if score > thresh:
+						score_idx = int(score / bin_size) - smallest[k]                    
+						score_idx += score_to_pval_lengths[k]
+						hits[k].append((numpy.int64(l), i, i+n, score, 
+							2.0 ** score_to_pvals[score_idx]))
 
 	return hits
 
@@ -372,9 +493,11 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		X_lengths = X_lengths.astype(numpy.int64)
 
 	# Use a fast numba function to run the core algorithm
+	_rest, _cuts, _tops = _score_bounds(motif_pwms, motif_lengths,
+		_score_thresholds)
 	hits = _fast_hits(X, X_lengths, motif_pwms, motif_lengths, 
 		_score_thresholds, bin_size, _smallest, _score_to_pvals, 
-		_score_to_pvals_lengths)
+		_score_to_pvals_lengths, _rest, _cuts, _tops)
 
 
 	# Convert the results to pandas DataFrames
