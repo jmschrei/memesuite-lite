@@ -1573,32 +1573,11 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	_H_int = numpy.empty((n_threads, n_h, n_hs, nt), dtype='int16')
 	_H_f = numpy.empty((n_threads, n_h, n_hs, n_score_bins+1), dtype='float64')
 
-	# Queries are visited in increasing width, so consecutive iterations
-	# share kernel branches and workspace shapes. prange hands each thread a
-	# contiguous block, so the sorted queries are dealt round-robin into
-	# n_threads blocks: each block is still in width order and the blocks get
-	# similar mixes of widths. With one thread this is the sorted order. Each
-	# query's arithmetic and its output row i are unchanged.
-	# Queries are visited in increasing width, so consecutive iterations
-	# share kernel branches and workspace shapes. The sorted queries are
-	# dealt round-robin into n_threads blocks: each block is still in width
-	# order and the blocks get similar mixes of widths. With one thread this
-	# is the sorted order.
+	# Queries are sorted by width, and consecutive queries of one width form
+	# batches: the largest power of two, at most n_batch, of those left in
+	# the run. Each query's arithmetic and output row are unchanged.
 	n_q = len(Q_lens)
-	by_width = numpy.argsort(Q_lens, kind='mergesort')
-	order = numpy.empty(n_q, dtype='int64')
-	n_blocks = max(1, min(n_threads, n_q))
-	start = 0
-	for t in range(n_blocks):
-		for j in range(t, n_q, n_blocks):
-			order[start] = by_width[j]
-			start += 1
-
-	# Consecutive queries of one width in `order` form batches: the largest
-	# power of two, at most n_batch, of those left in the run. The parallel
-	# loop runs over batches, and each query's arithmetic and output row are
-	# unchanged. There are many batches, so the scheduler can balance them;
-	# a loop over only n_threads blocks put several blocks on one thread.
+	order = numpy.argsort(Q_lens, kind='mergesort')
 	b_start = numpy.empty(n_q+1, dtype='int64')
 	n_b = 0
 	u = 0
@@ -1616,6 +1595,12 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		u += n_take
 	b_start[n_b] = n_q
 
+	# Batches are formed before they are given to threads, so a width's
+	# queries fill 16-query batches at any thread count; dealing queries to
+	# threads first split each run n_threads ways, and at 8 threads 94
+	# queries ran alone. With several threads, `tomtom` sets the parallel
+	# chunksize to 1 so the scheduler balances batches dynamically; the
+	# default, one contiguous block per thread, was 20% slower at 8 threads.
 	for bi in prange(n_b):
 		pid = numba.get_thread_id()
 		qb = numpy.empty(n_batch, dtype='int64')
@@ -1709,7 +1694,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 					results[i, :, 5] = idxs
 
 
-	return results            
+	return results
   
 
 def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000, 
@@ -1887,9 +1872,16 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	q_slot = unique_slot[q_inv]
 	q_cached = q_first[shared].astype('int64')
 
-	results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, 
-		n_nearest, n_score_bins, n_median_bins, n_cache, n_jobs, 
-		int(reverse_complement), q_slot, q_cached)
+	# With several threads, `_tomtom`'s parallel loop hands out one batch
+	# at a time rather than one contiguous block per thread. Set here, not
+	# inside `_tomtom`, because calling it there stops numba caching it.
+	_chunk = numba.set_parallel_chunksize(1 if n_jobs > 1 else 0)
+	try:
+		results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv,
+			rr_counts, n_nearest, n_score_bins, n_median_bins, n_cache,
+			n_jobs, int(reverse_complement), q_slot, q_cached)
+	finally:
+		numba.set_parallel_chunksize(_chunk)
 
 	if n_jobs != -1:
 		numba.set_num_threads(_n_jobs)
