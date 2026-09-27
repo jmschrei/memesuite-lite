@@ -163,6 +163,7 @@ def _all_pwm_to_mapping(motifs, motif_lengths, bin_size):
 # every group. Chosen by measurement on the benchmark: two groups of 5 beat
 # two or three groups of 4 or 3, and a test after every column was slower
 # than no test at all, because the branch that leaves the window mispredicts.
+# Codes are uint16, so `_TABLE_MAX` must stay at most 65536.
 _QMAX = 5
 _TABLE_MAX = 3125
 
