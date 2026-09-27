@@ -85,10 +85,22 @@ def _pwm_to_mapping(log_pwm, bin_size):
 		associated with each score bin.
 	"""
 
-	n, l = log_pwm.shape
-
-	log_bg = math.log2(0.25)
 	int_log_pwm = numpy.round(log_pwm / bin_size).astype(numpy.int32)
+	smallest, largest = _mapping_range(int_log_pwm)
+
+	logpdf = numpy.empty(largest - smallest + 1)
+	old_logpdf = numpy.empty(largest - smallest + 1)
+	_fill_mapping(int_log_pwm, smallest, logpdf, old_logpdf)
+	return smallest, old_logpdf
+
+
+@numba.njit(cache=True)
+def _mapping_range(int_log_pwm):
+	"""The smallest and largest score bins of `_pwm_to_mapping`'s table for a
+	PWM already divided by the bin size, rounded and cast to int32. The table
+	has largest - smallest + 1 bins."""
+
+	n, l = int_log_pwm.shape
 
 	smallest, largest = 9999999, -9999999
 	log_pwm_min_csum, log_pwm_max_csum = 0, 0
@@ -107,34 +119,133 @@ def _pwm_to_mapping(log_pwm, bin_size):
 		largest = max(largest, log_pwm_max_csum)
 
 	largest += l
+	return smallest, largest
 
-	logpdf = numpy.empty(largest - smallest + 1)
-	old_logpdf = -numpy.inf * numpy.ones(largest - smallest + 1)
+
+@numba.njit(cache=True)
+def _fill_mapping(int_log_pwm, smallest, logpdf, old_logpdf):
+	"""The dynamic program of `_pwm_to_mapping`, leaving the table of log
+	p-values in `old_logpdf`. `logpdf` is scratch. Both have one entry per bin
+	from `_mapping_range` and may hold anything on entry.
+
+	Every value in the table is -inf or finite, and never -0.0: a sum is -0.0
+	only when both terms are, and each value is either log_bg or a logaddexp2
+	of two such values, `vmax + log2(2 ** (vmin - vmax) + 1)` with a second
+	term of at least +0.0. So `logaddexp2(-inf, y)` is `y + log2(pow(2, -inf) +
+	1) = y + 0.0 = y` bitwise, as `pow(2, -inf)` is +0.0 and `log2(1)` is +0.0
+	(C99 Annex F), and in the same way `logaddexp2(x, -inf)` is `x`. Those
+	calls are written as their result; every other call is made as before, on
+	the same bins in the same order.
+	"""
+
+	n, l = int_log_pwm.shape
+	log_bg = math.log2(0.25)
+	size = old_logpdf.shape[0]
+
+	for j in range(size):
+		old_logpdf[j] = -numpy.inf
+
 	for i in range(n):
 		idx = int_log_pwm[i, 0] - smallest
-		old_logpdf[idx] = logaddexp2(old_logpdf[idx], log_bg)
+		if old_logpdf[idx] == -numpy.inf:
+			old_logpdf[idx] = log_bg
+		else:
+			old_logpdf[idx] = logaddexp2(old_logpdf[idx], log_bg)
 
 	for i in range(1, l):
-		for j in range(largest - smallest + 1):
+		for j in range(size):
 			logpdf[j] = -numpy.inf
 
 		for j, x in enumerate(old_logpdf):
 			if x != -numpy.inf:
+				y = log_bg + x
 				for k in range(n):
 					idx = j + int_log_pwm[k, i]
-					logpdf[idx] = logaddexp2(logpdf[idx], log_bg + x)
+					if logpdf[idx] == -numpy.inf:
+						logpdf[idx] = y
+					else:
+						logpdf[idx] = logaddexp2(logpdf[idx], y)
 
-		for j in range(largest - smallest + 1):
+		for j in range(size):
 			old_logpdf[j] = logpdf[j]
 
-	# `old_logpdf` holds the distribution over every column. `logpdf` is only
-	# written by the loop above, which does not run for a single-column PWM.
-	logpdf = old_logpdf
+	# The survival function, summed from the top bin down.
+	for i in range(size - 2, -1, -1):
+		if old_logpdf[i] == -numpy.inf:
+			old_logpdf[i] = old_logpdf[i + 1]
+		elif old_logpdf[i + 1] != -numpy.inf:
+			old_logpdf[i] = logaddexp2(old_logpdf[i], old_logpdf[i + 1])
 
-	for i in range(len(logpdf) - 2, -1, -1):
-		logpdf[i] = logaddexp2(logpdf[i], logpdf[i + 1])
 
-	return smallest, logpdf
+@numba.njit(cache=True)
+def _table_layout(motifs, motif_lengths, bin_size):
+	"""Where each motif's p-value table goes in one flat array, for
+	`_fill_tables`.
+
+	Returns the PWMs divided by the bin size, rounded and cast to int32 as
+	`_pwm_to_mapping` does (the same operations on each element), each motif's
+	smallest bin, the offsets of its table, and the cost of computing it:
+	about its width times its number of bins. A motif with no columns gets an
+	empty table.
+	"""
+
+	n = len(motif_lengths) - 1
+	int_pwms = numpy.round(motifs / bin_size).astype(numpy.int32)
+
+	smallests = numpy.zeros(n, dtype=numpy.int64)
+	offsets = numpy.empty(n + 1, dtype=numpy.int64)
+	cost = numpy.empty(n, dtype=numpy.int64)
+	offsets[0] = 0
+	for i in range(n):
+		s, e = motif_lengths[i], motif_lengths[i+1]
+		size = 0
+		if e > s:
+			smallest, largest = _mapping_range(int_pwms[:, s:e])
+			smallests[i] = smallest
+			size = largest - smallest + 1
+
+		offsets[i+1] = offsets[i] + size
+		cost[i] = (numpy.int64(e) - numpy.int64(s)) * size
+
+	return int_pwms, smallests, offsets, cost
+
+
+@numba.njit(parallel=True, cache=True)
+def _fill_tables(int_pwms, motif_lengths, smallests, offsets, order, tables):
+	"""Write the table of each motif, as `_pwm_to_mapping` returns it, into
+	`tables[offsets[i]:offsets[i+1]]`."""
+
+	n = len(motif_lengths) - 1
+	for t in numba.prange(n):
+		i = order[t]
+		s, e = motif_lengths[i], motif_lengths[i+1]
+		a, b = offsets[i], offsets[i+1]
+		if b > a:
+			logpdf = numpy.empty(b - a)
+			_fill_mapping(int_pwms[:, s:e], smallests[i], logpdf, tables[a:b])
+
+
+def _pvalue_tables(motifs, motif_lengths, bin_size):
+	"""The p-value tables of `_all_pwm_to_mapping`, concatenated: each motif's
+	smallest bin, the offsets of its table, and the tables in one array."""
+
+	int_pwms, smallests, offsets, cost = _table_layout(motifs, motif_lengths,
+		bin_size)
+
+	# A prange hands each thread one contiguous block of iterations, so the
+	# motifs are sorted by cost and dealt round-robin into one block per
+	# thread: block t is by_cost[t], by_cost[t + n_blocks], ... The order
+	# changes no value. It is built here because numba's argsort adds about
+	# 0.6 s to a cold compile.
+	n = len(cost)
+	n_blocks = max(min(numba.get_num_threads(), n), 1)
+	by_cost = numpy.full(-(-n // n_blocks) * n_blocks, -1, dtype=numpy.int64)
+	by_cost[:n] = numpy.argsort(-cost, kind='stable')
+	order = by_cost.reshape(-1, n_blocks).T.flatten()
+	order = order[order >= 0]
+	tables = numpy.empty(offsets[-1], dtype=numpy.float64)
+	_fill_tables(int_pwms, motif_lengths, smallests, offsets, order, tables)
+	return smallests, offsets, tables
 
 
 @numba.njit(parallel=True, cache=True)
@@ -156,14 +267,20 @@ def _all_pwm_to_mapping(motifs, motif_lengths, bin_size):
 
 # How `_fast_hits` bounds a window. Every sequence position gets a code for
 # the q letters starting there, and each motif gets tables of the summed
-# weights of q consecutive columns for every code, so q columns cost one
-# lookup. q is the largest value up to `_QMAX` whose tables have at most
-# `_TABLE_MAX` entries: 5 for DNA, whose 4 letters plus N give 5**5 = 3125.
-# A window is tested once after the first two groups of q columns, then after
-# every group. Chosen by measurement on the benchmark: two groups of 5 beat
-# two or three groups of 4 or 3, and a test after every column was slower
-# than no test at all, because the branch that leaves the window mispredicts.
-# Codes are uint16, so `_TABLE_MAX` must stay at most 65536.
+# weights of up to q consecutive columns for every code, so a block of
+# columns costs one lookup. A code exists at every position, so a block can
+# start at any column. q is the largest value up to `_QMAX` whose tables have
+# at most `_TABLE_MAX` entries: 5 for DNA, whose 4 letters plus N give
+# 5**5 = 3125. Codes are uint16, so `_TABLE_MAX` must stay at most 65536.
+#
+# `_block_layout` splits each motif's columns into blocks. A window is first
+# tested on two blocks, for a motif of at least 2q columns the two full blocks
+# with the largest summed gap between each column's largest and mean entry,
+# and then after every further block, in the same order of gap. Chosen by
+# measurement on the benchmark: the first test on the best two blocks passes
+# 0.27% of windows against 1.02% for the motif's first 2q columns. A first
+# test of one lookup passes three times as many as the first 2q columns, and
+# its loop was no faster per window than the loop of two.
 _QMAX = 5
 _TABLE_MAX = 3125
 
@@ -172,18 +289,20 @@ def _score_bounds(pwm, pwm_lengths, thresholds):
 	"""Upper bounds that let `_fast_hits` abandon a window early.
 
 	A column can add at most its largest entry to a window's score, or 0.0 when
-	the position is an N, which reads the kernel's all-zero row. For global
-	column c = s + j of the motif whose columns start at s, `rest[c + 1]` is
-	the most that columns j+1 onwards can still add, so `rest[s + p]` bounds
-	what remains after the
-	first p columns (`rest[s + n]` and `rest[0]` are 0.0). `tops[k]` is the
-	largest score motif k can reach at all.
+	the position is an N, which reads the kernel's all-zero row: that is
+	`col_max`, per global column, with +inf for a column holding NaN.
+	`_block_layout` sums it over the blocks a window has not yet been tested
+	on. `gap` is each column's largest entry minus its mean, which only
+	decides the order of the blocks. `tops[k]` is the largest score motif k can
+	reach at all.
 
 	A window is abandoned only when its partial score plus the remaining bound
 	is at most `cuts[k]`, the threshold minus a margin. The partial score is a
-	sum of table entries that each sum q columns (with +0.0 for columns past
-	the motif's end, which is exact), so it is one more order of addition of
-	the same terms. Every float sum
+	sum of table entries that each sum up to q columns (with +0.0 for columns
+	outside the block, which is exact), and the blocks tested and the blocks
+	left partition the motif's columns, whatever order they are visited in.
+	So the partial score plus the remaining bound is one more order of addition
+	of one term per column, each at least that column's entry. Every float sum
 	involved (the partial score, the bounds, and the full score, in any order
 	of addition) has at most n terms of magnitude at most
 	W = sum over columns of the largest finite |entry|, and any order of
@@ -208,19 +327,17 @@ def _score_bounds(pwm, pwm_lengths, thresholds):
 	mask = numpy.arange(max_width) < widths[:, None]
 
 	with numpy.errstate(invalid='ignore'):
-		col_max = pwm.max(axis=0)
-		col_max = numpy.where(numpy.isnan(col_max), numpy.inf,
-			numpy.maximum(col_max, 0.0))
+		raw_max = pwm.max(axis=0)
+		col_max = numpy.where(numpy.isnan(raw_max), numpy.inf,
+			numpy.maximum(raw_max, 0.0)).astype(numpy.float64)
 		col_abs = numpy.where(numpy.isfinite(pwm), numpy.abs(pwm), 0.0).max(
 			axis=0)
+		gap = (raw_max - pwm.mean(axis=0)).astype(numpy.float64)
 
-	# One row per motif, zero-padded, so each suffix sums only its own motif.
+	# One row per motif, zero-padded, so each sum is over its own motif.
 	padded = numpy.zeros((n_motifs, max_width + 1))
 	padded[:, :max_width][mask] = col_max
 	suffix = numpy.cumsum(padded[:, ::-1], axis=1)[:, ::-1]
-
-	rest = numpy.zeros(int(lengths[-1]) + 1)
-	rest[1:] = suffix[:, 1:][mask]
 	tops = numpy.where(widths > 0, suffix[:, 0], numpy.inf)
 
 	padded = numpy.zeros((n_motifs, max_width))
@@ -233,7 +350,7 @@ def _score_bounds(pwm, pwm_lengths, thresholds):
 		cuts = t - margin
 	cuts = numpy.where(numpy.isfinite(cuts) & (widths > 0), cuts, -numpy.inf)
 	cuts = numpy.where((t == numpy.inf) & (widths > 0), numpy.inf, cuts)
-	return rest, cuts, tops
+	return col_max, gap, cuts, tops
 
 
 def _qmer_width(n_rows):
@@ -288,32 +405,134 @@ def _qmer_codes(X, n_rows, q):
 	return codes
 
 
+@numba.njit(cache=True)
+def _block_layout(col_max, gap, pwm_lengths, q):
+	"""Split each motif's columns into blocks of at most q consecutive columns,
+	in the order `_fast_hits` tests them.
+
+	Block h of motif k covers columns `blk_off[h] .. blk_off[h] + blk_w[h] - 1`
+	of the motif, for h from `blk_start[k]` to `blk_start[k+1] - 1`, and the
+	blocks partition its columns. The first test reads the first two blocks.
+	For a motif of at most q columns they are the whole motif and an empty
+	block at column 0, whose table is all 0.0; for one of fewer than 2q columns
+	columns 0 to q-1 and q onwards; and for a wider motif the pair of
+	non-overlapping full blocks with the largest summed `gap`, the first of
+	equals. The columns left over are cut into blocks of q from the left of
+	each run of consecutive columns, and tested largest summed gap first,
+	keeping their order among equals. A NaN gap compares as never larger, so
+	it only changes which valid layout is used.
+
+	`blk_rest[h]` is the sum of `col_max` over the blocks after h: the most
+	those columns can still add to a window's score. It is 0.0 for each motif's
+	last block. Any order of summation is covered by `_score_bounds`' margin.
+	"""
+
+	n_motifs = len(pwm_lengths) - 1
+	q = numpy.int64(q)
+	cap = numpy.int64(pwm_lengths[n_motifs]) + 2 * n_motifs
+	blk_off = numpy.empty(cap, dtype=numpy.uint64)
+	blk_w = numpy.empty(cap, dtype=numpy.uint64)
+	blk_rest = numpy.empty(cap, dtype=numpy.float64)
+	blk_start = numpy.empty(n_motifs + 1, dtype=numpy.int64)
+	key = numpy.empty(cap, dtype=numpy.float64)
+	seg_lo = numpy.empty(3, dtype=numpy.int64)
+	seg_hi = numpy.empty(3, dtype=numpy.int64)
+
+	b = numpy.int64(0)
+	for k in range(n_motifs):
+		off = numpy.int64(pwm_lengths[k])
+		n = numpy.int64(pwm_lengths[k + 1]) - off
+		blk_start[k] = b
+
+		n_seg = 0
+		if n <= q:
+			blk_off[b], blk_w[b] = 0, n
+			blk_off[b + 1], blk_w[b + 1] = 0, 0
+		elif n < 2 * q:
+			blk_off[b], blk_w[b] = 0, q
+			blk_off[b + 1], blk_w[b + 1] = q, n - q
+		else:
+			# The summed gap of the full block starting at each column.
+			n_full = n - q + 1
+			gs = numpy.empty(n_full, dtype=numpy.float64)
+			for o in range(n_full):
+				v = 0.0
+				for d in range(q):
+					v += gap[off + o + d]
+				gs[o] = v
+
+			o1, o2 = 0, q
+			best = gs[0] + gs[q]
+			for o in range(n_full):
+				for p in range(o + q, n_full):
+					v = gs[o] + gs[p]
+					if v > best:
+						best = v
+						o1, o2 = o, p
+
+			blk_off[b], blk_w[b] = o1, q
+			blk_off[b + 1], blk_w[b + 1] = o2, q
+			seg_lo[0], seg_hi[0] = 0, o1
+			seg_lo[1], seg_hi[1] = o1 + q, o2
+			seg_lo[2], seg_hi[2] = o2 + q, n
+			n_seg = 3
+		b += 2
+
+		# The columns left over, in blocks of at most q, largest gap first.
+		r0 = b
+		for e in range(n_seg):
+			j = seg_lo[e]
+			while j < seg_hi[e]:
+				w = min(q, seg_hi[e] - j)
+				v = 0.0
+				for d in range(w):
+					v += gap[off + j + d]
+				h = b
+				while h > r0 and v > key[h - 1]:
+					blk_off[h], blk_w[h], key[h] = blk_off[h-1], blk_w[h-1], key[h-1]
+					h -= 1
+				blk_off[h], blk_w[h], key[h] = j, w, v
+				b += 1
+				j += w
+
+		s = 0.0
+		for h in range(b - 1, blk_start[k] - 1, -1):
+			blk_rest[h] = s
+			for d in range(numpy.int64(blk_w[h])):
+				s += col_max[off + numpy.int64(blk_off[h]) + d]
+
+	blk_start[n_motifs] = b
+	return blk_off[:b].copy(), blk_w[:b].copy(), blk_rest[:b].copy(), blk_start
+
+
 @numba.njit(inline='always')
-def _qmer_tables(tab, pwm, off, n, q, stride, n_groups):
-	"""tab[g * stride + c] = the summed weights of columns g*q .. g*q + q-1
-	of the motif whose columns start at `off`, for the q letters with code c.
-	`stride` is at least the number of codes, n_rows**q. Columns at or past
-	`n` weigh 0.0. Each group's table is built in place, from its last column
-	to its first, each column multiplying its size by the number of rows."""
+def _qmer_tables(tab, pwm, off, q, stride, blk_off, blk_w, b0, n_blocks):
+	"""tab[g * stride + c] = the summed weights of the columns of block b0 + g
+	of the motif whose columns start at `off`, for the q letters with code c:
+	digit d of c is the letter at the block's column d. `stride` is at least
+	the number of codes, n_rows**q. Digits at or past the block's width weigh
+	0.0. Each table is built in place, from its last digit to its first, each
+	digit multiplying its size by the number of rows."""
 
 	n_rows = numpy.int64(pwm.shape[0])
 	q = numpy.int64(q)
-	n = numpy.int64(n)
 	off = numpy.int64(off)
 	stride = numpy.int64(stride)
-	for g in range(numpy.int64(n_groups)):
+	b0 = numpy.int64(b0)
+	for g in range(numpy.int64(n_blocks)):
 		t0 = g * stride
+		col0 = off + numpy.int64(blk_off[b0 + g])
+		w = numpy.int64(blk_w[b0 + g])
 		tab[t0] = 0.0
 		size = numpy.int64(1)
 		for d in range(q - 1, -1, -1):
-			col = g * q + d
 			for t in range(size - 1, -1, -1):
 				v = tab[t0 + t]
 				for s in range(n_rows - 1, -1, -1):
-					w = 0.0
-					if col < n:
-						w = numpy.float64(pwm[s, off + col])
-					tab[t0 + t * n_rows + s] = v + w
+					wt = 0.0
+					if d < w:
+						wt = numpy.float64(pwm[s, col0 + d])
+					tab[t0 + t * n_rows + s] = v + wt
 			size *= n_rows
 
 
@@ -332,16 +551,17 @@ def _copy_hits(hits, o, seqs, starts, ends, scores, pvals):
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
-	bin_size, smallest, score_to_pvals, score_to_pval_lengths, rest, cuts, tops,
-	order):
+	bin_size, smallest, score_to_pvals, score_to_pval_lengths, blk_off, blk_w,
+	blk_rest, blk_start, cuts, tops, order):
 	"""Scan every motif over every sequence and return the hits as columns.
 
 	`codes` and `q` come from `_qmer_codes`: the bound that abandons a window
-	reads q columns per table lookup. The hits of each motif are collected in
-	a list while it is scanned, then copied into flat arrays in the order given
-	by `order`, so that the hits of motif `order[t]` are rows `offsets[t]` to
-	`offsets[t+1]` of the returned sequence index, start, end, score and
-	p-value arrays.
+	reads a block of up to q columns per table lookup, and the blocks and the
+	order they are read in come from `_block_layout`. The hits of each motif
+	are collected in a list while it is scanned, then copied into flat arrays
+	in the order given by `order`, so that the hits of motif `order[t]` are
+	rows `offsets[t]` to `offsets[t+1]` of the returned sequence index, start,
+	end, score and p-value arrays.
 	"""
 
 	n_motifs = len(pwm_lengths) - 1
@@ -357,51 +577,55 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 
 	for k in numba.prange(n_motifs):
 		n = pwm_lengths[k+1] - pwm_lengths[k]
+		b0 = numpy.uint64(blk_start[k])
+		n_blocks = numpy.uint64(blk_start[k+1] - blk_start[k])
 		k = numpy.uint64(k)
 		thresh = score_threshold[k]
 		cut = cuts[k]
 		off = numpy.uint64(pwm_lengths[k])
-		p = numpy.uint64(min(numpy.uint64(2) * q, n))
 
-		# Every group's table starts `_TABLE_MAX` entries after the last,
-		# whatever the number of codes, so the second lookup of the prefix is a
-		# constant offset from the table's start and needs no register of its
-		# own. It is set inside the prange body because a value set outside is
-		# passed into the body as an argument, which LLVM cannot fold.
+		# Every block's table starts `_TABLE_MAX` entries after the last,
+		# whatever the number of codes, so the second lookup of the first test
+		# is a constant offset from the table's start and needs no register of
+		# its own. It is set inside the prange body because a value set outside
+		# is passed into the body as an argument, which LLVM cannot fold.
 		stride = numpy.uint64(_TABLE_MAX)
 
 		# Skip a motif whose best possible score cannot pass its threshold.
 		if tops[k] > cut:
-			# One table per group of q columns, and at least two, so that the
-			# first test always reads two. Groups past the motif's end are
-			# all 0.0. An N reads the all-zero last row of `pwm` and adds
-			# +0.0, in the tables and in the rescoring loop below.
-			n_groups = max((n + q - numpy.uint64(1)) // q, numpy.uint64(2))
-			tab = numpy.empty(n_groups * stride, dtype=numpy.float64)
-			_qmer_tables(tab, pwm, off, n, q, stride, n_groups)
-			rest_p = rest[off+p]
+			# One table per block. An N reads the all-zero last row of `pwm`
+			# and adds +0.0, in the tables and in the rescoring loop below.
+			tab = numpy.empty(n_blocks * stride, dtype=numpy.float64)
+			_qmer_tables(tab, pwm, off, q, stride, blk_off, blk_w, b0, n_blocks)
 
-			for l in range(n_chroms):        
+			# The first test reads blocks b0 and b0 + 1, at columns o1 and o2
+			# of the window. A block lies inside the motif, so its code is
+			# read inside the window.
+			rest_p = blk_rest[b0 + numpy.uint64(1)]
+			o1 = blk_off[b0]
+			o2 = blk_off[b0 + numpy.uint64(1)]
+
+			for l in range(n_chroms):
 				start = numpy.uint64(chrom_lengths[l])
 				end = numpy.uint64(chrom_lengths[l+1])
-				
+
 				# Windows start at positions x from `start` to `xe` - 1.
 				m = numpy.uint64(max(numpy.int64(end - start) -
 					numpy.int64(n) + 1, 0))
 				xe = start + m
 				x = start
 				while x < xe:
-					# The first 2q columns in two lookups, in a loop of its own
-					# that moves to the next window until one survives this
-					# test, which about 1% of windows do on real motifs. With
-					# nothing else in the loop, its pointers, position and
-					# bounds stay in registers; in one loop with the code
-					# below, LLVM reloaded and spilled them for every window.
-					# Only the bound test uses these columns.
+					# The first test, in a loop of its own that moves to the
+					# next window until one survives it, which about 0.3% of
+					# windows do on real motifs. With nothing else in the loop,
+					# its pointers, position and bounds stay in registers; in
+					# one loop with the code below, LLVM reloaded and spilled
+					# them for every window. Only the bound test uses these
+					# columns.
 					bound = 0.0
 					while x < xe:
-						bound = tab[numpy.uint64(codes[x])] + tab[stride +
-							numpy.uint64(codes[x+q])]
+						bound = tab[numpy.uint64(codes[x+o1])] + tab[stride +
+							numpy.uint64(codes[x+o2])]
 						if bound + rest_p <= cut:
 							x += numpy.uint64(1)
 							continue
@@ -414,10 +638,10 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 					i = x - start
 					alive = True
 					g = numpy.uint64(2)
-					while g < n_groups:
-						bound += tab[g * stride + numpy.uint64(codes[base+g*q])]
-						j1 = min((g + numpy.uint64(1)) * q, n)
-						if bound + rest[off+j1] <= cut:
+					while g < n_blocks:
+						bound += tab[g * stride + numpy.uint64(codes[base +
+							blk_off[b0+g]])]
+						if bound + blk_rest[b0+g] <= cut:
 							alive = False
 							break
 						g += numpy.uint64(1)
@@ -710,11 +934,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	motif_pwms = numpy.concatenate([pwm for _, pwm in motifs], axis=-1)
 	motif_pwms = numpy.log2(motif_pwms + eps) - math.log2(0.25)
 
-	_smallest, _score_to_pvals = _all_pwm_to_mapping(motif_pwms, motif_lengths, 
-		bin_size)
-	_score_to_pvals_lengths = numpy.cumsum([0] + [len(logpdf) for logpdf in
-		_score_to_pvals])
-	_score_to_pvals = numpy.concatenate(_score_to_pvals)
+	_smallest, _score_to_pvals_lengths, _score_to_pvals = _pvalue_tables(
+		motif_pwms, motif_lengths, bin_size)
 
 	# Each motif's score threshold is the first bin of its table whose log
 	# p-value is below the threshold, or inf when no bin is. The first
@@ -788,8 +1009,10 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	q = _qmer_width(n_alpha + 1)
 	codes = _qmer_codes(X, n_alpha + 1, q)
 
-	_rest, _cuts, _tops = _score_bounds(motif_pwms, motif_lengths,
+	_col_max, _gap, _cuts, _tops = _score_bounds(motif_pwms, motif_lengths,
 		_score_thresholds)
+	_blk_off, _blk_w, _blk_rest, _blk_start = _block_layout(_col_max, _gap,
+		motif_lengths, q)
 	# The motif-strands differ in cost, and some are skipped outright, so the
 	# scan's prange hands them out one at a time instead of in one contiguous
 	# block per thread. The chunk size is set from Python
@@ -799,8 +1022,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	try:
 		offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes, q,
 			X_lengths, pwms_n, motif_lengths, _score_thresholds, bin_size,
-			_smallest, _score_to_pvals, _score_to_pvals_lengths, _rest, _cuts,
-			_tops, order)
+			_smallest, _score_to_pvals, _score_to_pvals_lengths, _blk_off,
+			_blk_w, _blk_rest, _blk_start, _cuts, _tops, order)
 	finally:
 		numba.set_parallel_chunksize(previous)
 
