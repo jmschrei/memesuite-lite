@@ -1645,7 +1645,7 @@ def _merge_rc_results_into(results, out):
 @njit(parallel=True, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
 	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement,
-	q_slot, q_cached):
+	q_slot, q_cached, results, _A, _A_csum, _B, _G, G_cache):
 	"""An internal function implementing the TOMTOM algorithm.
 
 	This internal function is necessary to handle the numba component of the
@@ -1666,8 +1666,6 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	Q_max = max(Q_lens)
 	
 	n_in_targets = len(T_lens) // 2 if reverse_complement else len(T_lens)
-	n_out_targets = n_in_targets if n_nearest == -1 else n_nearest
-	n_outputs = 5 if n_nearest == -1 else 6
 	nt = T.shape[-1]
 
 	# Re-usable workspace for each thread instead of re-allocating
@@ -1685,26 +1683,21 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	# A batch is 2, 4, 8 or 16 queries, and `_p_values_batch` is compiled
 	# for each. 16 was faster than 8 or 32 (iteration 74).
 	n_batch = 16
-	_G = numpy.empty((n_threads, nt*Q_max*n_batch), dtype='int16')
 	_f = numpy.empty((n_threads, Q_max, n_score_bins+1), dtype='float64')
 
 	# A and A_csum are flat per thread; each query takes a contiguous
 	# (nq, nq, n) view so its working set is not strided by n_len.
-	_A = numpy.empty((n_threads, Q_max*Q_max*n_len), dtype='float64')
-	_B = numpy.empty((n_threads, n_batch, T_max+1, n_len), dtype='float64')
-	_A_csum = numpy.empty((n_threads, Q_max*Q_max*n_len), dtype='float64')
+	# `_A`, `_A_csum`, `_B`, `_G`, `G_cache` and `results` are allocated by
+	# `tomtom` with numpy; see the comment there.
 
 	_medians = numpy.empty((n_threads, Q_max), dtype='float64')
 	_median_bins = numpy.empty((n_threads, n_median_bins, 2), dtype='float64')
 
 	_results = numpy.empty((n_threads, n_batch, len(T_lens), 5), 
 		dtype='float64')
-	results = numpy.empty((len(Q_lens), n_out_targets, n_outputs), 
-		dtype='float64') 
 
 	# Query columns that occur more than once have their distance row, min,
 	# max and median computed once here; every query reads them from these.
-	G_cache = numpy.empty((len(q_cached), nt), dtype='float64')
 	S_cache = numpy.empty((len(q_cached), 3), dtype='float64')
 	_fill_column_cache(Q, T, Q_norm, T_norm, rr_counts, q_cached, G_cache,
 		S_cache, n_median_bins)
@@ -2030,6 +2023,23 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	q_slot = unique_slot[q_inv]
 	q_cached = q_first[shared].astype('int64')
 
+	# The large per-call arrays are allocated here rather than in `_tomtom`.
+	# numpy asks the kernel for transparent huge pages on allocations of
+	# 4 MB or more (madvise), numba's allocator does not, so the first touch
+	# of these ~400 MB costs 2 MB page faults instead of 4 kB ones: 85k minor
+	# faults per call fell to 5k on JASPAR (iteration 95). Shapes are those
+	# `_tomtom` used; `n_batch` there is 16.
+	n_in = len(T_lens) // 2 if reverse_complement else len(T_lens)
+	Q_max, T_len_max, nt = int(Q_lens.max()), int(T_lens.max()), T.shape[-1]
+	n_len = Q_max*n_score_bins + Q_max*n_cache
+	results = numpy.empty((len(Q_lens), n_in if n_nearest == -1 else
+		n_nearest, 5 if n_nearest == -1 else 6), dtype='float64')
+	_A = numpy.empty((n_jobs, Q_max*Q_max*n_len), dtype='float64')
+	_A_csum = numpy.empty((n_jobs, Q_max*Q_max*n_len), dtype='float64')
+	_B = numpy.empty((n_jobs, 16, T_len_max+1, n_len), dtype='float64')
+	_G = numpy.empty((n_jobs, nt*Q_max*16), dtype='int16')
+	G_cache = numpy.empty((len(q_cached), nt), dtype='float64')
+
 	# With several threads, `_tomtom`'s parallel loop hands out one batch
 	# at a time rather than one contiguous block per thread. Set here, not
 	# inside `_tomtom`, because calling it there stops numba caching it.
@@ -2037,7 +2047,8 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	try:
 		results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv,
 			rr_counts, n_nearest, n_score_bins, n_median_bins, n_cache,
-			n_jobs, int(reverse_complement), q_slot, q_cached)
+			n_jobs, int(reverse_complement), q_slot, q_cached, results,
+			_A, _A_csum, _B, _G, G_cache)
 	finally:
 		numba.set_parallel_chunksize(_chunk)
 
