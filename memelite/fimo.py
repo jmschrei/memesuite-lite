@@ -790,10 +790,19 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 
 	_rest, _cuts, _tops = _score_bounds(motif_pwms, motif_lengths,
 		_score_thresholds)
-	offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes, q,
-		X_lengths, pwms_n, motif_lengths, _score_thresholds, bin_size,
-		_smallest, _score_to_pvals, _score_to_pvals_lengths, _rest, _cuts,
-		_tops, order)
+	# The motif-strands differ in cost, and some are skipped outright, so the
+	# scan's prange hands them out one at a time instead of in one contiguous
+	# block per thread. The chunk size is set from Python
+	# because setting it inside a cached function disables its cache, and it
+	# is restored on every exit so that the caller's setting is unchanged.
+	previous = numba.set_parallel_chunksize(1)
+	try:
+		offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes, q,
+			X_lengths, pwms_n, motif_lengths, _score_thresholds, bin_size,
+			_smallest, _score_to_pvals, _score_to_pvals_lengths, _rest, _cuts,
+			_tops, order)
+	finally:
+		numba.set_parallel_chunksize(previous)
 
 	if return_counts == True:
 		return numpy.diff(offsets[::step]).astype('int32')
