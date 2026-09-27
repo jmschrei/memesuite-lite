@@ -166,16 +166,17 @@ def _score_bounds(pwm, pwm_lengths, thresholds):
 	"""Upper bounds that let `_fast_hits` abandon a window early.
 
 	A column can add at most its largest entry to a window's score, or 0.0 when
-	the position is an N, which adds nothing. For global column c = s + j of
-	the motif whose columns start at s, `rest[c + 1]` is the most that columns
-	j+1 onwards can still add, so `rest[s + p]` bounds what remains after the
+	the position is an N, which reads the kernel's all-zero row. For global
+	column c = s + j of the motif whose columns start at s, `rest[c + 1]` is
+	the most that columns j+1 onwards can still add, so `rest[s + p]` bounds
+	what remains after the
 	first p columns (`rest[s + n]` and `rest[0]` are 0.0). `tops[k]` is the
 	largest score motif k can reach at all.
 
 	A window is abandoned only when its partial score plus the remaining bound
 	is at most `cuts[k]`, the threshold minus a margin. Every float sum
-	involved (the partial score, the bounds, and the full score in whatever
-	order fastmath adds it) has at most n terms of magnitude at most
+	involved (the partial score, the bounds, and the full score, in any order
+	of addition) has at most n terms of magnitude at most
 	W = sum over columns of the largest finite |entry|, and any order of
 	summation is within (n - 1) * 2**-53 * W of the exact sum (to first order).
 	Chaining these through the test, plus the rounding of the test's own
@@ -280,22 +281,20 @@ def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size,
 
 					# The first p columns as two interleaved partial sums, which
 					# halves the chain of dependent additions. Only the bound
-					# test uses them.
+					# test uses them. An N reads the all-zero last row of `pwm`
+					# and adds +0.0, here and in both loops below.
 					a = 0.0
 					b = 0.0
 					j = numpy.uint64(0)
 					while j + numpy.uint64(1) < p:
-						idx = X[base+j]
-						if idx != -1:
-							a += pwm[numpy.uint64(idx), off+j]
-						idx = X[base+j+numpy.uint64(1)]
-						if idx != -1:
-							b += pwm[numpy.uint64(idx), off+j+numpy.uint64(1)]
+						idx = numpy.uint64(X[base+j])
+						a += pwm[idx, off+j]
+						idx = numpy.uint64(X[base+j+numpy.uint64(1)])
+						b += pwm[idx, off+j+numpy.uint64(1)]
 						j += numpy.uint64(2)
 					if j < p:
-						idx = X[base+j]
-						if idx != -1:
-							a += pwm[numpy.uint64(idx), off+j]
+						idx = numpy.uint64(X[base+j])
+						a += pwm[idx, off+j]
 
 					bound = a + b
 					if bound + rest[off+p] <= cut:
@@ -307,9 +306,8 @@ def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size,
 						j1 = min(j0 + numpy.uint64(_STEP), n)
 						for j in range(j0, j1):
 							j = numpy.uint64(j)
-							idx = X[base+j]
-							if idx != -1:
-								bound += pwm[numpy.uint64(idx), off+j]
+							idx = numpy.uint64(X[base+j])
+							bound += pwm[idx, off+j]
 
 						if bound + rest[off+j1] <= cut:
 							alive = False
@@ -319,18 +317,16 @@ def _fast_hits(X, chrom_lengths, pwm, pwm_lengths, score_threshold, bin_size,
 					if not alive:
 						continue
 
-					# A window that survives is scored exactly as before, so its
-					# score and the decision below are unchanged.
+					# A window that survives is scored strictly left to right,
+					# as it would be without the bound test. `score` starts at
+					# +0.0 and a sum is -0.0 only when both terms are, so it is
+					# never -0.0 and adding the +0.0 of an N leaves it bitwise
+					# unchanged: the same as skipping the column.
 					score = 0.0
 					for j in range(n):
 						j = numpy.uint64(j)
-						
-						idx = X[start+i+j]
-						if idx == -1:
-							continue
-
+						idx = numpy.uint64(X[start+i+j])
 						m_idx = numpy.uint64(j + pwm_lengths[k])
-						idx = numpy.uint64(idx)
 						score += pwm[idx, m_idx]
 
 					if score > thresh:
@@ -537,6 +533,16 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		X = X.astype(numpy.int8).flatten()
 		X_lengths = X_lengths.astype(numpy.int64)
 
+	# The kernel's PWM gets an all-zero last row, `n_alpha`. N (-1), and any
+	# other index without a PWM row, is sent to it: as uint8, -1 is 255. `X`
+	# is always a fresh array here, so the caller's input is not modified.
+	n_alpha = motif_pwms.shape[0]
+	numpy.minimum(X.view(numpy.uint8), n_alpha, out=X.view(numpy.uint8))
+
+	pwms_n = numpy.zeros((n_alpha + 1, motif_pwms.shape[1]),
+		dtype=motif_pwms.dtype, order='F')
+	pwms_n[:n_alpha] = motif_pwms
+
 	# Use a fast numba function to run the core algorithm. The hits come back
 	# as flat columns ordered by output DataFrame: each motif's forward hits,
 	# then, if scanned, the hits of its reverse complement.
@@ -550,7 +556,7 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	_rest, _cuts, _tops = _score_bounds(motif_pwms, motif_lengths,
 		_score_thresholds)
 	offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, X_lengths, 
-		motif_pwms, motif_lengths, _score_thresholds, bin_size, _smallest, 
+		pwms_n, motif_lengths, _score_thresholds, bin_size, _smallest, 
 		_score_to_pvals, _score_to_pvals_lengths, _rest, _cuts, _tops, order)
 
 	if return_counts == True:
