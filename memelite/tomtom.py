@@ -1748,70 +1748,17 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	if int64(nq) * (int64(offset) + 32768) <= 2147483647:
 		t_sums = numpy.full(n_sums, -2147483648, dtype='int32')
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
-			results, reverse_complement, t_sums, True, b_lo)
+			results, reverse_complement, t_sums, b_lo)
 	else:
 		t_sums64 = numpy.full(n_sums, -9223372036854775807 - 1, 
 			dtype='int64')
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
-			results, reverse_complement, t_sums64, None, b_lo)
-
-
-@njit(cache=True)
-def _sums_rows(t_sums, gamma, rr_inv, start, nt, W):
-	"""Adds row rr_inv[start+k] of gamma into t_sums[k:k+W] for each k < nt.
-
-	W is compiled as a literal, so the row loop is fully unrolled. t_sums
-	must already hold the fill value.
-	"""
-
-	numba.literally(W)
-	for k in range(nt):
-		k = uint64(k)
-		k_idx = uint64(rr_inv[start + k])
-		for l in range(W):
-			l = uint64(l)
-			t_sums[k+l] += gamma[k_idx, l]
-
-
-@njit(cache=True)
-def _sums_window(t_sums, gamma, rr_inv, start, nt, W):
-	"""Writes t_sums[0:nt+W-1] for a query of width W <= 6, a literal.
-
-	t_sums[0] must hold the fill value on entry. The W sums that row k can
-	still reach are kept in scalars w0..w5: row k is added to them, w0 is
-	then final and stored, and the window moves down one position. Every
-	position receives the fill value plus the same rows in increasing k as
-	in the loop it replaces. Scalars at or above W stay at the fill value.
-	"""
-
-	numba.literally(W)
-	b = t_sums[0]
-	w0 = w1 = w2 = w3 = w4 = w5 = int64(b)
-	for k in range(nt):
-		k = uint64(k)
-		r = uint64(rr_inv[start + k])
-		w0 += gamma[r, 0]
-		if W > 1:
-			w1 += gamma[r, 1]
-		if W > 2:
-			w2 += gamma[r, 2]
-		if W > 3:
-			w3 += gamma[r, 3]
-		if W > 4:
-			w4 += gamma[r, 4]
-		if W > 5:
-			w5 += gamma[r, 5]
-		t_sums[k] = w0
-		w0, w1, w2, w3, w4, w5 = w1, w2, w3, w4, w5, int64(b)
-
-	for j in range(W-1):
-		t_sums[nt+uint64(j)] = w0
-		w0, w1, w2, w3, w4 = w1, w2, w3, w4, w5
+			results, reverse_complement, t_sums64, b_lo)
 
 
 @njit(cache=True)
 def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
-	reverse_complement, t_sums, literal, b_lo):
+	reverse_complement, t_sums, b_lo):
 	"""An internal function for calculating the best match and p-values.
 
 	This function will take in the integerized score matrix `gamma` and
@@ -1823,10 +1770,6 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 
 	Targets 0..iq are skipped, and so are their reverse complements, which
 	start at len(T_lens) // 2 only when `reverse_complement` is 1.
-
-	`literal` is True to use the kernels compiled for a literal width, and
-	None for the generic loop. numba prunes a branch on `is None` at compile
-	time, so the int64 sums, which pass None, compile none of those kernels.
 
 	The p-value at score s > 0 is B_cdfs[nt, _b_index(s, b_lo, n_col)] for
 	B_cdfs's rows of n_col entries (see `_p_value_backgrounds_windowed`);
@@ -1852,65 +1795,15 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 			total_offset += nt
 			continue
 
-		# Queries up to width 16 use kernels compiled for their literal width,
-		# which have no per-row loop setup. Each t_sums entry gets the same
-		# terms.
-		if literal is None:
-			for k in range(nt+nq-1):
-				k = uint64(k)
-				t_sums[k] = nq * offset
-			for k in range(nt):
-				k = uint64(k)
-				k_idx = uint64(rr_inv[total_offset + k])
-				for l in range(nq):
-					l = uint64(l)
-					t_sums[k+l] += gamma[k_idx, l]
-		elif nq <= 6:
-			t_sums[0] = nq * offset
-			if nq == 1:
-				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 1)
-			elif nq == 2:
-				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 2)
-			elif nq == 3:
-				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 3)
-			elif nq == 4:
-				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 4)
-			elif nq == 5:
-				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 5)
-			else:
-				_sums_window(t_sums, gamma, rr_inv, total_offset, nt, 6)
-		else:
-			for k in range(nt+nq-1):
-				k = uint64(k)
-				t_sums[k] = nq * offset
-
-			if nq == 7:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 7)
-			elif nq == 8:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 8)
-			elif nq == 9:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 9)
-			elif nq == 10:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 10)
-			elif nq == 11:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 11)
-			elif nq == 12:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 12)
-			elif nq == 13:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 13)
-			elif nq == 14:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 14)
-			elif nq == 15:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 15)
-			elif nq == 16:
-				_sums_rows(t_sums, gamma, rr_inv, total_offset, nt, 16)
-			else:
-				for k in range(nt):
-					k = uint64(k)
-					k_idx = uint64(rr_inv[total_offset + k])
-					for l in range(nq):
-						l = uint64(l)
-						t_sums[k+l] += gamma[k_idx, l]
+		for k in range(nt+nq-1):
+			k = uint64(k)
+			t_sums[k] = nq * offset
+		for k in range(nt):
+			k = uint64(k)
+			k_idx = uint64(rr_inv[total_offset + k])
+			for l in range(nq):
+				l = uint64(l)
+				t_sums[k+l] += gamma[k_idx, l]
 
 		# Only a position holding the maximum can be the final winner: the
 		# first one overwrites every field set by an earlier, lower score.
@@ -1972,8 +1865,13 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 @njit(cache=True)
 def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, nb,
 	s_proto, b_lo, b_col):
-	"""Allocates the running sums and calls `_p_values_batch_sums` with
-	NB = nb in {2, 4, 8, 16} as a literal.
+	"""Allocates the running sums and calls `_p_values_batch_sums`.
+
+	A full batch passes NB = 16 as a constant, so numba compiles a kernel
+	specialized to it; batches of 2, 4 and 8 share one kernel with NB a
+	runtime value. A kernel per batch size tied on runtime for 16 only and
+	cost about 2 s of cold compile (iteration 113); a runtime NB for all
+	sizes was 0.01 s slower.
 
 	The sums, the fill and the tracked maxima take the dtype of `s_proto`:
 	int16 for an int8 `G`, int32 for an int16 `G`. `_tomtom` puts a query in
@@ -1986,18 +1884,12 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, nb,
 	fill = numpy.empty(n_fill, dtype=s_proto.dtype)
 	mv = numpy.empty(16, dtype=s_proto.dtype)
 	m_init = -(int64(1) << int64(8 * s_proto.itemsize - 1))
-	if nb == 2:
-		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
-			results, t_sums, fill, mv, m_init, 2, b_lo, b_col)
-	elif nb == 4:
-		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
-			results, t_sums, fill, mv, m_init, 4, b_lo, b_col)
-	elif nb == 8:
-		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
-			results, t_sums, fill, mv, m_init, 8, b_lo, b_col)
-	else:
+	if nb == 16:
 		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
 			results, t_sums, fill, mv, m_init, 16, b_lo, b_col)
+	else:
+		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
+			results, t_sums, fill, mv, m_init, nb, b_lo, b_col)
 
 
 @njit(cache=True, inline='always')
@@ -2016,8 +1908,9 @@ def _p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 	t_sums, fill, mv, m_init, NB, b_lo, b_col):
 	"""`_p_values` for NB queries of the same width nq, in one target loop.
 
-	NB is a literal. Row r of `G` holds the NB queries' `gamma_int` rows
-	side by side, as G[r, l*NB + b] = gamma_int_b[r, l], and the running
+	NB is 16 or the batch size (see `_p_values_batch`). Row r of `G` holds
+	the NB queries' `gamma_int` rows side by side, as
+	G[r, l*NB + b] = gamma_int_b[r, l], and the running
 	sums are interleaved the same way: position p of query b is
 	t_sums[p*NB + b]. Row k of a target then adds one contiguous run of
 	nq*NB values into t_sums[k*NB : (k+nq)*NB], so the gather through
@@ -2048,7 +1941,6 @@ def _p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
 	supports (every value in gamma_int has nonzero weight in f).
 	"""
 
-	numba.literally(NB)
 	nb = uint64(NB)
 	w = uint64(nq) * nb
 	n_fill = uint64(len(fill))
@@ -2375,8 +2267,8 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	# Up to n_batch queries of the same width share one `_p_values_batch`
 	# target loop. Their `gamma_int` matrices are interleaved in _G (see
 	# `_p_values_batch`), and each keeps its own backgrounds and results.
-	# A batch is 2, 4, 8 or 16 queries, and `_p_values_batch` is compiled
-	# for each. 16 was faster than 8 or 32 (iteration 74).
+	# A batch is 2, 4, 8 or 16 queries; 16 has its own compiled kernel and
+	# the others share one. 16 was faster than 8 or 32 (iteration 74).
 	#
 	# _G is int8 when g_max is 127: every value x - offset (x in
 	# [0, n_score_bins]) then fits once `_fits_gamma` holds, and the batch's
