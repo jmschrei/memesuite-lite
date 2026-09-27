@@ -8,6 +8,7 @@ import numba
 
 from numba import njit
 from numba import prange
+from numba.core.cpu_options import ParallelOptions
 from numpy import uint64
 from numpy import int64
 from numpy import int32
@@ -176,8 +177,9 @@ def _column_stats(g_row, mxb, mnb, zb, median_bins, Y_counts, halfway):
 	z_min_, z_max_ = 9999999.9, -9999999.9
 	nb = n_y - n_y % 64
 	if nb > 0:
-		mxb[:] = g_row[:64]
-		mnb[:] = g_row[:64]
+		for u in range(64):
+			mxb[u] = g_row[u]
+			mnb[u] = g_row[u]
 		for j in range(64, nb, 64):
 			numpy.maximum(mxb, g_row[j:j+64], mxb)
 			numpy.minimum(mnb, g_row[j:j+64], mnb)
@@ -510,7 +512,32 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	returns the offset right after computing it, writing neither `gamma_int`
 	nor `f`, and the caller reruns it into a wider `gamma_int`.
 	"""
-	
+
+	i_min, bin_scale, offset = _distances_and_medians(X, Y, gamma, medians,
+		median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins, q_slot,
+		S_cache, halfway_pre)
+	if g_max >= 0 and not _fits_gamma(offset, n_bins, g_max):
+		return uint64(offset)
+
+	return _integer_histogram(Y, gamma, gamma_int, f, medians, Y_counts,
+		nq_csum, nq, i_min, bin_scale, offset, q_slot, G_cache, H_keys,
+		H_filled, H_int, H_f, w_pre)
+
+
+@njit(cache=True)
+def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
+	Y_counts, nq_csum, nq, n_bins, q_slot=None, S_cache=None,
+	halfway_pre=None):
+	"""Steps (1) and (2) of `_integer_distances_and_histogram`: each query
+	column's distance row (into `gamma`) and median (into `medians`), and
+	the query's (i_min, bin_scale, offset).
+
+	None of it touches `gamma_int`, so it is compiled once, while
+	`_integer_histogram` is compiled for each `gamma_int` type (int8 batched,
+	int16 alone). A query that does not fit the int8 batch keeps these
+	results and reruns only `_integer_histogram`.
+	"""
+
 	# `gamma` is private scratch, so its buffer is used as (n_rows, n_y): each
 	# query column's distances are then contiguous for every loop below.
 	n_a, n_y = Y.shape[0], Y.shape[-1]
@@ -590,8 +617,21 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	i_min = int(math.floor(z_min)) #offset
 	bin_scale = int(math.floor(n_bins / (z_max - i_min))) #scale
 	offset = -i_min * bin_scale
-	if g_max >= 0 and not _fits_gamma(offset, n_bins, g_max):
-		return uint64(offset)
+	return i_min, bin_scale, offset
+
+
+@njit(cache=True)
+def _integer_histogram(Y, gamma, gamma_int, f, medians, Y_counts, nq_csum, nq,
+	i_min, bin_scale, offset, q_slot=None, G_cache=None, H_keys=None,
+	H_filled=None, H_int=None, H_f=None, w_pre=None):
+	"""Steps (3) and (4) of `_integer_distances_and_histogram`, from the
+	outputs of `_distances_and_medians`: `gamma_int` and the histogram `f`.
+	Adds i_min to `medians`, so it runs once per `_distances_and_medians`.
+	"""
+
+	n_a, n_y = Y.shape[0], Y.shape[-1]
+	g = gamma.reshape((gamma.shape[1], gamma.shape[0]))
+	todo = numpy.empty(4, dtype=numpy.int64)
 
 	for i in range(nq):
 		medians[i] = medians[i] + i_min
@@ -1496,8 +1536,19 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 		dense = 2*n_packed > P.shape[0]
 
 	if dense:
-		_backgrounds_dense(f, f_lo, f_hi, A, B, A_csum, nq, n_bins, t_max, 
-			offset, needed, a_lo, a_hi, L, H, n)
+		# Never taken on JASPAR or on random motifs of widths 1-40, so
+		# `_backgrounds_dense` is called through object mode and compiled on
+		# first use rather than with every caller (3.5 s of a cold first
+		# call, plus its code relinked into each enclosing library). The
+		# scalars travel as one-element arrays so the call is typed with
+		# their numba types (offset is uint64 from `_tomtom`).
+		s_nq, s_nb, s_tm = numpy.full(1, nq), numpy.full(1, n_bins), \
+			numpy.full(1, t_max)
+		s_off, s_L, s_H, s_n = numpy.full(1, offset), numpy.full(1, L), \
+			numpy.full(1, H), numpy.full(1, n)
+		with numba.objmode():
+			_backgrounds_dense(f, f_lo, f_hi, A, B, A_csum, s_nq[0], s_nb[0],
+				s_tm[0], s_off[0], needed, a_lo, a_hi, s_L[0], s_H[0], s_n[0])
 	else:
 		if packed is None:
 			c = int64(offset) * int64(nq - 1)
@@ -2056,10 +2107,22 @@ def _merge_rc_results_into(results, out):
 			out[i, 4] = 0
 
 
-@njit(parallel=True, cache=True)
+# Only the explicit prange loop is parallelized. With parallel=True numba
+# also turns the whole-array numpy calls outside it (zeros, cumsum, sum) into
+# parallel loops, each compiled and linked separately, for arrays of a few
+# thousand elements. A ParallelOptions object, not a dict: numba pops the
+# dict's keys on the first compile, so a second signature would get every
+# option back.
+_PRANGE_ONLY = ParallelOptions({'comprehension': False, 'reduction': False,
+	'inplace_binop': False, 'setitem': False, 'numpy': False, 
+	'stencil': False, 'fusion': False, 'prange': True})
+
+
+@njit(parallel=_PRANGE_ONLY, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
 	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement,
-	q_slot, q_cached, results, _A, _A_csum, _B, _G, G_cache, g_max, s_proto):
+	q_slot, q_cached, results, _A, _A_csum, _B, _G, G_cache, g_max, s_proto,
+	order):
 	"""An internal function implementing the TOMTOM algorithm.
 
 	This internal function is necessary to handle the numba component of the
@@ -2081,7 +2144,8 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		needed[t] = True
 	
 	Q_offsets = numpy.zeros(len(Q_lens)+1, dtype='int64')
-	Q_offsets[1:] = numpy.cumsum(Q_lens)
+	for q in range(len(Q_lens)):
+		Q_offsets[q+1] = Q_offsets[q] + Q_lens[q]
 	Q_max = max(Q_lens)
 	
 	n_in_targets = len(T_lens) // 2 if reverse_complement else len(T_lens)
@@ -2148,11 +2212,12 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	_H_int = numpy.empty((n_threads, n_h, n_hs, nt), dtype='int16')
 	_H_f = numpy.empty((n_threads, n_h, n_hs, n_score_bins+1), dtype='float64')
 
-	# Queries are sorted by width, and consecutive queries of one width form
-	# batches: the largest power of two, at most n_batch, of those left in
-	# the run. Each query's arithmetic and output row are unchanged.
+	# Queries are sorted by width (`order`, a stable argsort of Q_lens made
+	# by `tomtom` with numpy, which saves compiling a sort), and consecutive
+	# queries of one width form batches: the largest power of two, at most
+	# n_batch, of those left in the run. Each query's arithmetic and output
+	# row are unchanged.
 	n_q = len(Q_lens)
-	order = numpy.argsort(Q_lens, kind='mergesort')
 	b_start = numpy.empty(n_q+1, dtype='int64')
 	n_b = 0
 	u = 0
@@ -2193,21 +2258,26 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 		for b in range(nb):
 			i = qb[b]
 			g1 = _gamma_int[pid, :nt*nq].reshape((nt, nq))
-			alone = nb == 1
-			if not alone:
-				offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
-					G3[:, :, b], _f[pid], _medians[pid], _median_bins[pid], 
-					Q_norm, T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, 
-					q_slot, G_cache, S_cache, _H_keys[pid], _H_filled[pid], 
-					_H_int[pid], _H_f[pid], w, halfway, g_max)
-				if g_max >= 0 and not _fits_gamma(offset, n_score_bins, g_max):
-					alone = True
+			# The distances and medians do not depend on the gamma_int
+			# type; the binned stage goes into the batch's int8 G3 when the
+			# offset fits it, and into this query's int16 g1 otherwise.
+			i_min, bin_scale, off_s = _distances_and_medians(Q, T, 
+				_gamma[pid], _medians[pid], _median_bins[pid], Q_norm, T_norm,
+				rr_counts, Q_offsets[i], nq, n_score_bins, q_slot, S_cache,
+				halfway)
+			alone = nb == 1 or (g_max >= 0 and 
+				not _fits_gamma(off_s, n_score_bins, g_max))
 			if alone:
-				offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
-					g1, _f[pid], _medians[pid], _median_bins[pid], 
-					Q_norm, T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, 
-					q_slot, G_cache, S_cache, _H_keys[pid], _H_filled[pid], 
-					_H_int[pid], _H_f[pid], w, halfway)
+				_integer_histogram(T, _gamma[pid], g1, _f[pid], _medians[pid],
+					rr_counts, Q_offsets[i], nq, i_min, bin_scale, off_s,
+					q_slot, G_cache, _H_keys[pid], _H_filled[pid], _H_int[pid],
+					_H_f[pid], w)
+			else:
+				_integer_histogram(T, _gamma[pid], G3[:, :, b], _f[pid], 
+					_medians[pid], rr_counts, Q_offsets[i], nq, i_min, 
+					bin_scale, off_s, q_slot, G_cache, _H_keys[pid], 
+					_H_filled[pid], _H_int[pid], _H_f[pid], w)
+			offset = uint64(off_s)
 			offs[b] = offset
 
 			# The backgrounds span nq*(n_score_bins+offset) bins. When the
@@ -2239,7 +2309,9 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			act[b] = not alone and n_needed <= n_len and fits
 			if not act[b]:
 				if not alone:
-					g1[:] = G3[:, :, b]
+					for ri in range(nt):
+						for li in range(nq):
+							g1[ri, li] = G3[ri, li, b]
 				_p_values(g1, B, rr_inv, T_lens, -1, nq, offset, 
 					_results[pid, b], reverse_complement)
 
@@ -2263,11 +2335,15 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 					res[:, 4] = 0
 
 				if n_nearest == -1:
-					results[i] = res[:n_in_targets]
+					for ti in range(n_in_targets):
+						for ci in range(5):
+							results[i, ti, ci] = res[ti, ci]
 				else:
 					idxs = numpy.argsort(res[:n_in_targets, 0])[:n_nearest]
-					results[i, :, :5] = res[idxs]
-					results[i, :, 5] = idxs
+					for ti in range(len(idxs)):
+						for ci in range(5):
+							results[i, ti, ci] = res[idxs[ti], ci]
+						results[i, ti, 5] = idxs[ti]
 
 
 	return results
@@ -2480,7 +2556,8 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv,
 			rr_counts, n_nearest, n_score_bins, n_median_bins, n_cache,
 			n_jobs, int(reverse_complement), q_slot, q_cached, results,
-			_A, _A_csum, _B, _G, G_cache, 127 if narrow else -1, s_proto)
+			_A, _A_csum, _B, _G, G_cache, 127 if narrow else -1, s_proto,
+			numpy.argsort(Q_lens, kind='stable'))
 	finally:
 		numba.set_parallel_chunksize(_chunk)
 
