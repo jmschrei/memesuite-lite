@@ -479,6 +479,125 @@ def _fast_convert(X, mapping):
 		X[i] = mapping[X[i]]
 
 
+@numba.njit(cache=True)
+def _int_one_hot_to_index(X, out):
+	"""`_one_hot_to_index` for signed integers, with four channels.
+
+	numpy computes the expression in int64, wrapping on overflow, and keeps
+	the low byte, which depends only on the low byte of each value. Summing
+	the values' low bytes gives the same low byte and cannot overflow, which
+	matters because numba's signed arithmetic assumes it does not.
+	"""
+
+	n, _, l = X.shape
+	for i in range(n):
+		o = i * l
+		for j in range(l):
+			v0 = X[i, 0, j]
+			v1 = X[i, 1, j]
+			v2 = X[i, 2, j]
+			v3 = X[i, 3, j]
+			s = (numpy.int64(numpy.int8(v0)) + numpy.int8(v1) + numpy.int8(v2)
+				+ numpy.int8(v3))
+
+			# numpy's argmax: the first of the largest values.
+			best = v0
+			arg = 0
+			if v1 > best:
+				best = v1
+				arg = 1
+			if v2 > best:
+				best = v2
+				arg = 2
+			if v3 > best:
+				arg = 3
+
+			out[o + j] = numpy.int8((arg + 1) * s - 1)
+
+
+@numba.njit(cache=True)
+def _float_one_hot_to_index(X, sums, out):
+	"""`_one_hot_to_index` for floats and unsigned integers, with four channels.
+
+	`sums` is numpy's own `X.sum(axis=1)`, so the order of summation is
+	numpy's. numpy computes the rest in float64 and casts it to int8, which
+	truncates toward zero; a value outside (-129, 128), or NaN, has no exact
+	int8 and casts in a platform-dependent way. Returns False when any value
+	falls outside, and the caller then uses numpy for the whole array.
+
+	A NaN in any channel makes the sum NaN, so the position falls back and
+	numpy's rule for NaN in argmax is never needed here.
+	"""
+
+	n, _, l = X.shape
+	ok = True
+	for i in range(n):
+		o = i * l
+		for j in range(l):
+			v0 = X[i, 0, j]
+			v1 = X[i, 1, j]
+			v2 = X[i, 2, j]
+			v3 = X[i, 3, j]
+
+			# numpy's argmax: the first of the largest values.
+			best = v0
+			arg = 0
+			if v1 > best:
+				best = v1
+				arg = 1
+			if v2 > best:
+				best = v2
+				arg = 2
+			if v3 > best:
+				arg = 3
+
+			v = numpy.float64(arg + 1) * numpy.float64(sums[i, j]) - 1.0
+			if v > -129.0 and v < 128.0:
+				out[o + j] = numpy.int8(numpy.int64(v))
+			else:
+				ok = False
+
+	return ok
+
+
+def _one_hot_to_index(sequences):
+	"""Convert one-hot sequences to flattened int8 indices and their offsets.
+
+	The indices are exactly
+	`(((sequences.argmax(axis=1) + 1) * sequences.sum(axis=1)) - 1)`
+	cast to int8 and flattened: the channel with the largest value, or -1
+	where no channel is set. Four-channel arrays of a native-endian integer,
+	bool, float32 or float64 dtype are converted in one pass with numba;
+	anything else, or a float result that has no exact int8, uses the numpy
+	expression. On every path the indices are a new array, never a view of
+	`sequences`, so `fimo` may modify them in place.
+	"""
+
+	dtype = sequences.dtype
+	if sequences.ndim == 3 and sequences.shape[1] == 4 and dtype.isnative:
+		n, _, l = sequences.shape
+		X = numpy.empty(n * l, dtype=numpy.int8)
+		X_lengths = (numpy.arange(n + 1) * l).astype(numpy.int64)
+
+		if dtype == numpy.bool_:
+			# numpy sums a bool as 0 or 1 in int64, as the int8 view does.
+			_int_one_hot_to_index(sequences.view(numpy.int8), X)
+			return X, X_lengths
+		elif dtype.kind == 'i':
+			_int_one_hot_to_index(sequences, X)
+			return X, X_lengths
+		elif dtype.kind == 'u' or dtype in (numpy.float32, numpy.float64):
+			if _float_one_hot_to_index(sequences, sequences.sum(axis=1), X):
+				return X, X_lengths
+
+	X = ((sequences.argmax(axis=1) + 1) * sequences.sum(axis=1)) - 1
+	X_lengths = numpy.arange(X.shape[0]+1) * X.shape[-1]
+
+	X = X.astype(numpy.int8).flatten()
+	X_lengths = X_lengths.astype(numpy.int64)
+	return X, X_lengths
+
+
 def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1, 
 	eps=0.0001, threshold=0.0001, reverse_complement=True, return_counts=False, 
 	dim=0):
@@ -593,20 +712,25 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 
 	_smallest, _score_to_pvals = _all_pwm_to_mapping(motif_pwms, motif_lengths, 
 		bin_size)
-	_score_to_pvals_lengths = [0]
-	_score_thresholds = numpy.empty(n_motifs, dtype=numpy.float32)
-
-	for i in range(n_motifs):	
-		_score_to_pvals_lengths.append(len(_score_to_pvals[i]))
-
-		idx = numpy.where(_score_to_pvals[i] < log_threshold)[0]
-		if len(idx) > 0:
-			_score_thresholds[i] = (idx[0] + _smallest[i]) * bin_size                              
-		else:
-			_score_thresholds[i] = float("inf")
-
+	_score_to_pvals_lengths = numpy.cumsum([0] + [len(logpdf) for logpdf in
+		_score_to_pvals])
 	_score_to_pvals = numpy.concatenate(_score_to_pvals)
-	_score_to_pvals_lengths = numpy.cumsum(_score_to_pvals_lengths)
+
+	# Each motif's score threshold is the first bin of its table whose log
+	# p-value is below the threshold, or inf when no bin is. The first
+	# passing bin at or after each table's start is found for all motifs at
+	# once, and it belongs to the motif only if it lies before the table's end.
+	starts = _score_to_pvals_lengths[:-1]
+	passing = numpy.flatnonzero(_score_to_pvals < log_threshold)
+	pos = numpy.searchsorted(passing, starts)
+	if len(passing) > 0:
+		first = passing[numpy.minimum(pos, len(passing) - 1)]
+	else:
+		first = starts
+
+	found = (pos < len(passing)) & (first < _score_to_pvals_lengths[1:])
+	_score_thresholds = numpy.full(n_motifs, numpy.inf, dtype=numpy.float32)
+	_score_thresholds[found] = ((first - starts + _smallest) * bin_size)[found]
 
 	# Extract the sequence from a FASTA
 	if isinstance(sequences, str):
@@ -638,11 +762,7 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 			
 	if isinstance(sequences, numpy.ndarray):
 		sequence_names = None
-		X = ((sequences.argmax(axis=1) + 1) * sequences.sum(axis=1)) - 1
-		X_lengths = numpy.arange(X.shape[0]+1) * X.shape[-1]
-
-		X = X.astype(numpy.int8).flatten()
-		X_lengths = X_lengths.astype(numpy.int64)
+		X, X_lengths = _one_hot_to_index(sequences)
 
 	# The kernel's PWM gets an all-zero last row, `n_alpha`. N (-1), and any
 	# other index without a PWM row, is sent to it: as uint8, -1 is 255. `X`
