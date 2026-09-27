@@ -802,11 +802,38 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	names = ['motif_name', 'motif_idx', 'sequence_name', 'start', 'end', 
 		'strand', 'score', 'p-value']
 
-	# Names that are all strings go in an object column directly; anything
-	# else is passed as a list so pandas infers the column's dtype.
 	string_names = motif_names.dtype.kind == 'U'
 	if sequence_names is not None:
 		sequence_names_ = sequence_names.astype(object)
+
+	# When the names are all strings, every hit goes into one DataFrame, in
+	# output order, and each motif's DataFrame is a copy of its rows: one
+	# constructor call per fimo call instead of one per motif. Every column
+	# gets the values, and the dtype, it gets when each DataFrame is built
+	# alone. Any other names are passed per DataFrame as a list, so that pandas
+	# infers each motif_name column's dtype from that motif's name alone.
+	n_total = offsets[-1]
+	if string_names and n_total > 0:
+		counts = numpy.diff(offsets[::step])
+		labels = numpy.array(list(motif_names[:n_]), dtype=object)
+		strands = numpy.array(['+', '-'][:step] * n_, dtype=object)
+
+		if sequence_names is not None:
+			sequence_idxs = sequence_names_[seqs]
+		else:
+			sequence_idxs = seqs
+
+		table = pandas.DataFrame({
+			'motif_name': numpy.repeat(labels, counts),
+			'motif_idx': numpy.repeat(numpy.arange(n_, dtype=numpy.int64),
+				counts),
+			'sequence_name': sequence_idxs,
+			'start': starts,
+			'end': ends,
+			'strand': numpy.repeat(strands, numpy.diff(offsets)),
+			'score': scores,
+			'p-value': pvals
+		})
 
 	hits, empty = [], None
 	for i in range(n_):
@@ -815,7 +842,9 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		n = b - a
 
 		# Every DataFrame without hits is the same, so build one, in the way
-		# that sets its dtypes, and copy it for the rest.
+		# that sets its dtypes, and copy it for the rest. A copy is
+		# consolidated, which makes copying it cheaper, so each further one is
+		# copied from the last.
 		if n == 0:
 			if empty is None:
 				empty = pandas.DataFrame([], columns=['sequence_name', 
@@ -829,18 +858,21 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 						empty['sequence_name']]
 
 				empty = empty[names]
-				hits.append(empty)
 			else:
-				hits.append(empty.copy())
+				empty = empty.copy()
 
+			hits.append(empty)
 			continue
 
 		if string_names:
-			names_ = numpy.empty(n, dtype=object)
-			names_[:] = motif_names[i]
-		else:
-			names_ = [motif_names[i]] * n
+			if n == n_total:
+				hits.append(table)
+			else:
+				hits.append(table.iloc[a:b].reset_index(drop=True))
 
+			continue
+
+		names_ = [motif_names[i]] * n
 		strands = numpy.empty(n, dtype=object)
 		strands[:n_fwd] = '+'
 		strands[n_fwd:] = '-'
