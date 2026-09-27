@@ -742,7 +742,9 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 		if q_slot is not None:
 			slot = q_slot[c]
 
-		if slot >= 0:
+		# `S_cache is not None` first, so numba removes the branch while typing
+		# when there is no cache; numba 0.60 does not infer that from `slot`.
+		if S_cache is not None and slot >= 0:
 			smin[i] = S_cache[slot, 0]
 			smax[i] = S_cache[slot, 1]
 			medians[i] = S_cache[slot, 2]
@@ -903,7 +905,7 @@ def _integer_histogram(Y, gamma, gamma_int, f, medians, Y_counts, nq_csum, nq,
 
 		_binned_column(row, mi, bin_scale, offset, w, zb, gamma_int, k, f[i])
 
-		if hs >= 0:
+		if H_keys is not None and hs >= 0:
 			_binned_save(H_int[h, hs], H_f[h, hs], gamma_int, f[i], k)
 			H_filled[h, hs] = True
 
