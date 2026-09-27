@@ -10,6 +10,7 @@ from numba import njit
 from numba import prange
 from numpy import uint64
 from numpy import int64
+from numpy import int32
 
 
 @njit(cache=True)
@@ -50,6 +51,13 @@ def _binned_median(x, bins, x_min, x_max, counts):
 	return -99999
 
 
+# Bit position of a one-bit uint64 v: _DEBRUIJN[(v * 0x03f79d71b4cb0a89) >> 58].
+_DEBRUIJN = numpy.array([0, 1, 48, 2, 57, 49, 28, 3, 61, 58, 50, 42, 38, 29,
+	17, 4, 62, 55, 59, 36, 53, 51, 43, 22, 45, 39, 33, 30, 24, 18, 12, 5, 63, 47,
+	56, 27, 60, 41, 37, 16, 54, 35, 52, 21, 44, 32, 23, 11, 46, 26, 40, 15, 34,
+	20, 31, 10, 25, 14, 19, 9, 13, 8, 7, 6], dtype=numpy.int64)
+
+
 @njit(cache=True)
 def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 	"""`_binned_median` with the bin indices computed in their own pass.
@@ -65,7 +73,10 @@ def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 	over the elements that fall in it, in ascending order starting from 0.0,
 	which is the same sequence of additions `bins[z, 1] += x[i] * counts[i]`
 	made. Blocks of 64 elements with no element in the bin are skipped after
-	a check that vectorizes. Bitwise equal to `_binned_median`. `bins` must be
+	a check that vectorizes (a min over zb ^ b, zero only on a hit). In a hit
+	block the elements in the bin are read from a 64-bit mask, lowest bit
+	first, so they are visited in ascending order without a data-dependent
+	branch per element. Bitwise equal to `_binned_median`. `bins` must be
 	C-contiguous.
 	"""
 
@@ -87,14 +98,22 @@ def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 		if count >= halfway:
 			s = 0.0
 			n_64 = n - n % 64
+			b32 = numpy.int32(b)
 			for i0 in range(0, n_64, 64):
-				hit = 0
+				d = numpy.uint32(0xFFFFFFFF)
 				for i in range(i0, i0 + 64):
-					hit |= zb[i] == b
-				if hit:
-					for i in range(i0, i0 + 64):
-						if zb[i] == b:
-							s += x[i] * counts[i]
+					d = min(d, numpy.uint32(zb[i] ^ b32))
+				if d != 0:
+					continue
+
+				m = uint64(0)
+				for t in range(64):
+					m |= uint64(zb[i0 + t] == b32) << uint64(t)
+				while m != 0:
+					low = m & (~m + uint64(1))
+					i = i0 + _DEBRUIJN[(low * uint64(0x03f79d71b4cb0a89)) >> uint64(58)]
+					s += x[i] * counts[i]
+					m ^= low
 
 			for i in range(n_64, n):
 				if zb[i] == b:
@@ -390,7 +409,7 @@ def _binned_block2(r0, r1, m0, m1, bin_scale, offset, w,
 def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians, 
 	median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins, q_slot=None,
 	G_cache=None, S_cache=None, H_keys=None, H_filled=None, H_int=None,
-	H_f=None):
+	H_f=None, w_pre=None, halfway_pre=None):
 	"""An internal function for integerized scores and the histogram.
 
 	This function is the main workhorse for the TOMTOM algorithm. It contains
@@ -416,6 +435,11 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	seen, stored in H_keys[1:]. The first query of a class to reach a slot
 	computes both as usual and saves them to H_int[h, slot] and H_f[h, slot];
 	later ones copy them. The arrays belong to one thread.
+
+	`w_pre` and `halfway_pre`, when given, are the target weights
+	Y_counts / sum(Y_counts) and `_halfway(Y_counts)`, computed once by the
+	caller with the same expressions used here; they depend only on the
+	targets, so every query reads the same values.
 	"""
 	
 	# `gamma` is private scratch, so its buffer is used as (n_rows, n_y): each
@@ -426,7 +450,10 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	zb = numpy.empty(n_y, dtype=numpy.int32)
 	mxb = numpy.empty(64, dtype=numpy.float64)
 	mnb = numpy.empty(64, dtype=numpy.float64)
-	halfway = _halfway(Y_counts)
+	if halfway_pre is None:
+		halfway = _halfway(Y_counts)
+	else:
+		halfway = halfway_pre
 
 	# Each column's (min, max, median) goes into smin/smax/medians, and the
 	# reduction over columns runs afterwards in column order. With four
@@ -496,10 +523,13 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 		medians[i] = medians[i] + i_min
 	
 	f[:] = 0
-	ys = numpy.sum(Y_counts)
-	w = numpy.empty(n_y, dtype=numpy.float64)
-	for j in range(n_y):
-		w[j] = Y_counts[j] / ys
+	if w_pre is None:
+		ys = numpy.sum(Y_counts)
+		w = numpy.empty(n_y, dtype=numpy.float64)
+		for j in range(n_y):
+			w[j] = Y_counts[j] / ys
+	else:
+		w = w_pre
 
 	# The (i_min, bin_scale) class of this query in the binned-stage cache.
 	h = -1
@@ -1144,18 +1174,23 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	[-nq * 32768, nq * (offset + 32767)]. When that fits in int32 the sums
 	are exact in int32, which halves the accumulation's vector width;
 	otherwise they are kept in int64.
+
+	t_sums has 8 slots past the longest scan and is filled with the dtype's
+	minimum, which no sum can reach; `_p_values_sums` reads it back from the
+	last slot as its padding value.
 	"""
 
 	# Sized by the longest target, not by gamma, whose rows are the unique
 	# target columns and can be fewer than a target's length after hashing.
-	n_sums = T_lens.max() + nq - 1
+	n_sums = T_lens.max() + nq - 1 + 8
 
 	if int64(nq) * (int64(offset) + 32768) <= 2147483647:
-		t_sums = numpy.empty(n_sums, dtype='int32')
+		t_sums = numpy.full(n_sums, -2147483648, dtype='int32')
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
 			results, reverse_complement, t_sums, True)
 	else:
-		t_sums64 = numpy.empty(n_sums, dtype='int64')
+		t_sums64 = numpy.full(n_sums, -9223372036854775807 - 1, 
+			dtype='int64')
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
 			results, reverse_complement, t_sums64, None)
 
@@ -1236,6 +1271,10 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	n = len(T_lens) // 2 if reverse_complement == 1 else len(T_lens)
 	total_offset = uint64(0)
 
+	# The dtype's minimum, which `_p_values` put in the last slot and which
+	# no sum can equal.
+	pad = t_sums[len(t_sums)-1]
+
 	for i, nt in enumerate(T_lens):
 		nt = uint64(nt)
 		results[i, 0] = 1
@@ -1308,20 +1347,41 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 		# Only a position holding the maximum can be the final winner: the
 		# first one overwrites every field set by an earlier, lower score.
 		# Skipping the rest keeps the result and the branches predictable.
-		M = t_sums[0]
-		for k in range(1, nt+nq-1):
+		# The sums past m are set to `pad`, so both passes below run over a
+		# multiple of 8 and, for int32 sums, take the 8-lane path with no
+		# scalar tail.
+		# `pad` is below every sum, so it changes neither M nor kf/kl.
+		m = int64(nt) + int64(nq) - 1
+		for j in range(8):
+			t_sums[m+j] = pad
+		mr = (m + 7) // 8 * 8
+
+		M = pad
+		for k in range(mr):
 			M = max(M, t_sums[k])
 
 		# The first and last positions holding M, by branchless integer
 		# min/max, which vectorize; every position equal to M lies in
 		# kf..kl and is still visited in increasing k.
-		m = int64(nt) + int64(nq) - 1
-		kf = m
-		kl = int64(0)
-		for k in range(m):
+		kf32 = int32(mr)
+		kl32 = int32(0)
+		for k in range(mr):
 			e = t_sums[k] == M
-			kf = min(kf, k if e else m)
-			kl = max(kl, k if e else 0)
+			kf32 = min(kf32, int32(k) if e else int32(mr))
+			kl32 = max(kl32, int32(k) if e else int32(0))
+		kf = int64(kf32)
+		kl = int64(kl32)
+
+		# One position holds a positive M: the visit below would pass the
+		# first test (results[i, 1] is 0) and not the tie test, and write
+		# all four fields from it.
+		if kf == kl and M > 0:
+			results[i, 0] = B_cdfs[nt, uint64(M-1)]
+			results[i, 1] = M
+			results[i, 2] = kf - nq + 1
+			results[i, 3] = min(kf+1, nq) - max(0, kf-int64(nt)+1)
+			total_offset += nt
+			continue
 
 		for k in range(kf, kl+1):
 			score = t_sums[k]
@@ -1560,6 +1620,15 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	_fill_column_cache(Q, T, Q_norm, T_norm, rr_counts, q_cached, G_cache,
 		S_cache, n_median_bins)
 
+	# The target weights and the median's half-count depend only on the
+	# targets, so they are computed once here, by the expressions
+	# `_integer_distances_and_histogram` would use, and read by every query.
+	halfway = _halfway(rr_counts)
+	ys = numpy.sum(rr_counts)
+	w = numpy.empty(nt, dtype=numpy.float64)
+	for j in range(nt):
+		w[j] = rr_counts[j] / ys
+
 	# The binned stage (`gamma_int` column and `f` row) of the most frequent
 	# cached columns, per (i_min, bin_scale) class, filled as queries reach
 	# them. One copy per thread, so nothing is shared under prange; at most
@@ -1626,7 +1695,7 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 				gamma_int, _f[pid], _medians[pid], _median_bins[pid], 
 				Q_norm, T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, 
 				q_slot, G_cache, S_cache, _H_keys[pid], _H_filled[pid], 
-				_H_int[pid], _H_f[pid])
+				_H_int[pid], _H_f[pid], w, halfway)
 			offs[b] = offset
 
 			# The backgrounds span nq*(n_score_bins+offset) bins. When the
