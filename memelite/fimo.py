@@ -250,12 +250,12 @@ def _qmer_width(n_rows):
 @numba.njit(cache=True)
 def _qmer_codes(X, n_rows, q):
 	"""The code of the q letters starting at each position of `X`,
-	X[i] + n_rows * X[i+1] + ... + n_rows**(q-1) * X[i+q-1], built one letter
-	at a time from the last so that each pass vectorizes. Positions past the
-	end of `X` read as N (n_rows - 1), and there are 2q codes more than
+	X[i] + n_rows * X[i+1] + ... + n_rows**(q-1) * X[i+q-1]. Positions past
+	the end of `X` read as N (n_rows - 1), and there are 2q codes more than
 	positions, so a read at a window's start plus q is always in bounds. A code
 	that runs past the end of its sequence is only ever read through table
-	columns that weigh 0.0."""
+	columns that weigh 0.0. q = 5 and 4 are written out, which vectorizes;
+	another q takes the same arithmetic in the loop at the end."""
 
 	L = X.shape[0]
 	n_codes = L + 2 * q
@@ -263,18 +263,27 @@ def _qmer_codes(X, n_rows, q):
 	b = numpy.uint16(n_rows)
 	letter_n = numpy.uint16(n_rows - 1)
 
-	m = max(min(L - (q - 1), n_codes), 0)
-	for i in range(m):
-		codes[i] = numpy.uint16(X[i + q - 1])
-	for i in range(m, n_codes):
-		codes[i] = letter_n
-
-	for d in range(q - 2, -1, -1):
-		m = max(min(L - d, n_codes), 0)
+	m = max(L - q + 1, 0)
+	if q == 5:
 		for i in range(m):
-			codes[i] = codes[i] * b + numpy.uint16(X[i + d])
-		for i in range(m, n_codes):
-			codes[i] = codes[i] * b + letter_n
+			codes[i] = (((numpy.uint16(X[i+4]) * b + numpy.uint16(X[i+3])) * b
+				+ numpy.uint16(X[i+2])) * b + numpy.uint16(X[i+1])) * b + \
+				numpy.uint16(X[i])
+	elif q == 4:
+		for i in range(m):
+			codes[i] = ((numpy.uint16(X[i+3]) * b + numpy.uint16(X[i+2])) * b
+				+ numpy.uint16(X[i+1])) * b + numpy.uint16(X[i])
+	else:
+		m = 0
+
+	for i in range(m, n_codes):
+		c = numpy.uint16(0)
+		for d in range(q - 1, -1, -1):
+			if i + d < L:
+				c = c * b + numpy.uint16(X[i + d])
+			else:
+				c = c * b + letter_n
+		codes[i] = c
 
 	return codes
 
@@ -322,8 +331,8 @@ def _copy_hits(hits, o, seqs, starts, ends, scores, pvals):
 
 
 @numba.njit(parallel=True, fastmath=True, cache=True)
-def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold, 
-	bin_size, smallest, score_to_pvals, score_to_pval_lengths, rest, cuts, tops, 
+def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
+	bin_size, smallest, score_to_pvals, score_to_pval_lengths, rest, cuts, tops,
 	order):
 	"""Scan every motif over every sequence and return the hits as columns.
 
@@ -378,7 +387,7 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 
 					# The first 2q columns in two lookups. Only the bound test
 					# uses them.
-					bound = tab[numpy.uint64(codes[base])] + tab[n_codes + 
+					bound = tab[numpy.uint64(codes[base])] + tab[n_codes +
 						numpy.uint64(codes[base+q])]
 					if bound + rest_p <= cut:
 						continue
@@ -638,9 +647,9 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 
 	_rest, _cuts, _tops = _score_bounds(motif_pwms, motif_lengths,
 		_score_thresholds)
-	offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes, q, 
-		X_lengths, pwms_n, motif_lengths, _score_thresholds, bin_size, 
-		_smallest, _score_to_pvals, _score_to_pvals_lengths, _rest, _cuts, 
+	offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes, q,
+		X_lengths, pwms_n, motif_lengths, _score_thresholds, bin_size,
+		_smallest, _score_to_pvals, _score_to_pvals_lengths, _rest, _cuts,
 		_tops, order)
 
 	if return_counts == True:
