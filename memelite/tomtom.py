@@ -984,38 +984,315 @@ def _convolve_span(prev, row, f, k_lo, k_hi, prev_base, row_base):
 		s0 -= 1
 
 
-@njit(cache=True)
-def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset, 
-	needed=None):
-	"""An internal function that calculates the backgrounds for p-values.
+@njit(cache=True, inline='always')
+def _pairwise_max_packed(x, y, y_csum, z, L, H, x_lo, x_hi, y_lo, y_hi, K, X,
+	copy, inplace):
+	"""`_pairwise_max_support` with y and y_csum stored as their window only.
 
-	This method takes in the histogram of integerized scores `f` and returns 
-	the background probabilities of each overlap achieving a given score. 
-	These scores are calculated for the complete overlap of the query and
-	target, but also for all overhangs where only part of the query and the
-	target are overlapping (on either end). Additionally, background
-	probabilities are calculated for all spans across the query for when the
-	target is smaller than the query and has to be scanned against it.
-
-	When `needed` is given, only the rows `t` with `needed[t]` true are
-	finished; the others hold unspecified values.
+	y[i - y_lo] and y_csum[i - y_lo] hold bin i for i in [y_lo, y_hi). Below
+	the window y and y_csum are zero; above it y is zero and y_csum is K up
+	to bin X and 1 from X on, which is what the dense cumulative sum holds
+	there (see `_backgrounds_packed`). Every value read is the one the dense
+	row holds, read by the same expression, so z is bitwise the same.
 	"""
 
-	n = n_bins*nq + nq*offset
+	if copy:
+		for i in range(L, y_lo):
+			z[i] = 0.0
+		for i in range(y_lo, y_hi):
+			z[i] = y[i - y_lo]
+		for i in range(y_hi, H):
+			z[i] = 0.0
+		return y_lo, y_hi
 
-	# First and last nonzero bin of each query column's histogram. Every term
-	# is non-negative, so a skipped zero term would only have added +0.0, and
-	# the remaining terms are still added in the same order: bitwise-exact.
-	f_lo = numpy.empty(nq, dtype='int64')
-	f_hi = numpy.empty(nq, dtype='int64')
-	for j in range(nq):
-		f_lo[j], f_hi[j] = n_bins+1, 0
-		for l in range(1, n_bins+1):
-			if f[j, l] != 0:
-				f_hi[j] = l
-				if f_lo[j] > n_bins:
-					f_lo[j] = l
-	
+	z_lo, z_hi = max(x_lo, y_lo), max(x_hi, y_hi)
+	m = min(x_hi, y_hi)
+
+	x_csum = 0.0
+	for i in range(x_lo, min(z_lo, x_hi)):
+		x_csum += x[i]
+
+	if inplace:
+		for i in range(x_lo, min(z_lo, x_hi)):
+			z[i] = 0.0
+	else:
+		for i in range(L, z_lo):
+			z[i] = 0.0
+		for i in range(z_hi, H):
+			z[i] = 0.0
+
+	for i in range(z_lo, m):
+		x_csum += x[i]
+		z[i] = x[i] * y_csum[i - y_lo] + y[i - y_lo] * x_csum - x[i] * y[i - y_lo]
+
+	if x_hi > y_hi:
+		s = max(y_hi, z_lo)
+		e = min(x_hi, max(X, s))
+		for i in range(s, e):
+			z[i] = x[i] * K
+		for i in range(e, x_hi):
+			z[i] = x[i] * 1.0
+	else:
+		for i in range(max(x_hi, z_lo), y_hi):
+			z[i] = y[i - y_lo] * x_csum
+
+	return z_lo, z_hi
+
+
+@njit(cache=True, inline='always')
+def _pm_packed(x, P, n_packed, a, b, z, L, H, a_lo, a_hi, a_off, a_K, a_X,
+	x_lo, x_hi, copy, inplace):
+	"""`_pm` on the packed rows: z = max(x, A[a, b]) over [L, H), returning
+	the support of z."""
+
+	o, lo, hi = a_off[a, b], a_lo[a, b], a_hi[a, b]
+	return _pairwise_max_packed(x, P[o:o+hi-lo],
+		P[n_packed+o:n_packed+o+hi-lo], z, L, H, x_lo, x_hi, lo, hi,
+		a_K[a, b], a_X[a, b], copy, inplace)
+
+
+@njit(cache=True, inline='always')
+def _pm_fused2_packed(x, y0, c0, p0, q0, K0, X0, z0, y1, c1, p1, q1, K1, X1,
+	z1, lo, hi):
+	"""`_pm_fused2` with y0, c0, y1 and c1 stored as their windows [p0, q0)
+	and [p1, q1) (see `_pairwise_max_packed`).
+
+	[lo, hi) is cut where a window starts or ends or where a constant part
+	of a cumulative sum changes. A piece inside both windows runs the loop
+	of `_pm_fused2` over views; any other piece runs one loop that uses, for
+	each step, its window or its constant. (Specialized loops for the three
+	other cases were slower, iteration 100.) Outside its window a step's y is zero and its cumulative sum a constant
+	C, so its expression `v * C + y * s - v * y` is `v * C + 0 - 0`, and
+	since v is finite and non-negative that is exactly `v * C`. Each running
+	sum still takes every v in order, so every value is bitwise the same.
+	"""
+
+	s0, s1 = 0.0, 0.0
+	i = lo
+	while i < hi:
+		e = hi
+		if i < p0 and p0 < e:
+			e = p0
+		if i < q0 and q0 < e:
+			e = q0
+		if i < X0 and X0 < e:
+			e = X0
+		if i < p1 and p1 < e:
+			e = p1
+		if i < q1 and q1 < e:
+			e = q1
+		if i < X1 and X1 < e:
+			e = X1
+
+		in0 = i >= p0 and i < q0
+		in1 = i >= p1 and i < q1
+		C0 = 0.0 if i < p0 else (K0 if i < X0 else 1.0)
+		C1 = 0.0 if i < p1 else (K1 if i < X1 else 1.0)
+
+		if in0 and in1:
+			xv, u0, u1 = x[i:e], z0[i:e], z1[i:e]
+			a0, b0 = y0[i-p0:e-p0], c0[i-p0:e-p0]
+			a1, b1 = y1[i-p1:e-p1], c1[i-p1:e-p1]
+			for t in range(e - i):
+				v = xv[t]
+				s0 += v
+				t0 = v * b0[t] + a0[t] * s0 - v * a0[t]
+				u0[t] = t0
+				s1 += t0
+				u1[t] = t0 * b1[t] + a1[t] * s1 - t0 * a1[t]
+		else:
+			for t in range(i, e):
+				v = x[t]
+				s0 += v
+				k0, k1 = uint64(t - p0), uint64(t - p1)
+				if in0:
+					t0 = v * c0[k0] + y0[k0] * s0 - v * y0[k0]
+				else:
+					t0 = v * C0
+				z0[t] = t0
+				s1 += t0
+				if in1:
+					z1[t] = t0 * c1[k1] + y1[k1] * s1 - t0 * y1[k1]
+				else:
+					z1[t] = t0 * C1
+
+		i = e
+
+
+@njit(cache=True, inline='always')
+def _pm_chain_packed(B, src, sa, sb, dst, n_steps, P, n_packed, L, H, a_lo,
+	a_hi, a_off, a_K, a_X, x_lo, x_hi):
+	"""`_pm_chain` on the packed rows, which are never all zero."""
+
+	k, row = 0, src
+	while k + 2 <= n_steps:
+		lo, hi, z_lo, z_hi = x_lo, x_hi, x_lo, x_hi
+		for r in range(k, k+2):
+			a, b = sa[r], sb[r]
+			hi = max(hi, a_hi[a, b])
+			z_lo, z_hi = max(z_lo, a_lo[a, b]), max(z_hi, a_hi[a, b])
+
+		a0, b0, a1, b1 = sa[k], sb[k], sa[k+1], sb[k+1]
+		o0, w0 = a_off[a0, b0], a_hi[a0, b0] - a_lo[a0, b0]
+		o1, w1 = a_off[a1, b1], a_hi[a1, b1] - a_lo[a1, b1]
+		_pm_fused2_packed(B[row], P[o0:o0+w0],
+			P[n_packed+o0:n_packed+o0+w0], a_lo[a0, b0], a_hi[a0, b0],
+			a_K[a0, b0], a_X[a0, b0], B[dst[k]], P[o1:o1+w1],
+			P[n_packed+o1:n_packed+o1+w1], a_lo[a1, b1], a_hi[a1, b1],
+			a_K[a1, b1], a_X[a1, b1], B[dst[k+1]], lo, hi)
+
+		for r in range(k, k+2):
+			d = dst[r]
+			if d != row and (r == k or d != dst[r-1]):
+				for i in range(L, lo):
+					B[d, i] = 0.0
+				for i in range(hi, H):
+					B[d, i] = 0.0
+
+		row, x_lo, x_hi = dst[k+1], z_lo, z_hi
+		k += 2
+
+	while k < n_steps:
+		x_lo, x_hi = _pm_packed(B[row], P, n_packed, sa[k], sb[k], B[dst[k]],
+			L, H, a_lo, a_hi, a_off, a_K, a_X, x_lo, x_hi, False,
+			dst[k] == row)
+		row = dst[k]
+		k += 1
+
+	return x_lo, x_hi
+
+
+@njit(cache=True)
+def _backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
+	offset, needed, a_lo, a_hi, L, H):
+	"""The span backgrounds, their cumulative sums and the rows of B before
+	the survival pass, with each span row stored as its nonzero window only.
+
+	Row A[i, j] is nonzero only in [a_lo[i, j], a_hi[i, j]), which the
+	caller has checked lies in [0, n) for every row and is never empty. It
+	is stored in P[a_off[i, j]:], one window after another, and its
+	cumulative sum at the same place plus n_packed. The dense code sums A
+	over [c + m, c + m*n_bins], a superset of the window, from 0.0, so its
+	cumulative sum is 0 below the window, the window's running sum within
+	it, and the total K above it up to bin X = n_bins*(j+1) + c, where it is
+	overwritten with 1 from X on. X can be the window's last bin, so the 1
+	is written into the window there. The readers use 0, K and 1 outside the
+	window. The convolution adds the same terms in the same order into a
+	row cleared over its window, which is exactly where it writes, so every
+	stored value is bitwise the dense one.
+	"""
+
+	a_off = numpy.empty((nq, nq), dtype='int64')
+	a_K = numpy.empty((nq, nq), dtype='float64')
+	a_X = numpy.empty((nq, nq), dtype='int64')
+	p = int64(0)
+	for i in range(nq):
+		for j in range(i, nq):
+			a_off[i, j] = p
+			p += a_hi[i, j] - a_lo[i, j]
+			a_X[i, j] = int64(n_bins) * int64(j+1) + int64(offset) * int64(nq
+				- j + i - 1)
+
+	for i in range(nq):
+		for j in range(i, nq):
+			o, w = a_off[i, j], a_hi[i, j] - a_lo[i, j]
+			row = P[o:o+w]
+			if i == j:
+				for l in range(f_lo[j], f_hi[j]+1):
+					row[l - f_lo[j]] = f[j, l]
+			else:
+				row[:] = 0
+
+				# In the dense row, bin k + c + offset of A[i, j-1] times
+				# f[j, l_lo + s] is added into bin k + c + l_lo + s of A[i, j],
+				# for k over the support [k_lo, k_hi] of A[i, j-1] in the
+				# `k` coordinate. Here both are shifted by their windows.
+				c = int64(offset) * int64(nq - j + i - 1)
+				k_lo = a_lo[i, j-1] - c - int64(offset)
+				k_hi = a_hi[i, j-1] - 1 - c - int64(offset)
+				po = a_off[i, j-1]
+				prev = P[po:po + a_hi[i, j-1] - a_lo[i, j-1]]
+				l_lo, l_hi = f_lo[j], f_hi[j]
+				_convolve_span(prev, row, f[j, l_lo:l_hi+1], k_lo, k_hi,
+					-k_lo, c + l_lo - a_lo[i, j])
+
+	for i in range(nq):
+		for j in range(i, nq):
+			o, w = a_off[i, j], a_hi[i, j] - a_lo[i, j]
+			a, s = P[o:o+w], P[n_packed+o:n_packed+o+w]
+			acc = 0.0
+			for k in range(w):
+				acc += a[k]
+				s[k] = acc
+
+			a_K[i, j] = acc
+			for k in range(max(a_X[i, j] - a_lo[i, j], 0), w):
+				s[k] = 1.0
+
+	# The B build of `_backgrounds_dense`, reading the packed rows. Pass 0
+	# builds the chain for rows nq..t_max and pass r > 0 row r; both end in
+	# the one call to `_pm_chain_packed`, which is inlined, so it is 
+	# compiled once.
+	n_steps_max = 2*nq + t_max
+	sa = numpy.empty(n_steps_max, dtype='int64')
+	sb = numpy.empty(n_steps_max, dtype='int64')
+	dst = numpy.empty(n_steps_max, dtype='int64')
+
+	for r in range(min(nq, t_max+1)):
+		ns = 0
+		if r == 0:
+			if t_max < nq:
+				continue
+
+			b_lo, b_hi, src = L, H, 1
+			if nq > 1:
+				b_lo, b_hi = _pm_packed(B[0], P, n_packed, 0, 0, B[1], L, H, 
+					a_lo, a_hi, a_off, a_K, a_X, b_lo, b_hi, True, False)
+				sa[ns], sb[ns], dst[ns] = nq-1, nq-1, 1
+				ns += 1
+
+			for i in range(2, nq):
+				sa[ns], sb[ns], dst[ns] = 0, i-1, i
+				sa[ns+1], sb[ns+1], dst[ns+1] = nq-i, nq-1, i
+				ns += 2
+
+			for i in range(nq, t_max+1):
+				if i == 1:
+					b_lo, b_hi = _pm_packed(B[0], P, n_packed, 0, nq-1, B[1], 
+						L, H, a_lo, a_hi, a_off, a_K, a_X, b_lo, b_hi, True, 
+						False)
+					continue
+				sa[ns], sb[ns], dst[ns] = 0, nq-1, i
+				ns += 1
+		else:
+			if needed is not None and not needed[r]:
+				continue
+
+			b_lo, b_hi, src = L, H, r
+			b_lo, b_hi = _pm_packed(B[r], P, n_packed, 0, r-1, B[r], L, H, 
+				a_lo, a_hi, a_off, a_K, a_X, L, H, True, True)
+
+			for j in range(1, nq - r + 1):
+				sa[ns], sb[ns], dst[ns] = j, j+r-1, r
+				ns += 1
+
+			for j in range(r-1):
+				sa[ns], sb[ns], dst[ns] = 0, j, r
+				sa[ns+1], sb[ns+1], dst[ns+1] = nq-1-j, nq-1, r
+				ns += 2
+
+		b_lo, b_hi = _pm_chain_packed(B, src, sa, sb, dst, ns, P, n_packed, L,
+			H, a_lo, a_hi, a_off, a_K, a_X, b_lo, b_hi)
+
+
+@njit(cache=True)
+def _backgrounds_dense(f, f_lo, f_hi, A, B, A_csum, nq, n_bins, t_max, offset,
+	needed, a_lo, a_hi, L, H, n):
+	"""The span backgrounds A, their cumulative sums A_csum and the rows of B
+	before the survival pass, in the dense layout: every row of A and A_csum
+	is n bins long. `_p_value_backgrounds` uses this when a query has an
+	empty column or a support that reaches n."""
+
 	for i in range(nq):
 		i = uint64(i)
 
@@ -1046,47 +1323,6 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 
 
 	_A_cumsum(A, A_csum, nq, n_bins, offset, n)
-
-	###
-
-	# Every A[i, j] is zero outside [lo, hi), where lo and hi follow from the
-	# lowest and highest nonzero bins of f, so every B row is too: the pdf of
-	# a maximum is zero below the larger of the two lower ends and above the
-	# larger of the two upper ends. B is built only over [L, H), the union of
-	# those windows. The values dropped are exact zeros, so every value that
-	# is kept is computed by the same operations in the same order.
-	L, H = int64(n), int64(0)
-	a_lo = numpy.empty((nq, nq), dtype='int64')
-	a_hi = numpy.empty((nq, nq), dtype='int64')
-	for i in range(nq):
-		lo, hi, empty = int64(0), int64(0), False
-		for j in range(i, nq):
-			if f_lo[j] > n_bins:
-				empty = True
-			if empty:
-				a_lo[i, j] = -1
-				continue
-
-			lo += f_lo[j]
-			hi += f_hi[j]
-			c = int64(offset) * int64(nq - j + i - 1)
-			a_lo[i, j], a_hi[i, j] = lo + c, hi + c + 1
-			L = min(L, lo + c)
-			H = max(H, hi + c + 1)
-
-	if H > int64(n):
-		H = int64(n)
-	if H <= L:
-		L, H = 0, 0
-
-	# A[a, b] is zero outside [a_lo, a_hi) (clipped to [L, H)), and a_lo is 
-	# -1 when the row is all zero; its A_csum is then not zero below the fill
-	# of 1, so it goes through the unrestricted `_pairwise_max_window` and 
-	# the result's support is taken to be all of [L, H).
-	for i in range(nq):
-		for j in range(i, nq):
-			if a_lo[i, j] >= 0:
-				a_hi[i, j] = min(a_hi[i, j], H)
 
 	# Rows below nq are rebuilt from A alone further down, so the first pass
 	# only matters as the start of the chain that builds rows nq..t_max. 
@@ -1141,6 +1377,119 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset,
 
 		b_lo, b_hi = _pm_chain(B, i, sa, sb, dst, ns, A, A_csum, L, H, a_lo,
 			a_hi, b_lo, b_hi)
+
+
+
+@njit(cache=True)
+def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset, 
+	needed=None, packed=None):
+	"""An internal function that calculates the backgrounds for p-values.
+
+	This method takes in the histogram of integerized scores `f` and returns 
+	the background probabilities of each overlap achieving a given score. 
+	These scores are calculated for the complete overlap of the query and
+	target, but also for all overhangs where only part of the query and the
+	target are overlapping (on either end). Additionally, background
+	probabilities are calculated for all spans across the query for when the
+	target is smaller than the query and has to be scanned against it.
+
+	When `needed` is given, only the rows `t` with `needed[t]` true are
+	finished; the others hold unspecified values.
+
+	The span backgrounds A[i, j] and their cumulative sums are stored packed,
+	each row as its nonzero window only (see `_backgrounds_packed`), in
+	`packed` when it is given, and A and A_csum are then not written.
+	Without `packed` they are stored in the memory of A_csum, and each A[i, i]
+	is set to the distribution of column i. A query with an empty column, a
+	support that reaches n, or too little room uses the dense layout in A and
+	A_csum (`_backgrounds_dense`).
+	"""
+
+	n = n_bins*nq + nq*offset
+
+	# First and last nonzero bin of each query column's histogram. Every term
+	# is non-negative, so a skipped zero term would only have added +0.0, and
+	# the remaining terms are still added in the same order: bitwise-exact.
+	f_lo = numpy.empty(nq, dtype='int64')
+	f_hi = numpy.empty(nq, dtype='int64')
+	for j in range(nq):
+		f_lo[j], f_hi[j] = n_bins+1, 0
+		for l in range(1, n_bins+1):
+			if f[j, l] != 0:
+				f_hi[j] = l
+				if f_lo[j] > n_bins:
+					f_lo[j] = l
+
+	# Every A[i, j] is zero outside [lo, hi), where lo and hi follow from the
+	# lowest and highest nonzero bins of f, so every B row is too: the pdf of
+	# a maximum is zero below the larger of the two lower ends and above the
+	# larger of the two upper ends. B is built only over [L, H), the union of
+	# those windows. The values dropped are exact zeros, so every value that
+	# is kept is computed by the same operations in the same order.
+	L, H = int64(n), int64(0)
+	a_lo = numpy.empty((nq, nq), dtype='int64')
+	a_hi = numpy.empty((nq, nq), dtype='int64')
+	for i in range(nq):
+		lo, hi, empty = int64(0), int64(0), False
+		for j in range(i, nq):
+			if f_lo[j] > n_bins:
+				empty = True
+			if empty:
+				a_lo[i, j] = -1
+				continue
+
+			lo += f_lo[j]
+			hi += f_hi[j]
+			c = int64(offset) * int64(nq - j + i - 1)
+			a_lo[i, j], a_hi[i, j] = lo + c, hi + c + 1
+			L = min(L, lo + c)
+			H = max(H, hi + c + 1)
+
+	# The packed layout needs every support inside [0, n) and no empty column.
+	dense = H > int64(n)
+	for j in range(nq):
+		if f_lo[j] > n_bins:
+			dense = True
+
+	if H > int64(n):
+		H = int64(n)
+	if H <= L:
+		L, H, dense = 0, 0, True
+
+	# A[a, b] is zero outside [a_lo, a_hi) (clipped to [L, H)), and a_lo is 
+	# -1 when the row is all zero; its A_csum is then not zero below the fill
+	# of 1, so it goes through the unrestricted `_pairwise_max_window` and 
+	# the result's support is taken to be all of [L, H).
+	for i in range(nq):
+		for j in range(i, nq):
+			if a_lo[i, j] >= 0:
+				a_hi[i, j] = min(a_hi[i, j], H)
+
+	if not dense:
+		n_packed = int64(0)
+		for i in range(nq):
+			for j in range(i, nq):
+				n_packed += a_hi[i, j] - a_lo[i, j]
+
+		if packed is None:
+			P = A_csum.reshape(A_csum.size)
+		else:
+			P = packed
+		dense = 2*n_packed > P.shape[0]
+
+	if dense:
+		_backgrounds_dense(f, f_lo, f_hi, A, B, A_csum, nq, n_bins, t_max, 
+			offset, needed, a_lo, a_hi, L, H, n)
+	else:
+		if packed is None:
+			c = int64(offset) * int64(nq - 1)
+			for i in range(nq):
+				A[i, i] = 0
+				for l in range(1, n_bins+1):
+					A[i, i, l+c] = f[i, l]
+
+		_backgrounds_packed(f, f_lo, f_hi, B, P, n_packed, nq, n_bins, t_max,
+			offset, needed, a_lo, a_hi, L, H)
 
 	# Row 0 is the all -1 starting point and is never a real distribution.
 	if needed is None or needed[0]:
@@ -1795,8 +2144,9 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 				A_csum = _A_csum[pid, :n_a].reshape((nq, nq, n_needed))
 				B = _B[pid, b]
 
+			# A_csum's memory holds the packed span rows; A[i, i] is not set.
 			_p_value_backgrounds(_f[pid], A, B, A_csum, nq, n_score_bins, 
-				T_max, offset, needed)
+				T_max, offset, needed, A_csum.reshape(A_csum.size))
 
 			# A single query, or one the batch cannot hold, runs alone
 			# from a packed copy of its gamma_int.
