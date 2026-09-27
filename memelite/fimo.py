@@ -293,6 +293,20 @@ _TABLE_MAX = 3125
 # entry on this machine, and at 64 the call was 0.027 s slower.
 _N_LANE = 16
 
+# For a four-letter alphabet, the blocks of windows above are tested on one
+# lookup instead of two: a base-4 code of the `_WIDE_K` letters at each
+# position (`_wide_codes`) indexes an int16 table of the summed weights of
+# min(n, `_WIDE_K`) consecutive columns of the motif, rounded up to a grid
+# (`_wide_table`), and the window's bound is compared with an integer cut. A
+# block with a window that passes goes through the two-lookup test below.
+# Chosen by measurement on the benchmark (AMD Zen 5, 8 threads): the int16
+# table of 4**7 entries is 32 KB and stays in L1, and its test costs about
+# 0.78 cycles per window against 1.63 for the two float64 lookups. A float64
+# table of 4**7 or 4**8 entries does not fit L1, and its lookup cost about as
+# much as the two lookups it replaced.
+_WIDE_K = 7
+_WIDE_CODES = 4 ** _WIDE_K
+
 
 def _score_bounds(pwm, pwm_lengths, thresholds):
 	"""Upper bounds that let `_fast_hits` abandon a window early.
@@ -322,6 +336,17 @@ def _score_bounds(pwm, pwm_lengths, thresholds):
 	(n + 2) * 1e-12 * (1 + W + |threshold|), is over 3,000 times that, and far
 	below the smallest gap between a window's score and its threshold on real
 	motifs (4.7e-5 on the benchmark).
+
+	The wide test of a four-letter alphabet (`_wide_table`) is covered by the
+	same chain. Its float table entry T is a sum of the min(n, `_WIDE_K`)
+	columns of one block (plus exact +0.0 terms), and its `rest` is a sum of
+	`col_max` over the motif's other columns, so T + rest is again one term per
+	column, each at least that column's entry. The int16 test abandons a window
+	only when T + rest < cut holds for the real numbers T, rest and cut, with
+	more than one grid step to spare (`_wide_table` proves it), which is
+	stronger than the rounded addition and comparison of the float test. A
+	block that touches an N, and a table that cannot be put on the grid, pass
+	the wide test, and the float tests below decide.
 
 	An unreachable threshold (+inf) gets a cut of +inf, so every window is
 	abandoned, as `_fast_hits` would report none of them. Any other non-finite
@@ -412,6 +437,161 @@ def _qmer_codes(X, n_rows, q):
 		codes[i] = c
 
 	return codes
+
+
+@numba.njit(cache=True)
+def _wide_codes(X):
+	"""The code of the `_WIDE_K` letters starting at each position of `X`, for
+	a four-letter alphabet whose N is 4: X[i] + 4 * X[i+1] + ... +
+	4**(K-1) * X[i+K-1]. A position whose K letters include an N, or run past
+	the end of `X`, gets `_WIDE_CODES`, which no letters produce. There are
+	K + 1 codes more than positions, all `_WIDE_CODES`, so a zero-width motif
+	can read the code at the end of the last sequence."""
+
+	L = X.shape[0]
+	codes = numpy.empty(L + _WIDE_K + 1, dtype=numpy.uint16)
+	m = max(L - _WIDE_K + 1, 0)
+	for i in range(m):
+		v0 = numpy.uint16(X[i])
+		v1 = numpy.uint16(X[i+1])
+		v2 = numpy.uint16(X[i+2])
+		v3 = numpy.uint16(X[i+3])
+		v4 = numpy.uint16(X[i+4])
+		v5 = numpy.uint16(X[i+5])
+		v6 = numpy.uint16(X[i+6])
+		c = (v0 | (v1 << 2) | (v2 << 4) | (v3 << 6) | (v4 << 8) | (v5 << 10)
+			| (v6 << 12))
+		bad = (v0 | v1 | v2 | v3 | v4 | v5 | v6) > 3
+		codes[i] = numpy.uint16(_WIDE_CODES) if bad else c
+
+	for i in range(m, L + _WIDE_K + 1):
+		codes[i] = _WIDE_CODES
+
+	return codes
+
+
+def _wide_layout(col_max, gap, pwm_lengths):
+	"""The block of each motif's wide test: min(n, `_WIDE_K`) consecutive
+	columns starting at column `w_off[k]`, the block of that width with the
+	largest summed `gap` (the first of equals; a NaN gap or sum counts as
+	-inf), and `w_rest[k]`, the sum of `col_max` over the motif's other
+	columns. The sum adds exact +0.0 for the block's columns, and its order is
+	covered by `_score_bounds`' margin."""
+
+	lengths = numpy.asarray(pwm_lengths, dtype=numpy.int64)
+	widths = numpy.diff(lengths)
+	n_motifs = len(widths)
+	max_width = int(widths.max()) if n_motifs > 0 else 0
+	cols = numpy.arange(max_width)
+	mask = cols < widths[:, None]
+
+	# The summed gap of each block of `_WIDE_K` columns that lies inside its
+	# motif. A motif of fewer columns has one block, at column 0.
+	g = numpy.full((n_motifs, max_width + _WIDE_K), -numpy.inf)
+	g[:, :max_width][mask] = numpy.where(numpy.isnan(gap), -numpy.inf, gap)
+	with numpy.errstate(invalid='ignore'):
+		sums = numpy.lib.stride_tricks.sliding_window_view(g, _WIDE_K,
+			axis=1)[:, :max_width + 1].sum(axis=2)
+	valid = numpy.arange(max_width + 1) <= (widths - _WIDE_K)[:, None]
+	sums = numpy.where(valid & ~numpy.isnan(sums), sums, -numpy.inf)
+	w_off = numpy.where(widths > _WIDE_K, sums.argmax(axis=1), 0)
+
+	kw = numpy.minimum(widths, _WIDE_K)
+	inside = (cols >= w_off[:, None]) & (cols < (w_off + kw)[:, None])
+	padded = numpy.zeros((n_motifs, max_width))
+	padded[mask] = col_max
+	padded[inside] = 0.0
+	w_rest = padded.sum(axis=1)
+	return w_off.astype(numpy.uint64), w_rest.astype(numpy.float64)
+
+
+@numba.njit(cache=True)
+def _wide_table(tabw, pwm, off, kw, cut, rest):
+	"""Fill the int16 table of a wide test and return its integer cut.
+
+	For the code c of `_WIDE_K` letters, the float entry T[c] is the summed
+	weight of columns off .. off + kw - 1 of `pwm` for the letters of c (digit
+	d is the letter at column off + d; digits at or past kw weigh 0.0), added
+	as lo4[the first four digits] + hi3[the last three]. The table holds
+	q[c] = ceil(a[c]) - 29999 with a[c] = (T[c] - lo) * inv, inv = 1 / s, where
+	lo and hi bound every T[c] and s >= (hi - lo) / 60000, so a[c] is in
+	[0, 60000] and q[c] in [-29999, 30001]. The code `_WIDE_CODES` (an N, or
+	the end of the sequence) holds 32767 and always passes.
+
+	A window passes when q[c] > qcut. With qc = (cut - rest - lo) * inv, qcut
+	is floor(qc) - 30001, so a window is abandoned only when
+	ceil(a[c]) <= floor(qc) - 2. Every rounding in a[c] and qc is at most
+	2**-23 grid steps, because s is at least 2**-30 * (|lo| + |cut - rest|)
+	and a[c], qc are at most 60011 steps. So an abandoned window has
+	T[c] + rest < cut - s for the real numbers. A qc above 60010 abandons
+	every finite entry (qcut 32766), which the same argument allows, and one
+	below -10 abandons none (qcut -32768).
+
+	A table whose lo4 or hi3 has a non-finite entry, or whose cut - rest or
+	grid step is not finite, passes every window (all 32767, qcut -32768),
+	and the float tests decide.
+	"""
+
+	lo4 = numpy.empty(256, dtype=numpy.float64)
+	hi3 = numpy.empty(64, dtype=numpy.float64)
+	off = numpy.int64(off)
+	kw = numpy.int64(kw)
+	for c in range(256):
+		v = 0.0
+		for d in range(4):
+			if d < kw:
+				v += numpy.float64(pwm[(c >> (2 * d)) & 3, off + d])
+		lo4[c] = v
+	for c in range(64):
+		v = 0.0
+		for d in range(3):
+			if d + 4 < kw:
+				v += numpy.float64(pwm[(c >> (2 * d)) & 3, off + 4 + d])
+		hi3[c] = v
+
+	ok = True
+	lmin, lmax = lo4[0], lo4[0]
+	for c in range(256):
+		ok = ok and math.isfinite(lo4[c])
+		lmin = min(lmin, lo4[c])
+		lmax = max(lmax, lo4[c])
+	hmin, hmax = hi3[0], hi3[0]
+	for c in range(64):
+		ok = ok and math.isfinite(hi3[c])
+		hmin = min(hmin, hi3[c])
+		hmax = max(hmax, hi3[c])
+
+	# Rounding is monotone, so every lo4[l] + hi3[h] lies in [lo, hi].
+	d = cut - rest
+	lo = lmin + hmin
+	hi = lmax + hmax
+	s = 1.0
+	if ok and math.isfinite(d):
+		s = max((hi - lo) / 60000.0, (abs(lo) + abs(d)) * 2.0 ** -30,
+			2.0 ** -900)
+		ok = math.isfinite(s)
+	else:
+		ok = False
+
+	tabw[_WIDE_CODES] = 32767
+	if not ok:
+		for c in range(_WIDE_CODES):
+			tabw[c] = 32767
+		return numpy.int64(-32768)
+
+	inv = 1.0 / s
+	for h in range(64):
+		hv = hi3[h]
+		for l in range(256):
+			a = ((lo4[l] + hv) - lo) * inv
+			tabw[h * 256 + l] = numpy.int16(numpy.int64(math.ceil(a)) - 29999)
+
+	qc = (d - lo) * inv
+	if qc > 60010.0:
+		return numpy.int64(32766)
+	elif qc >= -10.0:
+		return numpy.int64(math.floor(qc)) - 30001
+	return numpy.int64(-32768)
 
 
 @numba.njit(cache=True)
@@ -561,12 +741,14 @@ def _copy_hits(hits, o, seqs, starts, ends, scores, pvals):
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 	bin_size, smallest, score_to_pvals, score_to_pval_lengths, blk_off, blk_w,
-	blk_rest, blk_start, cuts, tops, order):
+	blk_rest, blk_start, cuts, tops, order, wcodes, w_on, w_off, w_rest):
 	"""Scan every motif over every sequence and return the hits as columns.
 
 	`codes` and `q` come from `_qmer_codes`: the bound that abandons a window
 	reads a block of up to q columns per table lookup, and the blocks and the
-	order they are read in come from `_block_layout`. The hits of each motif
+	order they are read in come from `_block_layout`. A motif with `w_on[k]`
+	is first tested on the wide block of `_wide_layout` (`w_off`, `w_rest`)
+	through the codes `wcodes` of `_wide_codes`. The hits of each motif
 	are collected in a list while it is scanned, then copied into flat arrays
 	in the order given by `order`, so that the hits of motif `order[t]` are
 	rows `offsets[t]` to `offsets[t+1]` of the returned sequence index, start,
@@ -616,6 +798,19 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 			o1 = blk_off[b0]
 			o2 = blk_off[b0 + numpy.uint64(1)]
 
+			# The wide test's table and integer cut, and the column of the
+			# window its block starts at. The block lies inside the motif, or
+			# covers the whole motif and letters after it that weigh 0.0.
+			wide = w_on[k]
+			ow = numpy.uint64(0)
+			qcut = numpy.int64(-32768)
+			tabw = numpy.empty(_WIDE_CODES + 1 if wide else 1,
+				dtype=numpy.int16)
+			if wide:
+				ow = w_off[k]
+				qcut = _wide_table(tabw, pwm, off + ow, min(numpy.int64(n),
+					_WIDE_K), cut, w_rest[k])
+
 			for l in range(n_chroms):
 				start = numpy.uint64(chrom_lengths[l])
 				end = numpy.uint64(chrom_lengths[l+1])
@@ -628,24 +823,36 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 				while x < xe:
 					# The first test on `n_lane` consecutive windows at a
 					# time, with one branch per block of windows: a block
-					# is skipped when none of its windows survives, and
-					# 1.6% of blocks on the benchmark have one that does.
+					# is skipped when none of its windows survives.
 					# The trip count is a constant, so LLVM unrolls the loop
 					# fully; numba does not run LLVM's SLP vectorizer, so
-					# the unrolled test is scalar. Each window's test is the
-					# one below, perhaps added in another order, which the
-					# margin in `_score_bounds` covers, so a skipped block
-					# holds no window that could be a hit.
-					while x + n_lane <= xe:
-						any_alive = False
-						for v in range(n_lane):
-							xv = x + numpy.uint64(v)
-							b = tab[numpy.uint64(codes[xv+o1])] + tab[stride +
-								numpy.uint64(codes[xv+o2])]
-							any_alive = any_alive | (b + rest_p > cut)
-						if any_alive:
-							break
-						x += n_lane
+					# the unrolled test is scalar. With `wide`, each window
+					# is tested on its wide block in integers; otherwise on
+					# the test below, perhaps added in another order. The
+					# margin in `_score_bounds` covers both, so a skipped
+					# block holds no window that could be a hit.
+					if wide:
+						while x + n_lane <= xe:
+							any_alive = False
+							for v in range(n_lane):
+								xv = x + numpy.uint64(v)
+								b = numpy.int64(tabw[numpy.uint64(wcodes[xv +
+									ow])])
+								any_alive = any_alive | (b > qcut)
+							if any_alive:
+								break
+							x += n_lane
+					else:
+						while x + n_lane <= xe:
+							any_alive = False
+							for v in range(n_lane):
+								xv = x + numpy.uint64(v)
+								b = tab[numpy.uint64(codes[xv+o1])] + tab[
+									stride + numpy.uint64(codes[xv+o2])]
+								any_alive = any_alive | (b + rest_p > cut)
+							if any_alive:
+								break
+							x += n_lane
 
 					# The windows of a block that has a survivor, and the
 					# last windows of a segment, go through the first test
@@ -1048,6 +1255,16 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		_score_thresholds)
 	_blk_off, _blk_w, _blk_rest, _blk_start = _block_layout(_col_max, _gap,
 		motif_lengths, q)
+
+	# The wide first test needs a four-letter alphabet, whose N is row 4.
+	wide = n_alpha == 4
+	_w_off, _w_rest = _wide_layout(_col_max, _gap, motif_lengths)
+	_w_on = numpy.full(n_motifs, wide, dtype=numpy.bool_)
+	if wide:
+		_wcodes = _wide_codes(X)
+	else:
+		_wcodes = numpy.full(1, _WIDE_CODES, dtype=numpy.uint16)
+
 	# The motif-strands differ in cost, and some are skipped outright, so the
 	# scan's prange hands them out one at a time instead of in one contiguous
 	# block per thread. The chunk size is set from Python
@@ -1058,7 +1275,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes, q,
 			X_lengths, pwms_n, motif_lengths, _score_thresholds, bin_size,
 			_smallest, _score_to_pvals, _score_to_pvals_lengths, _blk_off,
-			_blk_w, _blk_rest, _blk_start, _cuts, _tops, order)
+			_blk_w, _blk_rest, _blk_start, _cuts, _tops, order, _wcodes, _w_on,
+			_w_off, _w_rest)
 	finally:
 		numba.set_parallel_chunksize(previous)
 
