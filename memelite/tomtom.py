@@ -559,10 +559,18 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 	# columns and gives their min and max; each block's rows get their median
 	# right away, while they are still in cache. Of the up to three columns left over, a pair
 	# goes through `_distances_block2` and a single one alone.
+	#
+	# Columns computed one at a time (all uncached ones for an alphabet other
+	# than four letters, and the last leftover for four) are collected in
+	# `rest` and share one call of the inlined `_column_distances`, so its
+	# code is compiled once rather than twice. Each column's results depend
+	# only on that column, so the order they are computed in does not matter.
 	smin = numpy.empty(nq, dtype=numpy.float64)
 	smax = numpy.empty(nq, dtype=numpy.float64)
 	todo = numpy.empty(4, dtype=numpy.int64)
+	rest = numpy.empty(nq, dtype=numpy.int64)
 	n_todo = 0
+	n_rest = 0
 	for i in range(nq):
 		c = i + nq_csum
 		slot = -1
@@ -588,9 +596,8 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 						smin[iu], smax[iu], Y_counts, zb, halfway)
 				n_todo = 0
 		else:
-			smin[i], smax[i], medians[i] = _column_distances(X, c, Y, Y_norm,
-				X_norm[c], g[i], x2, mxb, mnb, zb, median_bins, Y_counts, 
-				halfway)
+			rest[n_rest] = i
+			n_rest += 1
 
 	if n_todo >= 2:
 		_distances_block2(X, Y, Y_norm, X_norm, todo[0] + nq_csum, 
@@ -602,7 +609,10 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 		todo[0] = todo[2]
 		n_todo -= 2
 	for u in range(n_todo):
-		iu = todo[u]
+		rest[n_rest] = todo[u]
+		n_rest += 1
+	for u in range(n_rest):
+		iu = rest[u]
 		c = iu + nq_csum
 		smin[iu], smax[iu], medians[iu] = _column_distances(X, c, Y, Y_norm,
 			X_norm[c], g[iu], x2, mxb, mnb, zb, median_bins, Y_counts, halfway)
@@ -1739,6 +1749,10 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 	t_sums has 8 slots past the longest scan and is filled with the dtype's
 	minimum, which no sum can reach; `_p_values_sums` reads it back from the
 	last slot as its padding value.
+
+	The int64 sums need nq * (offset + 32768) > 2**31, a query of more than
+	65,535 columns, so they run in object mode (`_p_values_int64`) and are
+	compiled on first use rather than with every caller.
 	"""
 
 	# Sized by the longest target, not by gamma, whose rows are the unique
@@ -1750,10 +1764,25 @@ def _p_values(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
 			results, reverse_complement, t_sums, b_lo)
 	else:
-		t_sums64 = numpy.full(n_sums, -9223372036854775807 - 1, 
-			dtype='int64')
-		_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, 
-			results, reverse_complement, t_sums64, b_lo)
+		# The scalars travel as one-element arrays so the object-mode call
+		# is typed with their numba types (offset is uint64 from `_tomtom`).
+		# `_p_values_sums` only tests reverse_complement == 1.
+		s_iq, s_nq, s_off = numpy.full(1, iq), numpy.full(1, nq), \
+			numpy.full(1, offset)
+		s_rc = numpy.full(1, int64(1 if reverse_complement == 1 else 0))
+		s_lo = numpy.full(1, b_lo)
+		with numba.objmode():
+			_p_values_int64(gamma, B_cdfs, rr_inv, T_lens, s_iq[0], s_nq[0],
+				s_off[0], results, s_rc[0], n_sums, s_lo[0])
+
+
+def _p_values_int64(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
+	reverse_complement, n_sums, b_lo):
+	"""The int64 branch of `_p_values`, called from its object-mode block."""
+
+	t_sums64 = numpy.full(n_sums, -9223372036854775807 - 1, dtype='int64')
+	_p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
+		reverse_complement, t_sums64, b_lo)
 
 
 @njit(cache=True)
@@ -2104,6 +2133,24 @@ def _merge_rc_results_into(results, out):
 			out[i, 4] = 0
 
 
+@njit(cache=True)
+def _integer_histogram_int16(Y, gamma, gamma_int, f, medians, Y_counts,
+	nq_csum, nq, i_min, bin_scale, offset, q_slot, G_cache, H_keys, H_filled,
+	H_int, H_f, w_pre):
+	"""`_integer_histogram` into an int16 `gamma_int`, called through object
+	mode so that it compiles on first use. `_tomtom` needs it only for a
+	query whose offset does not fit the int8 batch. The scalars travel as
+	one-element arrays so the call is typed with their numba types."""
+
+	s_c, s_nq, s_im = numpy.full(1, nq_csum), numpy.full(1, nq), \
+		numpy.full(1, i_min)
+	s_bs, s_off = numpy.full(1, bin_scale), numpy.full(1, offset)
+	with numba.objmode():
+		_integer_histogram(Y, gamma, gamma_int, f, medians, Y_counts, s_c[0],
+			s_nq[0], s_im[0], s_bs[0], s_off[0], q_slot, G_cache, H_keys,
+			H_filled, H_int, H_f, w_pre)
+
+
 @njit(cache=True, inline='always')
 def _transpose8(r0, r1, r2, r3, r4, r5, r6, r7):
 	"""Transpose the 8x8 byte matrix whose row b is word r_b (byte p at
@@ -2365,19 +2412,25 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			i = qb[b]
 			g1 = _gamma_int[pid, :nt*nq].reshape((nt, nq))
 			# The distances and medians do not depend on the gamma_int
-			# type; the binned stage goes into the batch's int8 G3 when the
-			# offset fits it, and into this query's int16 g1 otherwise.
+			# type; the binned stage goes into the batch's buffer (`_Gs` or
+			# G3) when the offset fits it, which includes a query running
+			# alone (it is then copied into g1), and into this query's int16
+			# g1 otherwise. The offset is in [0, n_score_bins] (see `tomtom`),
+			# so the int16 call is a guard, never taken on any input tried:
+			# it runs in object mode and compiles on first use
+			# (`_integer_histogram_int16`), and only the batch buffer's
+			# specialization is compiled with `_tomtom`.
 			i_min, bin_scale, off_s = _distances_and_medians(Q, T, 
 				_gamma[pid], _medians[pid], _median_bins[pid], Q_norm, T_norm,
 				rr_counts, Q_offsets[i], nq, n_score_bins, q_slot, S_cache,
 				halfway)
-			alone = nb == 1 or (g_max >= 0 and 
-				not _fits_gamma(off_s, n_score_bins, g_max))
-			if alone:
-				_integer_histogram(T, _gamma[pid], g1, _f[pid], _medians[pid],
-					rr_counts, Q_offsets[i], nq, i_min, bin_scale, off_s,
-					q_slot, G_cache, _H_keys[pid], _H_filled[pid], _H_int[pid],
-					_H_f[pid], w)
+			in_g3 = g_max < 0 or _fits_gamma(off_s, n_score_bins, g_max)
+			alone = nb == 1 or not in_g3
+			if not in_g3:
+				_integer_histogram_int16(T, _gamma[pid], g1, _f[pid], 
+					_medians[pid], rr_counts, Q_offsets[i], nq, i_min, 
+					bin_scale, off_s, q_slot, G_cache, _H_keys[pid], 
+					_H_filled[pid], _H_int[pid], _H_f[pid], w)
 			else:
 				# With an int8 _G, `_Gs` holds each query's packed gamma_int
 				# until `_interleave` copies the batch into _G, and `direct`
@@ -2426,10 +2479,11 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 				A_csum.reshape(A_csum.size))
 
 			# A single query, or one the batch cannot hold, runs alone
-			# from a packed copy of its gamma_int (already in g1 when alone).
+			# from a packed copy of its gamma_int (already in g1 when it did
+			# not fit the batch buffer).
 			act[b] = not alone and n_needed <= n_len and fits
 			if not act[b]:
-				if not alone:
+				if in_g3:
 					if _Gs is not None:
 						Gb = _Gs[pid, b, :nt*nq].reshape((nt, nq))
 						for ri in range(nt):
