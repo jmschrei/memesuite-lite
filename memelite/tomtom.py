@@ -305,32 +305,57 @@ def _distances_block4(X, Y, Y_norm, X_norm, c0, c1, c2, c3, r0, r1, r2, r3,
 
 
 @njit(cache=True)
-def _distances_block2(X, Y, Y_norm, X_norm, c0, c1, r0, r1):
-	"""`_distances_block4` for two query columns, used for a leftover pair."""
+def _distances_block2(X, Y, Y_norm, X_norm, c0, c1, r0, r1, L):
+	"""`_distances_block4` for two query columns, used for the columns left
+	over: returns (min0, max0, min1, max1), with each row's running max and
+	min kept in lanes of `L` in the loop that writes it, as there. A single
+	column passes c1 = c0 and a spare row as r1."""
 
 	n_a, n_y = Y.shape[0], Y.shape[-1]
+	lo, hi = 9999999.9, -9999999.9
 	if n_a != 4:
-		return
+		return lo, hi, lo, hi
 
 	a0, a1, a2, a3 = 2 * X[0, c0], 2 * X[1, c0], 2 * X[2, c0], 2 * X[3, c0]
 	b0, b1, b2, b3 = 2 * X[0, c1], 2 * X[1, c1], 2 * X[2, c1], 2 * X[3, c1]
 	xa, xb = X_norm[c0], X_norm[c1]
-	for j in range(n_y):
+
+	M0, N0, M1, N1 = L[0], L[1], L[2], L[3]
+	for t in range(64):
+		M0[t], M1[t] = hi, hi
+		N0[t], N1[t] = lo, lo
+
+	nb = n_y - n_y % 64
+	for j0 in range(0, nb, 64):
+		for t in range(64):
+			j = j0 + t
+			y0, y1, y2, y3, yn = Y[0, j], Y[1, j], Y[2, j], Y[3, j], Y_norm[j]
+
+			g = _distance4(xa, a0, a1, a2, a3, yn, y0, y1, y2, y3)
+			r0[j] = g
+			M0[t] = g if g > M0[t] else M0[t]
+			N0[t] = g if g < N0[t] else N0[t]
+
+			g = _distance4(xb, b0, b1, b2, b3, yn, y0, y1, y2, y3)
+			r1[j] = g
+			M1[t] = g if g > M1[t] else M1[t]
+			N1[t] = g if g < N1[t] else N1[t]
+
+	mn0, mx0, mn1, mx1 = lo, hi, lo, hi
+	for j in range(nb, n_y):
 		y0, y1, y2, y3, yn = Y[0, j], Y[1, j], Y[2, j], Y[3, j], Y_norm[j]
+		g = _distance4(xa, a0, a1, a2, a3, yn, y0, y1, y2, y3)
+		r0[j] = g
+		mn0, mx0 = min(mn0, g), max(mx0, g)
+		g = _distance4(xb, b0, b1, b2, b3, yn, y0, y1, y2, y3)
+		r1[j] = g
+		mn1, mx1 = min(mn1, g), max(mx1, g)
 
-		z = xa + yn
-		z -= a0 * y0
-		z -= a1 * y1
-		z -= a2 * y2
-		z -= a3 * y3
-		r0[j] = -math.sqrt(z) if z > 0 else 0
+	for t in range(64):
+		mx0, mn0 = max(mx0, M0[t]), min(mn0, N0[t])
+		mx1, mn1 = max(mx1, M1[t]), min(mn1, N1[t])
 
-		z = xb + yn
-		z -= b0 * y0
-		z -= b1 * y1
-		z -= b2 * y2
-		z -= b3 * y3
-		r1[j] = -math.sqrt(z) if z > 0 else 0
+	return mn0, mx0, mn1, mx1
 
 
 @njit(cache=True)
@@ -557,14 +582,15 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 	# letters, columns without a cached row are computed four at a time by
 	# `_distances_block4`, so one sweep over the targets serves four query
 	# columns and gives their min and max; each block's rows get their median
-	# right away, while they are still in cache. Of the up to three columns left over, a pair
-	# goes through `_distances_block2` and a single one alone.
+	# right away, while they are still in cache. Of the up to three columns
+	# left over, a pair goes through `_distances_block2`, which also gives
+	# their min and max, and a single one goes through it paired with itself.
 	#
-	# Columns computed one at a time (all uncached ones for an alphabet other
-	# than four letters, and the last leftover for four) are collected in
-	# `rest` and share one call of the inlined `_column_distances`, so its
-	# code is compiled once rather than twice. Each column's results depend
-	# only on that column, so the order they are computed in does not matter.
+	# With an alphabet other than four letters, uncached columns are computed
+	# one at a time: they are collected in `rest` and share one call of the
+	# inlined `_column_distances`, so its code is compiled once rather than
+	# twice. Each column's results depend only on that column, so the order
+	# they are computed in does not matter.
 	smin = numpy.empty(nq, dtype=numpy.float64)
 	smax = numpy.empty(nq, dtype=numpy.float64)
 	todo = numpy.empty(4, dtype=numpy.int64)
@@ -600,17 +626,28 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 			n_rest += 1
 
 	if n_todo >= 2:
-		_distances_block2(X, Y, Y_norm, X_norm, todo[0] + nq_csum, 
-			todo[1] + nq_csum, g[todo[0]], g[todo[1]])
+		i0, i1 = todo[0], todo[1]
+		smin[i0], smax[i0], smin[i1], smax[i1] = _distances_block2(X, Y,
+			Y_norm, X_norm, i0 + nq_csum, i1 + nq_csum, g[i0], g[i1], L)
 		for u in range(2):
 			iu = todo[u]
-			smin[iu], smax[iu], medians[iu] = _column_stats(g[iu], mxb, mnb, 
-				zb, median_bins, Y_counts, halfway)
+			medians[iu] = _binned_median_z(g[iu], median_bins,
+				smin[iu], smax[iu], Y_counts, zb, halfway)
 		todo[0] = todo[2]
 		n_todo -= 2
-	for u in range(n_todo):
-		rest[n_rest] = todo[u]
-		n_rest += 1
+	if n_todo == 1:
+		# A single column runs as a pair with itself, the second row going
+		# to a spare row whose results are discarded.
+		i0 = todo[0]
+		if nq < g.shape[0]:
+			r1 = g[nq]
+		else:
+			r1 = numpy.empty(n_y, dtype=numpy.float64)
+		smin[i0], smax[i0], _mn, _mx = _distances_block2(X, Y, Y_norm, X_norm,
+			i0 + nq_csum, i0 + nq_csum, g[i0], r1, L)
+		medians[i0] = _binned_median_z(g[i0], median_bins, smin[i0],
+			smax[i0], Y_counts, zb, halfway)
+		n_todo = 0
 	for u in range(n_rest):
 		iu = rest[u]
 		c = iu + nq_csum
