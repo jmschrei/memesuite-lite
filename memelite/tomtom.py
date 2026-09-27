@@ -458,11 +458,20 @@ def _binned_block2(r0, r1, m0, m1, bin_scale, offset, w,
 		f1[uint64(x1)] += wj
 
 
+@njit(cache=True, inline='always')
+def _fits_gamma(offset, n_bins, g_max):
+	"""Whether x - offset lies in [-g_max-1, g_max] for every x in
+	[0, n_bins]. `offset` is the signed value (int64 of the returned uint64)."""
+
+	return int64(offset) <= int64(g_max) + 1 and \
+		int64(n_bins) - int64(offset) <= int64(g_max)
+
+
 @njit(cache=True)
 def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians, 
 	median_bins, X_norm, Y_norm, Y_counts, nq_csum, nq, n_bins, q_slot=None,
 	G_cache=None, S_cache=None, H_keys=None, H_filled=None, H_int=None,
-	H_f=None, w_pre=None, halfway_pre=None):
+	H_f=None, w_pre=None, halfway_pre=None, g_max=-1):
 	"""An internal function for integerized scores and the histogram.
 
 	This function is the main workhorse for the TOMTOM algorithm. It contains
@@ -493,6 +502,13 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	Y_counts / sum(Y_counts) and `_halfway(Y_counts)`, computed once by the
 	caller with the same expressions used here; they depend only on the
 	targets, so every query reads the same values.
+
+	`g_max` >= 0 says `gamma_int` holds only [-g_max-1, g_max] (127 for
+	int8). Every stored value is x - offset with x in [0, n_bins] (x also
+	indexes `f`, which has n_bins + 1 columns), so they all fit when
+	`_fits_gamma(offset, n_bins, g_max)`. When they do not, the function
+	returns the offset right after computing it, writing neither `gamma_int`
+	nor `f`, and the caller reruns it into a wider `gamma_int`.
 	"""
 	
 	# `gamma` is private scratch, so its buffer is used as (n_rows, n_y): each
@@ -574,6 +590,8 @@ def _integer_distances_and_histogram(X, Y, gamma, gamma_int, f, medians,
 	i_min = int(math.floor(z_min)) #offset
 	bin_scale = int(math.floor(n_bins / (z_max - i_min))) #scale
 	offset = -i_min * bin_scale
+	if g_max >= 0 and not _fits_gamma(offset, n_bins, g_max):
+		return uint64(offset)
 
 	for i in range(nq):
 		medians[i] = medians[i] + i_min
@@ -1807,7 +1825,50 @@ def _p_values_sums(gamma, B_cdfs, rr_inv, T_lens, iq, nq, offset, results,
 
 
 @njit(cache=True)
-def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, NB):
+def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, nb,
+	s_proto):
+	"""Allocates the running sums and calls `_p_values_batch_sums` with
+	NB = nb in {2, 4, 8, 16} as a literal.
+
+	The sums, the fill and the tracked maxima take the dtype of `s_proto`:
+	int16 for an int8 `G`, int32 for an int16 `G`. `_tomtom` puts a query in
+	the batch only when its partial sums fit that dtype (`_sums_fit`).
+	Inactive queries get a fill of 0, since their lanes are never read.
+	"""
+
+	n_fill = (uint64(T_lens.max()) + uint64(nq) - 1) * uint64(nb)
+	t_sums = numpy.empty(n_fill + 16, dtype=s_proto.dtype)
+	fill = numpy.empty(n_fill, dtype=s_proto.dtype)
+	mv = numpy.empty(16, dtype=s_proto.dtype)
+	m_init = -(int64(1) << int64(8 * s_proto.itemsize - 1))
+	if nb == 2:
+		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
+			results, t_sums, fill, mv, m_init, 2)
+	elif nb == 4:
+		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
+			results, t_sums, fill, mv, m_init, 4)
+	elif nb == 8:
+		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
+			results, t_sums, fill, mv, m_init, 8)
+	else:
+		_p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active,
+			results, t_sums, fill, mv, m_init, 16)
+
+
+@njit(cache=True, inline='always')
+def _sums_fit(nq, offset, g_max, s_max):
+	"""Whether a query's partial sums fit in [-s_max-1, s_max]: they start
+	at nq * offset and receive at most nq values of `gamma_int`, each in
+	[-g_max-1, g_max], whatever its contents."""
+
+	lo = int64(nq) * (int64(offset) - int64(g_max) - 1)
+	hi = int64(nq) * (int64(offset) + int64(g_max))
+	return lo >= -int64(s_max) - 1 and hi <= int64(s_max)
+
+
+@njit(cache=True)
+def _p_values_batch_sums(G, Bs, rr_inv, T_lens, nq, offsets, active, results,
+	t_sums, fill, mv, m_init, NB):
 	"""`_p_values` for NB queries of the same width nq, in one target loop.
 
 	NB is a literal. Row r of `G` holds the NB queries' `gamma_int` rows
@@ -1817,7 +1878,7 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, NB):
 	nq*NB values into t_sums[k*NB : (k+nq)*NB], so the gather through
 	`rr_inv` and the loop setup are paid once for NB queries. Each query's
 	sums receive the same integer terms as in `_p_values_sums`, and every
-	query in the batch must satisfy its int32 bound.
+	active query's sums must fit the dtype of `t_sums` (`_sums_fit`).
 
 	Each query's maximum M and the first and last positions holding it are
 	tracked over the target's positions once its rows are added: the same M,
@@ -1829,24 +1890,28 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, NB):
 	Bs[b] and the outputs are the per-query ones, in the same order.
 	Queries with active[b] False are accumulated but not scanned, and their
 	`results[b]` is left alone. There is no target skipping (iq is -1).
+
+	`t_sums` (n_fill + 16 entries), `fill` (n_fill) and `mv` (16) share one
+	integer dtype, chosen by `_tomtom`; `m_init` is its minimum.
 	"""
 
 	numba.literally(NB)
 	nb = uint64(NB)
 	w = uint64(nq) * nb
-	n_fill = (uint64(T_lens.max()) + uint64(nq) - 1) * nb
+	n_fill = uint64(len(fill))
 
-	# Allocated here, not as per-thread rows of a shared array: mv, fv and
-	# lv are written at every position, and neighbouring threads' rows
-	# sharing a cache line made 8 threads up to 25x slower.
-	t_sums = numpy.empty(n_fill + 16, dtype=numpy.int32)
-	fill = numpy.empty(n_fill, dtype=numpy.int32)
-	mv = numpy.empty(16, dtype=numpy.int32)
+	# Allocated here and in `_p_values_batch`, not as per-thread rows of a
+	# shared array: mv, fv and lv are written at every position, and
+	# neighbouring threads' rows sharing a cache line made 8 threads up to
+	# 25x slower.
 	fv = numpy.empty(16, dtype=numpy.int32)
 	lv = numpy.empty(16, dtype=numpy.int32)
 	for p in range(n_fill // nb):
 		for b in range(NB):
-			fill[uint64(p)*nb + uint64(b)] = nq * offsets[b]
+			if active[b]:
+				fill[uint64(p)*nb + uint64(b)] = nq * offsets[b]
+			else:
+				fill[uint64(p)*nb + uint64(b)] = 0
 
 	total_offset = uint64(0)
 	for i, nt in enumerate(T_lens):
@@ -1858,7 +1923,7 @@ def _p_values_batch(G, Bs, rr_inv, T_lens, nq, offsets, active, results, NB):
 			t_sums[k] = fill[k]
 
 		for b in range(16):
-			mv[b] = numpy.int32(-2147483648)
+			mv[b] = m_init
 			fv[b] = 0
 			lv[b] = 0
 
@@ -1994,13 +2059,18 @@ def _merge_rc_results_into(results, out):
 @njit(parallel=True, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
 	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement,
-	q_slot, q_cached, results, _A, _A_csum, _B, _G, G_cache):
+	q_slot, q_cached, results, _A, _A_csum, _B, _G, G_cache, g_max, s_proto):
 	"""An internal function implementing the TOMTOM algorithm.
 
 	This internal function is necessary to handle the numba component of the
 	implementation. Here, scratchboard memory is allocated for each thread and
 	the main parallel loop is called. Additionally, if reverse complements are
 	being considered, values are merged across both strands.
+
+	`_G`'s dtype and the empty array `s_proto`'s are the batched
+	`gamma_int`'s and its sums': int8 and int16 with `g_max` 127, or int16
+	and int32 with `g_max` -1 (see `tomtom`). Passing the dtypes in compiles
+	only the batched kernels that the call uses.
 	"""
 
 	T_max = max(T_lens)
@@ -2031,6 +2101,11 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 	# `_p_values_batch`), and each keeps its own backgrounds and results.
 	# A batch is 2, 4, 8 or 16 queries, and `_p_values_batch` is compiled
 	# for each. 16 was faster than 8 or 32 (iteration 74).
+	#
+	# _G is int8 when g_max is 127: every value x - offset (x in
+	# [0, n_score_bins]) then fits once `_fits_gamma` holds, and the batch's
+	# sums can be int16 (see `_p_values_batch`). A query whose offset does
+	# not fit is rerun into its int16 `_gamma_int` and runs alone.
 	n_batch = 16
 	_f = numpy.empty((n_threads, Q_max, n_score_bins+1), dtype='float64')
 
@@ -2117,23 +2192,34 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 
 		for b in range(nb):
 			i = qb[b]
-			if nb > 1:
-				gamma_int = G3[:, :, b]
-			else:
-				gamma_int = _gamma_int[pid, :nt*nq].reshape((nt, nq))
-
-			offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
-				gamma_int, _f[pid], _medians[pid], _median_bins[pid], 
-				Q_norm, T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, 
-				q_slot, G_cache, S_cache, _H_keys[pid], _H_filled[pid], 
-				_H_int[pid], _H_f[pid], w, halfway)
+			g1 = _gamma_int[pid, :nt*nq].reshape((nt, nq))
+			alone = nb == 1
+			if not alone:
+				offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
+					G3[:, :, b], _f[pid], _medians[pid], _median_bins[pid], 
+					Q_norm, T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, 
+					q_slot, G_cache, S_cache, _H_keys[pid], _H_filled[pid], 
+					_H_int[pid], _H_f[pid], w, halfway, g_max)
+				if g_max >= 0 and not _fits_gamma(offset, n_score_bins, g_max):
+					alone = True
+			if alone:
+				offset = _integer_distances_and_histogram(Q, T, _gamma[pid], 
+					g1, _f[pid], _medians[pid], _median_bins[pid], 
+					Q_norm, T_norm, rr_counts, Q_offsets[i], nq, n_score_bins, 
+					q_slot, G_cache, S_cache, _H_keys[pid], _H_filled[pid], 
+					_H_int[pid], _H_f[pid], w, halfway)
 			offs[b] = offset
 
 			# The backgrounds span nq*(n_score_bins+offset) bins. When the
 			# offset exceeds `n_cache` this can overrun the shared
 			# workspace, so allocate a large enough one for this query.
 			n_needed = nq*n_score_bins + nq*offset
-			fits32 = int64(nq) * (int64(offset) + 32768) <= 2147483647
+			# A batched query's sums must fit the batch's dtype: int32 as
+			# before for an int16 gamma_int, int16 for an int8 one.
+			if g_max >= 0:
+				fits = _sums_fit(nq, offset, g_max, 32767)
+			else:
+				fits = int64(nq) * (int64(offset) + 32768) <= 2147483647
 			if n_needed > n_len:
 				A = numpy.empty((nq, nq, n_needed), dtype='float64')
 				B = numpy.empty((T_max+1, n_needed), dtype='float64')
@@ -2149,29 +2235,18 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 				T_max, offset, needed, A_csum.reshape(A_csum.size))
 
 			# A single query, or one the batch cannot hold, runs alone
-			# from a packed copy of its gamma_int.
-			act[b] = nb > 1 and n_needed <= n_len and fits32
+			# from a packed copy of its gamma_int (already in g1 when alone).
+			act[b] = not alone and n_needed <= n_len and fits
 			if not act[b]:
-				g1 = _gamma_int[pid, :nt*nq].reshape((nt, nq))
-				if nb > 1:
-					g1[:] = gamma_int
+				if not alone:
+					g1[:] = G3[:, :, b]
 				_p_values(g1, B, rr_inv, T_lens, -1, nq, offset, 
 					_results[pid, b], reverse_complement)
 
 		if nb > 1:
 			G2 = _G[pid, :nt*nq*nb].reshape((nt, nq*nb))
-			if nb == 2:
-				_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-					_results[pid], 2)
-			elif nb == 4:
-				_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-					_results[pid], 4)
-			elif nb == 8:
-				_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-					_results[pid], 8)
-			else:
-				_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
-					_results[pid], 16)
+			_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
+				_results[pid], nb, s_proto)
 
 		for b in range(nb):
 			i = qb[b]
@@ -2373,6 +2448,13 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	q_slot = unique_slot[q_inv]
 	q_cached = q_first[shared].astype('int64')
 
+	# With n_score_bins <= 127 the batched `gamma_int` is int8 and its sums
+	# int16: each value is x - offset with x in [0, n_score_bins], and the
+	# offset is in [0, n_score_bins] (`_fits_gamma` checks it per query).
+	# Otherwise int16 and int32, as before.
+	narrow = n_score_bins <= 127
+	s_proto = numpy.empty(0, dtype='int16' if narrow else 'int32')
+
 	# The large per-call arrays are allocated here rather than in `_tomtom`.
 	# numpy asks the kernel for transparent huge pages on allocations of
 	# 4 MB or more (madvise), numba's allocator does not, so the first touch
@@ -2387,7 +2469,7 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	_A = numpy.empty((n_jobs, Q_max*Q_max*n_len), dtype='float64')
 	_A_csum = numpy.empty((n_jobs, Q_max*Q_max*n_len), dtype='float64')
 	_B = numpy.empty((n_jobs, 16, T_len_max+1, n_len), dtype='float64')
-	_G = numpy.empty((n_jobs, nt*Q_max*16), dtype='int16')
+	_G = numpy.empty((n_jobs, nt*Q_max*16), dtype='int8' if narrow else 'int16')
 	G_cache = numpy.empty((len(q_cached), nt), dtype='float64')
 
 	# With several threads, `_tomtom`'s parallel loop hands out one batch
@@ -2398,7 +2480,7 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv,
 			rr_counts, n_nearest, n_score_bins, n_median_bins, n_cache,
 			n_jobs, int(reverse_complement), q_slot, q_cached, results,
-			_A, _A_csum, _B, _G, G_cache)
+			_A, _A_csum, _B, _G, G_cache, 127 if narrow else -1, s_proto)
 	finally:
 		numba.set_parallel_chunksize(_chunk)
 
