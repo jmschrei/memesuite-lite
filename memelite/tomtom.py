@@ -514,8 +514,8 @@ def _binned_column(row, mi, bin_scale, offset, w, zb, gamma_int, k, f_row):
 
 	for j in range(n_y):
 		x = zb[j]
-		gamma_int[j, k] = x - offset
 		f_row[uint64(x)] += w[j]
+		gamma_int[j, k] = x - offset
 
 
 @njit(cache=True)
@@ -528,6 +528,12 @@ def _binned_block4(r0, r1, r2, r3, m0, m1, m2, m3, bin_scale, offset, w,
 	the four columns per target: their `gamma_int[j, k]` stores share one
 	row, and each `f` row receives its additions in ascending j, as before,
 	so every sum is bitwise the same.
+
+	Each column is finished (scatter, then store) before the next is
+	loaded. With the four loads, four stores and four scatters grouped
+	instead, LLVM kept all four bin indices live and reloaded pointers from
+	the stack 9 times per target; this order holds one index at a time.
+	`_binned_block4c` is the faster form for consecutive columns.
 	"""
 
 	n_y = len(w)
@@ -542,16 +548,58 @@ def _binned_block4(r0, r1, r2, r3, m0, m1, m2, m3, bin_scale, offset, w,
 		z3[j] = math.floor((r3[j] - m3) * bin_scale + 0.5)
 
 	for j in range(n_y):
-		x0, x1, x2, x3 = z0[j], z1[j], z2[j], z3[j]
-		gamma_int[j, k0] = x0 - offset
-		gamma_int[j, k1] = x1 - offset
-		gamma_int[j, k2] = x2 - offset
-		gamma_int[j, k3] = x3 - offset
 		wj = w[j]
-		f0[uint64(x0)] += wj
-		f1[uint64(x1)] += wj
-		f2[uint64(x2)] += wj
-		f3[uint64(x3)] += wj
+		x = z0[j]
+		f0[uint64(x)] += wj
+		gamma_int[j, k0] = x - offset
+		x = z1[j]
+		f1[uint64(x)] += wj
+		gamma_int[j, k1] = x - offset
+		x = z2[j]
+		f2[uint64(x)] += wj
+		gamma_int[j, k2] = x - offset
+		x = z3[j]
+		f3[uint64(x)] += wj
+		gamma_int[j, k3] = x - offset
+
+
+@njit(cache=True)
+def _binned_block4c(r0, r1, r2, r3, m0, m1, m2, m3, bin_scale, offset, w,
+	zb4, gamma_int, kb, f0, f1, f2, f3):
+	"""`_binned_block4` for four consecutive query columns, whose `gamma_int`
+	columns are kb + 3, kb + 2, kb + 1 and kb. One unsigned base column lets
+	the four stores share one row pointer at constant displacements, where
+	four independent k need four offsets and spill. The caller must decide
+	consecutiveness: an equality test on k0..k3 inside one kernel lets LLVM
+	rewrite kb + 3 back into k0 and the four offsets return."""
+
+	n_y = len(w)
+	z0, z1, z2, z3 = zb4[0], zb4[1], zb4[2], zb4[3]
+	for j in range(n_y):
+		z0[j] = math.floor((r0[j] - m0) * bin_scale + 0.5)
+	for j in range(n_y):
+		z1[j] = math.floor((r1[j] - m1) * bin_scale + 0.5)
+	for j in range(n_y):
+		z2[j] = math.floor((r2[j] - m2) * bin_scale + 0.5)
+	for j in range(n_y):
+		z3[j] = math.floor((r3[j] - m3) * bin_scale + 0.5)
+
+	k0, k1, k2, k3 = kb + uint64(3), kb + uint64(2), kb + uint64(1), kb
+
+	for j in range(n_y):
+		wj = w[j]
+		x = z0[j]
+		f0[uint64(x)] += wj
+		gamma_int[j, k0] = x - offset
+		x = z1[j]
+		f1[uint64(x)] += wj
+		gamma_int[j, k1] = x - offset
+		x = z2[j]
+		f2[uint64(x)] += wj
+		gamma_int[j, k2] = x - offset
+		x = z3[j]
+		f3[uint64(x)] += wj
+		gamma_int[j, k3] = x - offset
 
 
 @njit(cache=True)
@@ -566,12 +614,13 @@ def _binned_block2(r0, r1, m0, m1, bin_scale, offset, w,
 	for j in range(n_y):
 		z1[j] = math.floor((r1[j] - m1) * bin_scale + 0.5)
 	for j in range(n_y):
-		x0, x1 = z0[j], z1[j]
-		gamma_int[j, k0] = x0 - offset
-		gamma_int[j, k1] = x1 - offset
 		wj = w[j]
-		f0[uint64(x0)] += wj
-		f1[uint64(x1)] += wj
+		x = z0[j]
+		f0[uint64(x)] += wj
+		gamma_int[j, k0] = x - offset
+		x = z1[j]
+		f1[uint64(x)] += wj
+		gamma_int[j, k1] = x - offset
 
 
 @njit(cache=True, inline='always')
@@ -809,8 +858,8 @@ def _integer_histogram(Y, gamma, gamma_int, f, medians, Y_counts, nq_csum, nq,
 	# [0, n_bins], because f has n_bins + 1 columns, so int32 holds it exactly.
 	#
 	# Columns without a cached row, for a 4-letter alphabet, are binned four
-	# at a time by `_binned_block4`; consecutive ones
-	# have consecutive k, so their four stores land in one gamma_int row.
+	# at a time; consecutive ones have consecutive k, so their four stores
+	# land in one gamma_int row, and go through `_binned_block4c`.
 	# Of up to three left over, a pair goes through `_binned_block2` and a
 	# single one through `_binned_column`.
 	zb = numpy.empty(n_y, dtype=numpy.int32)
@@ -831,10 +880,16 @@ def _integer_histogram(Y, gamma, gamma_int, f, medians, Y_counts, nq_csum, nq,
 			n_todo += 1
 			if n_todo == 4:
 				i0, i1, i2, i3 = todo[0], todo[1], todo[2], todo[3]
-				_binned_block4(g[i0], g[i1], g[i2], g[i3], medians[i0],
-					medians[i1], medians[i2], medians[i3], bin_scale, offset,
-					w, zb4, gamma_int, nq - i0 - 1, nq - i1 - 1, nq - i2 - 1,
-					nq - i3 - 1, f[i0], f[i1], f[i2], f[i3])
+				if i1 == i0 + 1 and i2 == i0 + 2 and i3 == i0 + 3:
+					_binned_block4c(g[i0], g[i1], g[i2], g[i3], medians[i0],
+						medians[i1], medians[i2], medians[i3], bin_scale,
+						offset, w, zb4, gamma_int, uint64(nq - i3 - 1), f[i0],
+						f[i1], f[i2], f[i3])
+				else:
+					_binned_block4(g[i0], g[i1], g[i2], g[i3], medians[i0],
+						medians[i1], medians[i2], medians[i3], bin_scale,
+						offset, w, zb4, gamma_int, nq - i0 - 1, nq - i1 - 1,
+						nq - i2 - 1, nq - i3 - 1, f[i0], f[i1], f[i2], f[i3])
 				n_todo = 0
 			continue
 
