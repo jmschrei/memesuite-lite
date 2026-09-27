@@ -304,8 +304,18 @@ _N_LANE = 16
 # 0.78 cycles per window against 1.63 for the two float64 lookups. A float64
 # table of 4**7 or 4**8 entries does not fit L1, and its lookup cost about as
 # much as the two lookups it replaced.
+#
+# The wide test passes more windows than the two lookups, and each window
+# that passes costs a block of windows sent through the two-lookup test. So
+# each motif-strand gets the wide test only when the fraction of windows
+# expected to pass it, under a uniform background (`_wide_choice`), is below
+# `_WIDE_RATE`: the wide test's saving per window divided by the cost of a
+# window that passes it. Both measured on the benchmark's kernel (AMD Zen 5,
+# 8 threads): 0.205 ns of thread time per window, and 12.3-12.6 ns per window
+# that passes, for the strands expected to pass 0.5% to 4% of windows.
 _WIDE_K = 7
 _WIDE_CODES = 4 ** _WIDE_K
+_WIDE_RATE = 0.016
 
 
 def _score_bounds(pwm, pwm_lengths, thresholds):
@@ -503,6 +513,77 @@ def _wide_layout(col_max, gap, pwm_lengths):
 	padded[inside] = 0.0
 	w_rest = padded.sum(axis=1)
 	return w_off.astype(numpy.uint64), w_rest.astype(numpy.float64)
+
+
+@numba.njit(cache=True)
+def _wide_choice(pwm, pwm_lengths, w_off, w_rest, cuts, tops, max_rate):
+	"""Whether each motif-strand of a four-letter alphabet is first tested on
+	its wide block (`_wide_layout`) or on the two lookups of `_block_layout`.
+
+	A strand gets the wide test when the fraction of windows expected to pass
+	it is below `max_rate`. The fraction is the share of the 4**`_WIDE_K`
+	letter combinations of the wide block, each equally likely (the
+	background the p-values are computed against), whose float entry of
+	`_wide_table`, lo4[first four letters] + hi3[last three], plus `w_rest`
+	exceeds the cut, compared as lo4 > (cut - w_rest) - hi3. The entries are
+	summed in `_wide_table`'s order, and digits at or past the block's width
+	add +0.0. The count runs over hi3, skips an entry that no lo4 entry can
+	bring above the cut, and stops once it reaches `max_rate`. Both tests are
+	exact, so this only decides which one runs. A strand that is never
+	scanned (`tops[k]` not above `cuts[k]`) is not counted.
+	"""
+
+	n_motifs = len(pwm_lengths) - 1
+	w_on = numpy.zeros(n_motifs, dtype=numpy.bool_)
+	p = numpy.empty((_WIDE_K, 4), dtype=numpy.float64)
+	s01 = numpy.empty(16, dtype=numpy.float64)
+	lo4 = numpy.empty(256, dtype=numpy.float64)
+	hi3 = numpy.empty(64, dtype=numpy.float64)
+	limit = max_rate * _WIDE_CODES
+	for k in range(n_motifs):
+		if not tops[k] > cuts[k]:
+			continue
+
+		off = numpy.int64(pwm_lengths[k]) + numpy.int64(w_off[k])
+		kw = min(numpy.int64(pwm_lengths[k + 1]) - numpy.int64(pwm_lengths[k]),
+			_WIDE_K)
+		for d in range(_WIDE_K):
+			for s in range(4):
+				p[d, s] = numpy.float64(pwm[s, off + d]) if d < kw else 0.0
+
+		# The largest lo4 entry, as a sum of each digit's largest weight in
+		# the same order: rounding is monotone.
+		lmax = 0.0
+		for d in range(4):
+			m = max(max(p[d, 0], p[d, 1]), max(p[d, 2], p[d, 3]))
+			lmax = m if d == 0 else lmax + m
+
+		for i in range(16):
+			s01[i] = p[0, i & 3] + p[1, i >> 2]
+		for c in range(16):
+			a2 = p[2, c & 3]
+			a3 = p[3, c >> 2]
+			for i in range(16):
+				lo4[c * 16 + i] = (s01[i] + a2) + a3
+		for i in range(16):
+			s01[i] = p[4, i & 3] + p[5, i >> 2]
+		for c in range(4):
+			a6 = p[6, c]
+			for i in range(16):
+				hi3[c * 16 + i] = s01[i] + a6
+
+		need = cuts[k] - w_rest[k]
+		count = 0
+		for h in range(64):
+			t = need - hi3[h]
+			if t < lmax:
+				for c in range(256):
+					count += lo4[c] > t
+			if count >= limit:
+				break
+		w_on[k] = count < limit
+
+	return w_on
 
 
 @numba.njit(cache=True)
@@ -1256,13 +1337,16 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	_blk_off, _blk_w, _blk_rest, _blk_start = _block_layout(_col_max, _gap,
 		motif_lengths, q)
 
-	# The wide first test needs a four-letter alphabet, whose N is row 4.
+	# The wide first test needs a four-letter alphabet, whose N is row 4, and
+	# is used for the motif-strands expected to pass few windows.
 	wide = n_alpha == 4
 	_w_off, _w_rest = _wide_layout(_col_max, _gap, motif_lengths)
-	_w_on = numpy.full(n_motifs, wide, dtype=numpy.bool_)
 	if wide:
+		_w_on = _wide_choice(pwms_n, motif_lengths, _w_off, _w_rest, _cuts,
+			_tops, _WIDE_RATE)
 		_wcodes = _wide_codes(X)
 	else:
+		_w_on = numpy.zeros(n_motifs, dtype=numpy.bool_)
 		_wcodes = numpy.full(1, _WIDE_CODES, dtype=numpy.uint16)
 
 	# The motif-strands differ in cost, and some are skipped outright, so the
