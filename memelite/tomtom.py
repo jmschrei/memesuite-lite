@@ -2212,6 +2212,113 @@ def _merge_rc_results_into(results, out):
 			out[i, 4] = 0
 
 
+@njit(cache=True, inline='always')
+def _transpose8(r0, r1, r2, r3, r4, r5, r6, r7):
+	"""Transpose the 8x8 byte matrix whose row b is word r_b (byte p at
+	bits 8p): word p of the result holds byte p of every r_b, r_b's at bits
+	8b. Three rounds of masked swaps."""
+
+	m32 = uint64(0x00000000FFFFFFFF)
+	t = ((r0 >> uint64(32)) ^ r4) & m32
+	r0 ^= t << uint64(32)
+	r4 ^= t
+	t = ((r1 >> uint64(32)) ^ r5) & m32
+	r1 ^= t << uint64(32)
+	r5 ^= t
+	t = ((r2 >> uint64(32)) ^ r6) & m32
+	r2 ^= t << uint64(32)
+	r6 ^= t
+	t = ((r3 >> uint64(32)) ^ r7) & m32
+	r3 ^= t << uint64(32)
+	r7 ^= t
+
+	m16 = uint64(0x0000FFFF0000FFFF)
+	t = ((r0 >> uint64(16)) ^ r2) & m16
+	r0 ^= t << uint64(16)
+	r2 ^= t
+	t = ((r1 >> uint64(16)) ^ r3) & m16
+	r1 ^= t << uint64(16)
+	r3 ^= t
+	t = ((r4 >> uint64(16)) ^ r6) & m16
+	r4 ^= t << uint64(16)
+	r6 ^= t
+	t = ((r5 >> uint64(16)) ^ r7) & m16
+	r5 ^= t << uint64(16)
+	r7 ^= t
+
+	m8 = uint64(0x00FF00FF00FF00FF)
+	t = ((r0 >> uint64(8)) ^ r1) & m8
+	r0 ^= t << uint64(8)
+	r1 ^= t
+	t = ((r2 >> uint64(8)) ^ r3) & m8
+	r2 ^= t << uint64(8)
+	r3 ^= t
+	t = ((r4 >> uint64(8)) ^ r5) & m8
+	r4 ^= t << uint64(8)
+	r5 ^= t
+	t = ((r6 >> uint64(8)) ^ r7) & m8
+	r6 ^= t << uint64(8)
+	r7 ^= t
+	return r0, r1, r2, r3, r4, r5, r6, r7
+
+
+@njit(cache=True)
+def _interleave(Gs, G, n, nb):
+	"""Write the nb packed matrices Gs[b, :n] into a batch's interleaved
+	matrix, G[p*nb + b] = Gs[b, p] (see `_p_values_batch`).
+
+	`_integer_distances_and_histogram` writes a query's `gamma_int` a few
+	columns per sweep over the targets. Into its lane of G directly, every
+	sweep touches every cache line of the batch's n*nb matrix, several MB;
+	into its own packed row of Gs the writes stay in L2. For one-byte
+	values and nb of 8 or 16 the copy moves eight positions of eight lanes
+	as eight 64-bit words through a byte transpose, with a scalar loop for
+	the rest. Gs's rows must start on 8-byte boundaries, and the words are
+	little-endian. Copied byte by byte, the copy cost as much as the L2
+	saved (iteration 109). The values are copied, not changed.
+	"""
+
+	p0 = uint64(0)
+	if G.itemsize == 1 and nb == 16:
+		n8 = uint64(n) // uint64(8)
+		G64 = G.view(numpy.uint64)
+		S = Gs[:16].view(numpy.uint64)
+		for q in range(n8):
+			q = uint64(q)
+			o = q * uint64(16)
+			c0, c1, c2, c3, c4, c5, c6, c7 = _transpose8(S[0, q], S[1, q],
+				S[2, q], S[3, q], S[4, q], S[5, q], S[6, q], S[7, q])
+			d0, d1, d2, d3, d4, d5, d6, d7 = _transpose8(S[8, q], S[9, q],
+				S[10, q], S[11, q], S[12, q], S[13, q], S[14, q], S[15, q])
+			G64[o], G64[o+uint64(1)] = c0, d0
+			G64[o+uint64(2)], G64[o+uint64(3)] = c1, d1
+			G64[o+uint64(4)], G64[o+uint64(5)] = c2, d2
+			G64[o+uint64(6)], G64[o+uint64(7)] = c3, d3
+			G64[o+uint64(8)], G64[o+uint64(9)] = c4, d4
+			G64[o+uint64(10)], G64[o+uint64(11)] = c5, d5
+			G64[o+uint64(12)], G64[o+uint64(13)] = c6, d6
+			G64[o+uint64(14)], G64[o+uint64(15)] = c7, d7
+		p0 = n8 * uint64(8)
+	elif G.itemsize == 1 and nb == 8:
+		n8 = uint64(n) // uint64(8)
+		G64 = G.view(numpy.uint64)
+		S = Gs[:8].view(numpy.uint64)
+		for q in range(n8):
+			q = uint64(q)
+			o = q * uint64(8)
+			c0, c1, c2, c3, c4, c5, c6, c7 = _transpose8(S[0, q], S[1, q],
+				S[2, q], S[3, q], S[4, q], S[5, q], S[6, q], S[7, q])
+			G64[o], G64[o+uint64(1)], G64[o+uint64(2)] = c0, c1, c2
+			G64[o+uint64(3)], G64[o+uint64(4)], G64[o+uint64(5)] = c3, c4, c5
+			G64[o+uint64(6)], G64[o+uint64(7)] = c6, c7
+		p0 = n8 * uint64(8)
+
+	for p in range(p0, uint64(n)):
+		p = uint64(p)
+		for b in range(nb):
+			G[p*uint64(nb) + uint64(b)] = Gs[b, p]
+
+
 # Only the explicit prange loop is parallelized. With parallel=True numba
 # also turns the whole-array numpy calls outside it (zeros, cumsum, sum) into
 # parallel loops, each compiled and linked separately, for arrays of a few
@@ -2226,8 +2333,8 @@ _PRANGE_ONLY = ParallelOptions({'comprehension': False, 'reduction': False,
 @njit(parallel=_PRANGE_ONLY, cache=True)
 def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest, 
 	n_score_bins, n_median_bins, n_cache, n_threads, reverse_complement,
-	q_slot, q_cached, results, _A, _A_csum, _B, _G, G_cache, g_max, s_proto,
-	order):
+	q_slot, q_cached, results, _A, _A_csum, _B, _G, _Gs, direct, G_cache, 
+	g_max, s_proto, order):
 	"""An internal function implementing the TOMTOM algorithm.
 
 	This internal function is necessary to handle the numba component of the
@@ -2380,10 +2487,23 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 					q_slot, G_cache, _H_keys[pid], _H_filled[pid], _H_int[pid],
 					_H_f[pid], w)
 			else:
-				_integer_histogram(T, _gamma[pid], G3[:, :, b], _f[pid], 
-					_medians[pid], rr_counts, Q_offsets[i], nq, i_min, 
-					bin_scale, off_s, q_slot, G_cache, _H_keys[pid], 
-					_H_filled[pid], _H_int[pid], _H_f[pid], w)
+				# With an int8 _G, `_Gs` holds each query's packed gamma_int
+				# until `_interleave` copies the batch into _G, and `direct`
+				# is None. Otherwise `_Gs` is None and the query writes its
+				# lane of _G directly. numba prunes a branch on `x is not
+				# None` only when x is None, so each call compiles one of the
+				# two.
+				if _Gs is not None:
+					_integer_histogram(T, _gamma[pid], 
+						_Gs[pid, b, :nt*nq].reshape((nt, nq)), _f[pid], 
+						_medians[pid], rr_counts, Q_offsets[i], nq, i_min, 
+						bin_scale, off_s, q_slot, G_cache, _H_keys[pid], 
+						_H_filled[pid], _H_int[pid], _H_f[pid], w)
+				if direct is not None:
+					_integer_histogram(T, _gamma[pid], G3[:, :, b], _f[pid], 
+						_medians[pid], rr_counts, Q_offsets[i], nq, i_min, 
+						bin_scale, off_s, q_slot, G_cache, _H_keys[pid], 
+						_H_filled[pid], _H_int[pid], _H_f[pid], w)
 			offset = uint64(off_s)
 			offs[b] = offset
 
@@ -2418,14 +2538,22 @@ def _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv, rr_counts, n_nearest,
 			act[b] = not alone and n_needed <= n_len and fits
 			if not act[b]:
 				if not alone:
-					for ri in range(nt):
-						for li in range(nq):
-							g1[ri, li] = G3[ri, li, b]
+					if _Gs is not None:
+						Gb = _Gs[pid, b, :nt*nq].reshape((nt, nq))
+						for ri in range(nt):
+							for li in range(nq):
+								g1[ri, li] = Gb[ri, li]
+					if direct is not None:
+						for ri in range(nt):
+							for li in range(nq):
+								g1[ri, li] = G3[ri, li, b]
 				_p_values(g1, B[:(T_max+1)*b_col[b]].reshape((T_max+1, 
 					b_col[b])), rr_inv, T_lens, -1, nq, offset, 
 					_results[pid, b], reverse_complement, b_lo[b])
 
 		if nb > 1:
+			if _Gs is not None:
+				_interleave(_Gs[pid], _G[pid, :nt*nq*nb], nt*nq, nb)
 			G2 = _G[pid, :nt*nq*nb].reshape((nt, nq*nb))
 			_p_values_batch(G2, _B[pid], rr_inv, T_lens, nq, offs, act,
 				_results[pid], nb, s_proto, b_lo, b_col)
@@ -2657,6 +2785,11 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	_B = numpy.empty((n_jobs, 16, (T_len_max+1)*n_len), dtype='float64')
 	_G = numpy.empty((n_jobs, nt*Q_max*16), dtype='int8' if narrow else 'int16')
 	G_cache = numpy.empty((len(q_cached), nt), dtype='float64')
+	# With an int8 _G, each batched query's packed `gamma_int` before
+	# `_interleave`; rows padded to a multiple of 8 bytes so each starts on
+	# an 8-byte boundary. For int16 staging measured slower (iteration 109).
+	_Gs = numpy.empty((n_jobs, 16, -(-nt*Q_max // 8) * 8), dtype='int8') \
+		if narrow else None
 
 	# With several threads, `_tomtom`'s parallel loop hands out one batch
 	# at a time rather than one contiguous block per thread. Set here, not
@@ -2666,8 +2799,8 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		results = _tomtom(Q, T, Q_lens, T_lens, Q_norm, T_norm, rr_inv,
 			rr_counts, n_nearest, n_score_bins, n_median_bins, n_cache,
 			n_jobs, int(reverse_complement), q_slot, q_cached, results,
-			_A, _A_csum, _B, _G, G_cache, 127 if narrow else -1, s_proto,
-			numpy.argsort(Q_lens, kind='stable'))
+			_A, _A_csum, _B, _G, _Gs, None if narrow else True, G_cache,
+			127 if narrow else -1, s_proto, numpy.argsort(Q_lens, kind='stable'))
 	finally:
 		numba.set_parallel_chunksize(_chunk)
 
