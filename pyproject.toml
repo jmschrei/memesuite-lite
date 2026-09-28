@@ -39,3 +39,8 @@ dev = [
 markers = [
     "cmd: tests that invoke the ttl command-line tool",
 ]
+# Most tests compare against small sets of motifs on purpose; the warning for
+# fewer than 25 targets is checked in its own tests.
+filterwarnings = [
+    "ignore:.*fewer than 25:UserWarning",
+]

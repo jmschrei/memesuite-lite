@@ -4,6 +4,7 @@
 import numba
 import numpy
 import pytest
+import warnings
 
 from memelite.io import read_meme
 from memelite.tomtom import tomtom
@@ -569,3 +570,16 @@ def test_symmetric_tomtom_near_duplicates_positive():
 
 	assert (p > 0).all()
 	assert (p <= 1).all()
+
+
+def test_symmetric_tomtom_few_motifs_warns():
+	# The motifs are their own targets, so the same warning as tomtom's
+	# applies below 25 motifs.
+	pwms = generate_dirichlet_meme([8] * 25, random_state=4)
+
+	with pytest.warns(UserWarning, match="given 24 motifs"):
+		symmetric_tomtom(pwms[:24])
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error")
+		symmetric_tomtom(pwms)

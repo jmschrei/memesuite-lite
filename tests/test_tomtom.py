@@ -4,6 +4,7 @@
 import numba
 import numpy
 import pytest
+import warnings
 import pandas
 
 from memelite.io import read_meme
@@ -1610,3 +1611,18 @@ def test_p_value_backgrounds_right_tail():
 	assert B[1, 0] == 1
 	assert_allclose(B[1, 1:19], 1e-20, rtol=1e-12)
 	assert B[1, 19] == 0
+
+
+@pytest.mark.parametrize("reverse_complement", [True, False])
+def test_tomtom_few_targets_warns(reverse_complement):
+	# The background comes from the targets' columns, so with few targets the
+	# p-values depend on which targets are given. Reverse complements are not
+	# counted.
+	pwms = generate_random_meme(n=25, random_state=3)
+
+	with pytest.warns(UserWarning, match="given 24 target motifs"):
+		tomtom(pwms[:2], pwms[:24], reverse_complement=reverse_complement)
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error")
+		tomtom(pwms[:2], pwms, reverse_complement=reverse_complement)

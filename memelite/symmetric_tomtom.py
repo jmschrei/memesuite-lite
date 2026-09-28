@@ -5,6 +5,7 @@ import time
 import math
 import numpy
 import numba
+import warnings
 
 from numba import njit
 from numba import prange
@@ -17,6 +18,7 @@ from .tomtom import _merge_rc_results
 from .tomtom import _integer_distances_and_histogram
 from .tomtom import _p_values
 from .tomtom import tomtom
+from .tomtom import _MIN_TARGETS
 
  
 @njit(cache=True)
@@ -208,6 +210,11 @@ def symmetric_tomtom(Xs, n_score_bins=100, n_median_bins=1000,
 	which is more robust to edge effects. The "incomplete score" is not a good
 	score and so is not implemented. 
 
+	The background distribution of each motif column is built from its scores
+	against every column of the motifs, so the p-values depend on which motifs
+	are given. With fewer than 25 motifs they can change by orders of
+	magnitude with the choice of motifs, and a warning is raised.
+
 
 	Parameters
 	----------
@@ -290,6 +297,12 @@ def symmetric_tomtom(Xs, n_score_bins=100, n_median_bins=1000,
 		original ordering of the targets corresponding to each returned
 		neighbor. These will be sorted by p-value.
 	"""
+
+	if len(Xs) < _MIN_TARGETS:
+		warnings.warn("symmetric_tomtom was given {} motifs. Its p-values use "
+			"the motif columns as the background, so with fewer than {} motifs "
+			"they depend strongly on which motifs are included.".format(
+			len(Xs), _MIN_TARGETS), stacklevel=2)
 	
 	if n_jobs != -1:
 		_n_jobs = numba.get_num_threads()

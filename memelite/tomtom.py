@@ -5,6 +5,7 @@ import time
 import math
 import numpy
 import numba
+import warnings
 
 from numba import njit
 from numba import prange
@@ -55,6 +56,12 @@ def _binned_median(x, bins, x_min, x_max, counts):
 			return bins[i, 1] / bins[i, 0]
 			
 	return -99999
+
+
+# With fewer target motifs than this, tomtom and symmetric_tomtom warn that
+# their p-values depend strongly on which targets are given (MEME's tomtom
+# warns below 50).
+_MIN_TARGETS = 25
 
 
 # Bit position of a one-bit uint64 v: _DEBRUIJN[(v * 0x03f79d71b4cb0a89) >> 58].
@@ -2774,6 +2781,12 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	which is more robust to edge effects. The "incomplete score" is not a good
 	score and so is not implemented. 
 
+	The background distribution of each query column is built from its scores
+	against every column of the targets, so the p-values depend on which
+	targets are given. With fewer than 25 targets they can change by orders of
+	magnitude with the choice of targets, and a warning is raised; MEME's
+	tomtom warns below 50.
+
 
 	Parameters
 	----------
@@ -2857,6 +2870,13 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		original ordering of the targets corresponding to each returned
 		neighbor. These will be sorted by p-value.
 	"""
+
+	if len(Ts) < _MIN_TARGETS:
+		warnings.warn("tomtom was given {} target motifs. Its p-values use the "
+			"target columns as the background, so with fewer than {} targets "
+			"they depend strongly on which targets are included. Use a larger "
+			"target set, such as a complete motif database, for reliable "
+			"p-values.".format(len(Ts), _MIN_TARGETS), stacklevel=2)
 
 	if n_jobs != -1:
 		_n_jobs = numba.get_num_threads()

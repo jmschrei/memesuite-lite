@@ -122,6 +122,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tomtom` and `symmetric_tomtom` warn when given fewer than 25 target motifs
+  (reverse complements are not counted). Each query column's background
+  distribution is built from the target columns, so with few targets the
+  p-values depend on which targets are given: against a single JASPAR
+  target, the p-value of a query's best JASPAR match was a median of 3
+  orders of magnitude larger than against all of JASPAR. MEME's tomtom warns
+  below 50 motifs. Thanks @moritzburghardt! (#7)
 - `fimo` takes `verbose=True` to show progress bars while reading a FASTA
   file, while scanning, and while building the output DataFrames. The scan's
   bar counts motifs as the numba kernel finishes them. The default,
