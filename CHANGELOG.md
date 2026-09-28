@@ -83,6 +83,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   golden case. They now match MEME's tomtom to within 1e-6 (absolute) on
   both. The golden p-values of the one-hot `tomtom` and `symmetric_tomtom`
   cases were regenerated. Thanks @moritzburghardt! (#7)
+- `tomtom` and `symmetric_tomtom` compute the background survival function
+  as the sum of the probability above each score, instead of
+  `1 - cumsum(pdf)`, and merge the two strands with `p * (2 - p)`, instead of
+  `1 - (1 - p) ** 2`. Together these lost every p-value below about 1e-12
+  to round-off. On JASPAR against itself, `tomtom` returned 3,681 p-values
+  of exactly 0, including 2,225 of the 2,346 self-matches. The ties at 0
+  made the order of the best matches, and so `n_nearest`, follow the order
+  of the targets. The smallest p-value there is now 5.8e-136, and p-values
+  agree with an extended-precision computation to within 1e-12 (relative).
+  p-values above 1e-6 change by at most 3.2e-6 (relative) on JASPAR, and by
+  at most 1.4e-5 on synthetic motifs. `symmetric_tomtom` never received the
+  clamp added in 0.4.0 and still returned negative p-values (1,500 on
+  JASPAR); it no longer does. Thanks @ghuls and @moritzburghardt! (#7)
 
 ### Changed
 

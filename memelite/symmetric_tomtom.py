@@ -92,13 +92,15 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 	for i in range(nq, t_max+1):
 		_pairwise_max(B[i-1], A[0, nq-1], A_csum[0, nq-1], B[i], n)
 
-	# Again, `axis` is not implemented for cumsum
+	# The survival value at bin j is the sum of the pdf above j, added from
+	# the top down, clamped to [0, 1]; see `_p_value_backgrounds_windowed`
+	# in tomtom.py, whose values this matches.
 	for i in range(B.shape[0]):
-		for j in range(1, n):
-			B[i, j] += B[i, j-1]
-		
-		for j in range(n):
-			B[i, j] = 1 - B[i, j]
+		a = 0.0
+		for j in range(n-1, -1, -1):
+			p = B[i, j]
+			B[i, j] = min(max(a, 0.0), 1.0)
+			a += p
 			
 
 @njit(parallel=True, cache=True)

@@ -19,6 +19,7 @@ from memelite.tomtom import tomtom
 from ._golden_inputs import one_hot_pwms
 
 from numpy.testing import assert_raises
+from numpy.testing import assert_allclose
 from numpy.testing import assert_array_equal
 from numpy.testing import assert_array_almost_equal
 
@@ -727,22 +728,20 @@ def test_tomtom_reverse_complement_merge():
 
 def test_tomtom_p_values_non_negative():
 	# Regression test for the small, negative p-values that users reported on
-	# very good matches.
+	# very good matches (#7).
 	#
-	# The p-value of a hit is read straight out of the background survival
-	# function `B` built in `_p_value_backgrounds`, which is formed as
-	# `1 - cumsum(pdf)`. The cumsum accumulates floating-point round-off over
-	# thousands of bins and the underlying distribution does not sum to exactly
-	# 1, so for the very best (highest-scoring) matches -- which land in the
-	# extreme right tail where the CDF is ~1 -- the survival value could come
-	# out as a tiny negative number (~ -1e-14 single strand, roughly doubled by
-	# the `1 - (1 - p) ** 2` reverse-complement merge). A survival probability
-	# can never be negative, so `_p_value_backgrounds` now clamps it to zero.
+	# The p-value of a hit is read out of the background survival function
+	# `B` built in `_p_value_backgrounds`. When it was formed as
+	# `1 - cumsum(pdf)`, round-off in the cumsum over thousands of bins made
+	# the survival value of the very best matches, in the extreme right tail
+	# where the CDF is ~1, a tiny negative number (~ -1e-14). It is now the
+	# sum of the pdf above each score, which is never negative, and clamped
+	# to [0, 1].
 	#
 	# A self-comparison of `test.meme` exercises this: every motif's best hit
-	# is itself, sitting in that tail. Pre-fix the diagonal entries were
-	# negative (see the golden values in `test_tomtom_meme`); they must now be
-	# non-negative on both strands.
+	# is itself, sitting in that tail. The p-values must be non-negative on
+	# both strands; `test_tomtom_self_matches_positive` checks that they are
+	# also not rounded to 0.
 	pwms = list(read_meme("tests/data/test.meme").values())
 
 	for rc in (True, False):
@@ -1574,3 +1573,40 @@ def test_tomtom_one_hot_matches_meme():
 			0.899403, 0.222739, 0.968174],
 		[0.859372, 0.984423, 0.199181, 0.984423, 0.953196, 0.021359, 0.756237,
 			0.997009, 0.548497, 0.398691]], 4)
+
+
+def test_tomtom_self_matches_positive():
+	# Each motif's match to itself lies in the far right tail of the
+	# background, below the round-off of a cumsum that reaches 1, and
+	# 1 - cumsum(pdf) gave 0 for every one of them.
+	pwms = list(read_meme("tests/data/test.meme").values())
+	p = tomtom(pwms, pwms)[0]
+
+	assert (p > 0).all()
+	assert (numpy.diag(p) < 1e-8).all()
+
+
+def test_merge_rc_results_small_p():
+	# 1 - (1 - p) ** 2 is 0 in float64 for p below about 1e-16.
+	results = numpy.array([[1e-20, 5, 0, 5, 0], [1e-10, 3, 0, 5, 0],
+		[1.0, 1, 0, 5, 0], [0.5, 2, 0, 5, 0]])
+	_merge_rc_results(results)
+
+	assert_allclose(results[:2, 0], [2e-20, 1e-10 * (2 - 1e-10)], rtol=1e-15)
+
+
+def test_p_value_backgrounds_right_tail():
+	# P(S >= s) is 1e-20 for s in [2, 19], which 1 - cumsum(pdf) returned as
+	# 0 because the cumsum had already reached 1.
+	f = numpy.zeros((1, 21))
+	f[0, 1], f[0, 19] = 1.0, 1e-20
+
+	A = numpy.empty((1, 1, 40))
+	A_csum = numpy.empty((1, 1, 40))
+	B = numpy.empty((2, 40))
+	_p_value_backgrounds(f, A, B, A_csum, 1, 20, 1, numpy.uint64(0))
+
+	# B[1, j] is P(S >= j + 1) for j < 20.
+	assert B[1, 0] == 1
+	assert_allclose(B[1, 1:19], 1e-20, rtol=1e-12)
+	assert B[1, 19] == 0

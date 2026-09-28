@@ -557,3 +557,15 @@ def test_symmetric_tomtom_n_score_bins_scales_scores():
 	s50 = symmetric_tomtom(pwms, n_score_bins=50)[1][mask]
 	s100 = symmetric_tomtom(pwms, n_score_bins=100)[1][mask]
 	assert s100.mean() > 1.5 * s50.mean()
+
+
+def test_symmetric_tomtom_near_duplicates_positive():
+	# Each motif and a copy with 0.01 added to every entry match very well,
+	# so their p-values lie in the far right tail of the background, where
+	# 1 - cumsum(pdf) went negative.
+	pwms = list(read_meme("tests/data/test.meme").values())
+	X = pwms + [(pwm + 0.01) / 1.04 for pwm in pwms]
+	p = numpy.asarray(symmetric_tomtom(X)[0])
+
+	assert (p > 0).all()
+	assert (p <= 1).all()

@@ -1843,14 +1843,13 @@ def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
 
 		lo, L, H = L, int64(1), n_col - 1
 
-	# `axis` is not implemented for cumsum. The pdf is zero below L, so the
-	# CDF is zero there and the survival 1, and it is flat from H on.
-	#
-	# The cumsum accumulates floating-point round-off across thousands of bins
-	# and the underlying distribution does not sum to exactly 1, so at the
-	# extreme right tail (the very best matches) the CDF can land just above
-	# 1.0. A survival probability cannot be negative, so clamp the round-off
-	# to zero to avoid returning tiny negative p-values.
+	# Each row's survival value at bin j is the sum of the pdf above j, added
+	# from the top of the window down. A sum from the right keeps the small
+	# tail probabilities of the best matches to full relative precision;
+	# 1 - cumsum(pdf) loses everything below the round-off of the cumsum,
+	# about 1e-12 with thousands of bins, and can go negative. The pdf is
+	# zero from H on, so the survival there is 0, and below L it is the
+	# total, which is 1 up to round-off; each value is clamped to [0, 1].
 	rows = numpy.empty(t_max+1, dtype=numpy.int64)
 	nr = 0
 	for i in range(1, t_max+1):
@@ -1858,55 +1857,43 @@ def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
 			rows[nr] = i
 			nr += 1
 
-	# Each row's running sum is its own serial chain of additions, in the same
-	# order as `B[i, j] += B[i, j-1]` (a + b == b + a bitwise). Four rows are
-	# summed at once so that four independent chains overlap their latency,
-	# and each survival value is computed from the sum as it is produced.
+	totals = numpy.zeros(t_max+1, dtype=numpy.float64)
+
+	# Four rows are summed at once so that four independent chains of
+	# additions overlap their latency.
 	r = 0
 	while r + 4 <= nr:
 		b0, b1, b2, b3 = B[rows[r+0]], B[rows[r+1]], B[rows[r+2]], B[rows[r+3]]
-		if H > L:
-			a0, a1, a2, a3 = b0[L], b1[L], b2[L], b3[L]
-			s = 1 - a0
-			b0[L] = s if s > 0 else 0.0
-			s = 1 - a1
-			b1[L] = s if s > 0 else 0.0
-			s = 1 - a2
-			b2[L] = s if s > 0 else 0.0
-			s = 1 - a3
-			b3[L] = s if s > 0 else 0.0
-			for j in range(L+1, H):
-				a0 = b0[j] + a0
-				a1 = b1[j] + a1
-				a2 = b2[j] + a2
-				a3 = b3[j] + a3
-				s0 = 1 - a0
-				b0[j] = s0 if s0 > 0 else 0.0
-				s1 = 1 - a1
-				b1[j] = s1 if s1 > 0 else 0.0
-				s2 = 1 - a2
-				b2[j] = s2 if s2 > 0 else 0.0
-				s3 = 1 - a3
-				b3[j] = s3 if s3 > 0 else 0.0
+		a0, a1, a2, a3 = 0.0, 0.0, 0.0, 0.0
+		for j in range(H-1, L-1, -1):
+			p0, p1, p2, p3 = b0[j], b1[j], b2[j], b3[j]
+			b0[j] = min(max(a0, 0.0), 1.0)
+			b1[j] = min(max(a1, 0.0), 1.0)
+			b2[j] = min(max(a2, 0.0), 1.0)
+			b3[j] = min(max(a3, 0.0), 1.0)
+			a0 += p0
+			a1 += p1
+			a2 += p2
+			a3 += p3
+		totals[r+0], totals[r+1], totals[r+2], totals[r+3] = a0, a1, a2, a3
 		r += 4
 
 	while r < nr:
 		b0 = B[rows[r]]
-		if H > L:
-			a0 = b0[L]
-			s = 1 - a0
-			b0[L] = s if s > 0 else 0.0
-			for j in range(L+1, H):
-				a0 = b0[j] + a0
-				s = 1 - a0
-				b0[j] = s if s > 0 else 0.0
+		a0 = 0.0
+		for j in range(H-1, L-1, -1):
+			p0 = b0[j]
+			b0[j] = min(max(a0, 0.0), 1.0)
+			a0 += p0
+		totals[r] = a0
 		r += 1
 
 	for r in range(nr):
 		i = rows[r]
+		total = min(max(totals[r], 0.0), 1.0) if H > L else 1.0
 		for j in range(L):
-			B[i, j] = 1.0
-		tail = B[i, H-1] if H > 0 else 1.0
+			B[i, j] = total
+		tail = B[i, H-1] if H > L else 1.0
 		for j in range(H, n_col):
 			B[i, j] = tail
 
@@ -2314,8 +2301,10 @@ def _merge_rc_results(results):
 	n = nt // 2
 	
 	for i in range(n):
+		# 1 - (1 - p) ** 2, written so that it does not round to 0 for
+		# p below 1e-16.
 		p = min(results[i, 0], results[i+n, 0])
-		p = 1 - (1 - p) ** 2
+		p = p * (2 - p)
 
 		results[i, 0] = p
 		results[i, 4] = 0
@@ -2338,8 +2327,10 @@ def _merge_rc_results_into(results, out):
 	n = out.shape[0]
 
 	for i in range(n):
+		# 1 - (1 - p) ** 2, written so that it does not round to 0 for
+		# p below 1e-16.
 		p = min(results[i, 0], results[i+n, 0])
-		p = 1 - (1 - p) ** 2
+		p = p * (2 - p)
 
 		out[i, 0] = p
 		
