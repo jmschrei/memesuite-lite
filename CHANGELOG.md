@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unpack" and reports the right targets; with several queries of different
   lengths each row's alignment is laid out with its own query's length; and a
   target lying entirely inside the query is shown with every query column.
+- `fimo` with a zero-width motif no longer intermittently raises
+  `SystemError` ("returned a result with an exception set") on a later call
+  in the same process.
 
 ### Changed
 
@@ -58,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so they are no longer recompiled in every new process (about 4-6 s each).
   The thread count is passed into the kernel instead of read inside it, which
   had prevented caching.
+- `fimo` is about 20x faster with identical output: every hit, p-value and
+  row order is unchanged, and scores agree to within 4e-15. Most windows
+  are now rejected after one or two table lookups over precomputed sequence
+  codes, which provably cannot drop a hit, and only windows that might pass
+  the threshold are scored in full. The p-value tables and the output
+  DataFrames are also built faster. On 400 JASPAR motifs against 2,000 1 kb
+  sequences at 8 threads the call takes 0.075 s instead of 1.49 s. Long
+  sequences read from a FASTA file with few motifs gain less (about 2-4x) and
+  use 4 more bytes of memory per base while scanning. The first call in a
+  fresh environment compiles for about 3 s longer.
 
 ### Added
 
