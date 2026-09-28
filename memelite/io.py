@@ -10,7 +10,8 @@ def read_meme(filename, n_motifs=None):
 
 	This method takes in the filename of a MEME-formatted file to read in
 	and returns a dictionary of the PWMs where the keys are the metadata
-	line and the values are the PWMs.
+	line and the values are the PWMs. Each key is the rest of the motif's
+	MOTIF line, such as 'MA0004.1 Arnt', with its fields joined by one space.
 
 
 	Parameters
@@ -37,7 +38,8 @@ def read_meme(filename, n_motifs=None):
 		for line in infile:
 			if motif is None:
 				if line[:5] == 'MOTIF':
-					motif = line.replace('MOTIF ', '').strip("\r\n")
+					# The fields may be separated by tabs or several spaces.
+					motif = ' '.join(line[5:].split())
 				else:
 					continue
 
