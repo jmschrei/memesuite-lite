@@ -36,6 +36,11 @@ def _binned_median(x, bins, x_min, x_max, counts):
 
 	halfway = 0
 	x_max -= x_min
+
+	# Every value is x_min when the range is zero, so x_min is the median.
+	if x_max == 0:
+		return x_min
+
 	for i in range(n):
 		z = int((x[i] - x_min) / x_max * (n_bins - 1))
 		bins[z, 0] += counts[i]
@@ -83,6 +88,11 @@ def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 
 	n, n_bins = len(x), len(bins)
 	x_max -= x_min
+
+	# Every value is x_min when the range is zero, so x_min is the median.
+	if x_max == 0:
+		return x_min
+
 	for i in range(n):
 		zb[i] = int((x[i] - x_min) / x_max * (n_bins - 1))
 
@@ -180,18 +190,33 @@ def _binned_median_block4(r0, r1, r2, r3, mn0, mx0, mn1, mx1, mn2, mx2, mn3,
 
 	n, n_bins = len(r0), len(bins)
 	z0, z1, z2, z3 = zb4[0], zb4[1], zb4[2], zb4[3]
+
+	# A row whose values are all equal has a zero range. Its elements all go
+	# in bin 0, and its median is its minimum, as in `_binned_median_z`.
 	mx0 -= mn0
-	for i in range(n):
-		z0[i] = int((r0[i] - mn0) / mx0 * (n_bins - 1))
+	if mx0 == 0:
+		z0[:n] = 0
+	else:
+		for i in range(n):
+			z0[i] = int((r0[i] - mn0) / mx0 * (n_bins - 1))
 	mx1 -= mn1
-	for i in range(n):
-		z1[i] = int((r1[i] - mn1) / mx1 * (n_bins - 1))
+	if mx1 == 0:
+		z1[:n] = 0
+	else:
+		for i in range(n):
+			z1[i] = int((r1[i] - mn1) / mx1 * (n_bins - 1))
 	mx2 -= mn2
-	for i in range(n):
-		z2[i] = int((r2[i] - mn2) / mx2 * (n_bins - 1))
+	if mx2 == 0:
+		z2[:n] = 0
+	else:
+		for i in range(n):
+			z2[i] = int((r2[i] - mn2) / mx2 * (n_bins - 1))
 	mx3 -= mn3
-	for i in range(n):
-		z3[i] = int((r3[i] - mn3) / mx3 * (n_bins - 1))
+	if mx3 == 0:
+		z3[:n] = 0
+	else:
+		for i in range(n):
+			z3[i] = int((r3[i] - mn3) / mx3 * (n_bins - 1))
 
 	c4 = bins.reshape(-1).view(numpy.int32)
 	c0 = c4[0:n_bins]
@@ -208,10 +233,12 @@ def _binned_median_block4(r0, r1, r2, r3, mn0, mx0, mn1, mx1, mn2, mx2, mn3,
 		c2[uint64(z2[i])] += ci
 		c3[uint64(z3[i])] += ci
 
-	return (_median_from_counts(r0, c0, z0, counts, halfway),
-		_median_from_counts(r1, c1, z1, counts, halfway),
-		_median_from_counts(r2, c2, z2, counts, halfway),
-		_median_from_counts(r3, c3, z3, counts, halfway))
+	m0 = _median_from_counts(r0, c0, z0, counts, halfway)
+	m1 = _median_from_counts(r1, c1, z1, counts, halfway)
+	m2 = _median_from_counts(r2, c2, z2, counts, halfway)
+	m3 = _median_from_counts(r3, c3, z3, counts, halfway)
+	return (mn0 if mx0 == 0 else m0, mn1 if mx1 == 0 else m1,
+		mn2 if mx2 == 0 else m2, mn3 if mx3 == 0 else m3)
 
 
 @njit(cache=True, inline='always')
@@ -808,9 +835,13 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 		z_min = min(z_min, smin[i] - m)
 		z_max = max(z_max, smax[i] - m)
 			
-	# Find the minimum value and the number of bins needed to get there
+	# Find the minimum value and the number of bins needed to get there.
+	# z_max - i_min is below 1 only when z_min is 0, i.e. every column's
+	# median is its minimum, and z_max < 1. When every target column scores
+	# the same it is 0 or round-off, and dividing by it would stretch that
+	# round-off over all n_bins bins, so the divisor is at least 1.
 	i_min = int(math.floor(z_min)) #offset
-	bin_scale = int(math.floor(n_bins / (z_max - i_min))) #scale
+	bin_scale = int(math.floor(n_bins / max(z_max - i_min, 1.0))) #scale
 	offset = -i_min * bin_scale
 	return i_min, bin_scale, offset
 

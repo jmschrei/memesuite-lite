@@ -60,6 +60,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fimo` with a zero-width motif no longer intermittently raises
   `SystemError` ("returned a result with an exception set") on a later call
   in the same process.
+- `tomtom` and `symmetric_tomtom` no longer divide by zero when every target
+  column is the same distance from a query column, e.g. a uniform query
+  column against a single target whose columns hold the same entries in
+  different orders, or against a one-column target that is its own reverse
+  complement. The error was raised inside numba's parallel loop, so the first
+  such call in a process returned uninitialized memory (p-values of 0 or far
+  above 1) and later calls raised `SystemError`. The median of equal
+  distances is now that distance; a query with one uniform column then gets
+  the same p-value as with a column 1e-9 away from uniform. When every query
+  column's median was also its minimum, the score scale came from a
+  round-off-sized range, and a uniform query against a near-one-hot target,
+  where every alignment scores the same, got p-values anywhere from 0.11 to
+  1; the scale's divisor is now at least 1, and these give p = 1.
+  Thanks @moritzburghardt! (#7)
 
 ### Changed
 

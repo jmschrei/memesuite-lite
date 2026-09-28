@@ -8,6 +8,8 @@ import pandas
 
 from memelite.io import read_meme
 from memelite.tomtom import _binned_median
+from memelite.tomtom import _binned_median_z
+from memelite.tomtom import _binned_median_block4
 from memelite.tomtom import _pairwise_max
 from memelite.tomtom import _merge_rc_results
 from memelite.tomtom import _p_value_backgrounds
@@ -1434,3 +1436,105 @@ def test_tomtom_torch():
 	pwms32 = [pwm.astype('float32') for pwm in pwms]
 	_assert_identical(tomtom(pwms32, pwms), 
 		tomtom([torch.from_numpy(pwm) for pwm in pwms32], pwms_t))
+
+
+##
+
+
+def _issue7_target(hi, lo):
+	# The single target of issue #7: one near-one-hot column per position.
+	t = numpy.full((4, 20), lo)
+	for j, c in enumerate("ACCTACTAGGGGCTGAACCC"):
+		t["ACGT".index(c), j] = hi
+
+	return t
+
+
+@pytest.mark.parametrize("hi, lo", [(0.997, 0.001), (0.9997, 0.0001)])
+@pytest.mark.parametrize("reverse_complement", [True, False])
+def test_tomtom_uniform_query_single_target(hi, lo, reverse_complement):
+	# Every column of this target is the same distance from a uniform query
+	# column, so every alignment scores the same and the p-value is 1. With
+	# 0.997 the distances are exactly equal and the binned median divided by
+	# a zero range. The second call checks that no error was left pending.
+	q = numpy.full((4, 20), 0.25)
+	T = _issue7_target(hi, lo)
+
+	for _ in range(2):
+		p = tomtom([q], [T], reverse_complement=reverse_complement)[0]
+		assert_array_equal(p, [[1.0]])
+
+
+@pytest.mark.parametrize("w", [6, 20])
+def test_tomtom_uniform_query_round_off(w):
+	# The same for 200 values of the dominant entry. When every column's
+	# median is its minimum the scale was chosen from the largest shifted
+	# score alone, which is round-off here, and p-values from 0.11 to 1 came
+	# out, or the scale divided by zero.
+	q = numpy.full((4, w), 0.25)
+
+	for hi in numpy.linspace(0.5, 0.999, 200):
+		T = _issue7_target(hi, (1 - hi) / 3)
+		assert tomtom([q], [T])[0][0, 0] == 1
+
+
+def test_tomtom_uniform_column_once():
+	# A uniform column that occurs once in the query is scored inside the
+	# parallel loop, where the division by zero returned uninitialized values
+	# on the first call in a process and raised SystemError on later calls.
+	q = numpy.random.RandomState(0).dirichlet(numpy.ones(4), size=12).T
+	q[:, 5] = 0.25
+	T = _issue7_target(0.997, 0.001)
+
+	p = tomtom([q], [T])[0]
+	assert_array_equal(p, tomtom([q], [T])[0])
+	assert_array_almost_equal(p, [[0.8449]], 4)
+
+	# A column 1e-9 from uniform never had a zero range, and scores the same.
+	q[:, 5] = [0.25 + 1e-9, 0.25 - 1e-9, 0.25, 0.25]
+	assert_array_almost_equal(p, tomtom([q], [T])[0], 4)
+
+
+def test_tomtom_palindromic_single_column_target():
+	# A one-column target that is its own reverse complement leaves a single
+	# unique target column, so each query column has one distance and every
+	# alignment scores the same.
+	q = numpy.random.RandomState(1).dirichlet(numpy.ones(4), size=10).T
+	T = numpy.array([[0.4], [0.1], [0.1], [0.4]])
+
+	assert_array_equal(tomtom([q], [T])[0], [[1.0]])
+
+
+@pytest.mark.parametrize("value", [-0.862561302169301, 0.0])
+def test_binned_median_zero_range(value):
+	# All values equal: the median is that value, with no division by the
+	# zero range.
+	X = numpy.full(7, value)
+	counts = numpy.arange(1, 8, dtype='int64')
+	bins = numpy.zeros((1000, 2), dtype='float64')
+	zb = numpy.empty(7, dtype=numpy.int32)
+
+	assert _binned_median(X, bins, value, value, counts) == value
+	assert _binned_median_z(X, bins, value, value, counts, zb, 
+		counts.sum() / 2) == value
+
+
+def test_binned_median_block4_zero_range():
+	# A constant row among three varied ones gets its value, and every row
+	# matches `_binned_median_z` on its own.
+	state = numpy.random.RandomState(2)
+	n = 130
+	rows = [numpy.full(n, -0.5)] + [state.uniform(-1.4, 0, n) for _ in range(3)]
+	counts = state.randint(1, 5, size=n).astype('int64')
+	halfway = counts.sum() / 2
+	mn, mx = [r.min() for r in rows], [r.max() for r in rows]
+
+	m = _binned_median_block4(rows[0], rows[1], rows[2], rows[3], mn[0], mx[0],
+		mn[1], mx[1], mn[2], mx[2], mn[3], mx[3], numpy.zeros((1000, 2)), 
+		counts, counts.astype(numpy.int32), numpy.empty((4, n), 
+		dtype=numpy.int32), halfway)
+
+	assert m[0] == -0.5
+	for r, lo, hi, value in zip(rows, mn, mx, m):
+		assert value == _binned_median_z(r, numpy.zeros((1000, 2)), lo, hi, 
+			counts, numpy.empty(n, dtype=numpy.int32), halfway)
