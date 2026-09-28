@@ -1487,10 +1487,11 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		if len(hits) == 0:
 			return []
 
+		# One DataFrame per sequence, sorted by name, each keeping its rows in
+		# motif order.
 		hits = pandas.concat(hits)
-		_names = numpy.unique(hits['sequence_name'])
-		hits = [hits[hits['sequence_name'] == name].reset_index(drop=True)
-			for name in _names]
+		hits = [df.reset_index(drop=True) for _, df in hits.groupby(
+			'sequence_name')]
 
 	return hits
 
