@@ -80,6 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fimo` takes `verbose=True` to show progress bars while reading a FASTA
+  file, while scanning, and while building the output DataFrames. The scan's
+  bar counts motifs as the numba kernel finishes them. The default,
+  `verbose=False`, prints nothing, as before. Thanks @54yyyu! (#2)
 - A much larger unit test suite: brute-force references for `fimo`, exact
   p-value enumeration for short motifs, invariance and shape-grid tests for
   `tomtom` and `symmetric_tomtom`, CLI flag coverage, `read_meme` format

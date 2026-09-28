@@ -1,14 +1,19 @@
 # test_fimo.py
 # Contact: Jacob Schreiber <jmschreiber91@gmail.com>
 
+import io
 import warnings
+import threading
 
 import numpy
 import pytest
 import pandas
 
+from tqdm import tqdm
+
 from memelite.fimo import _pwm_to_mapping
 from memelite.fimo import _fast_convert
+from memelite.fimo import _scan_progress
 from memelite.fimo import logaddexp2
 from memelite.fimo import fimo
 from memelite.io import read_meme
@@ -1490,3 +1495,101 @@ def test_fimo_unreachable_threshold():
 			for df0, df1 in zip(expected, observed[1:]):
 				df1 = df1.assign(motif_idx=df1['motif_idx'] - 1)
 				pandas.testing.assert_frame_equal(df0, df1)
+
+
+##
+
+
+def _last_bar(err, desc):
+	"""Return the last state tqdm printed for the bar named `desc`."""
+
+	lines = err.replace("\r", "\n").split("\n")
+	lines = [line for line in lines if line.startswith(desc + ":")]
+	return lines[-1] if len(lines) > 0 else None
+
+
+@pytest.mark.parametrize("reverse_complement", [True, False])
+@pytest.mark.parametrize("dim", [0, 1])
+def test_fimo_verbose_same_output(dim, reverse_complement):
+	# The progress bars change what is printed, not what is returned.
+	expected = fimo("tests/data/test.meme", "tests/data/test.fa",
+		threshold=1e-3, dim=dim, reverse_complement=reverse_complement)
+	observed = fimo("tests/data/test.meme", "tests/data/test.fa",
+		threshold=1e-3, dim=dim, reverse_complement=reverse_complement,
+		verbose=True)
+
+	assert len(observed) == len(expected)
+	for df0, df1 in zip(expected, observed):
+		pandas.testing.assert_frame_equal(df0, df1)
+
+
+def test_fimo_verbose_same_counts():
+	X = _make_one_hot((3, 4, 200), random_state=0)
+
+	expected = fimo("tests/data/test.meme", X, threshold=1e-3,
+		return_counts=True)
+	observed = fimo("tests/data/test.meme", X, threshold=1e-3,
+		return_counts=True, verbose=True)
+
+	assert_array_equal(observed, expected)
+
+
+def test_fimo_verbose_default_silent(capsys):
+	fimo("tests/data/test.meme", "tests/data/test.fa")
+
+	captured = capsys.readouterr()
+	assert captured.out == ""
+	assert captured.err == ""
+
+
+@pytest.mark.parametrize("reverse_complement", [True, False])
+def test_fimo_verbose_bars(capsys, reverse_complement):
+	# One bar per stage, on stderr. Each ends full, and the scan's bar counts
+	# motifs whether or not their reverse complements are scanned too.
+	n_threads = threading.active_count()
+	fimo("tests/data/test.meme", "tests/data/test.fa",
+		reverse_complement=reverse_complement, verbose=True)
+
+	captured = capsys.readouterr()
+	assert captured.out == ""
+	assert "7/7" in _last_bar(captured.err, "Reading FASTA")
+	assert "12/12" in _last_bar(captured.err, "Scanning")
+	assert "12/12" in _last_bar(captured.err, "Building DataFrames")
+
+	# The thread that advances the scan's bar has finished.
+	assert threading.active_count() == n_threads
+
+
+def test_fimo_verbose_bars_one_hot_counts(capsys):
+	# One-hot sequences are not read from a FASTA file, and counts are
+	# returned without building DataFrames.
+	X = _make_one_hot((3, 4, 200), random_state=0)
+	fimo("tests/data/test.meme", X, return_counts=True, verbose=True)
+
+	err = capsys.readouterr().err
+	assert _last_bar(err, "Reading FASTA") is None
+	assert "12/12" in _last_bar(err, "Scanning")
+	assert _last_bar(err, "Building DataFrames") is None
+
+
+class _StopAfterOne:
+	"""Stands in for the `stop` event, letting `_scan_progress` poll once."""
+
+	def __init__(self):
+		self.n_calls = 0
+
+	def wait(self, timeout):
+		self.n_calls += 1
+		return self.n_calls > 1
+
+
+@pytest.mark.parametrize("step", [1, 2])
+def test_scan_progress(step):
+	# The bar is moved to the number of motif-strands done, divided by the
+	# number of strands per motif.
+	done = numpy.zeros(8, dtype=numpy.uint8)
+	done[[0, 3, 4, 6, 7]] = 1
+
+	with tqdm(total=8 // step, file=io.StringIO()) as pbar:
+		_scan_progress(done, step, pbar, _StopAfterOne())
+		assert pbar.n == 5 // step
