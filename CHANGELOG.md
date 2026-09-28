@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It reads the width from the `w=` field, so `alength=4 w=2` (no space after
   `=`) is parsed correctly, and `n_motifs=0` returns no motifs instead of all
   of them.
+- `read_meme` accepts tabs or several spaces between the fields of a `MOTIF`
+  line, as MEME does, and joins the fields with one space in the key. A motif
+  headed `MOTIF\tcoordinator\tcoordinator` was stored under that whole line
+  instead of `'coordinator coordinator'`. Whitespace at the end of the line is
+  no longer part of the key, so `MOTIF crp ` gives `'crp'` instead of `'crp '`.
+  Thanks @jaavedm for reporting this and the dropped final motif above! (#6)
 - `one_hot_encode` accepts a tuple alphabet, as documented, instead of raising
   `TypeError`.
 - `characters` accepts torch tensors again; it raised `AttributeError` for

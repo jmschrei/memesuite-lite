@@ -504,6 +504,19 @@ def test_read_meme_alternate_name(tmp_path):
 	assert list(motifs.keys()) == ['MA0001.1 AGL3']
 
 
+@pytest.mark.parametrize("line", ["MOTIF\tMA0001.1\tAGL3",
+	"MOTIF  MA0001.1  AGL3", "MOTIF MA0001.1 AGL3 \t", "MOTIF \tMA0001.1 \t AGL3",
+	"MOTIFMA0001.1 AGL3"])
+def test_read_meme_header_whitespace(tmp_path, line):
+	# MEME allows any whitespace, or none, after MOTIF and any whitespace
+	# between the fields. The key joins the fields with one space.
+	text = _MOTIF_A.replace("MOTIF a", line)
+	motifs = _read_text(tmp_path, _HEADER + text)
+
+	assert list(motifs.keys()) == ['MA0001.1 AGL3']
+	assert numpy.array_equal(motifs['MA0001.1 AGL3'], _PWM_A)
+
+
 def test_read_meme_empty_file(tmp_path):
 	assert _read_text(tmp_path, "") == {}
 
