@@ -1613,7 +1613,7 @@ def _backgrounds_dense(f, f_lo, f_hi, A, B, A_csum, nq, n_bins, t_max, offset,
 			A[i, j] = 0
 			
 			if i == j:
-				for l in range(1, n_bins+1):
+				for l in range(n_bins+1):
 					l = uint64(l)
 					A[i, j, l+c] = f[j, l]
 
@@ -1730,7 +1730,7 @@ def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
 	f_hi = numpy.empty(nq, dtype='int64')
 	for j in range(nq):
 		f_lo[j], f_hi[j] = n_bins+1, 0
-		for l in range(1, n_bins+1):
+		for l in range(n_bins+1):
 			if f[j, l] != 0:
 				f_hi[j] = l
 				if f_lo[j] > n_bins:
@@ -1831,7 +1831,7 @@ def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
 			c = int64(offset) * int64(nq - 1)
 			for i in range(nq):
 				A[i, i] = 0
-				for l in range(1, n_bins+1):
+				for l in range(n_bins+1):
 					A[i, i, l+c] = f[i, l]
 
 		# Column c of a row holds bin c + L - 1: the survival pass below runs

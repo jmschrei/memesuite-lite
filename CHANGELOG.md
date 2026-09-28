@@ -74,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where every alignment scores the same, got p-values anywhere from 0.11 to
   1; the scale's divisor is now at least 1, and these give p = 1.
   Thanks @moritzburghardt! (#7)
+- `tomtom` and `symmetric_tomtom` include the lowest score bin in the
+  background distributions. A query's lowest scores fall in that bin when
+  every query column's median score is also its lowest, e.g. one-hot queries
+  against one-hot targets. Their probability was dropped, and the p-values
+  of such queries came out as 1: for all 703,800 pairs of JASPAR consensus
+  sequences compared as one-hot motifs, and all 50 pairs of the one-hot
+  golden case. They now match MEME's tomtom to within 1e-6 (absolute) on
+  both. The golden p-values of the one-hot `tomtom` and `symmetric_tomtom`
+  cases were regenerated. Thanks @moritzburghardt! (#7)
 
 ### Changed
 

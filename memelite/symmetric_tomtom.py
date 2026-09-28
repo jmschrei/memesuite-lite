@@ -49,7 +49,7 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 		im1, nqmi, nqmi1 = uint64(i-1), uint64(nq-i), uint64(nq-i-1)
 
 		if i == 0:
-			for k in range(1, n_bins+1):
+			for k in range(n_bins+1):
 				k = uint64(k)
 				A[0, 0, k+c] = f[0, k]
 				A[1, nqm1, k+c] = f[nqm1, k]
@@ -60,12 +60,12 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 				a1 = A[1, nqmi, k+c+offset]
 
 				if a0 > 0:
-					for l in range(1, n_bins+1):
+					for l in range(n_bins+1):
 						l = uint64(l)
 						A[0, i, l+k+c] += a0 * f[i, l]
 
 				if a1 > 0:
-					for l in range(1, n_bins+1):
+					for l in range(n_bins+1):
 						l = uint64(l)
 						A[1, nqmi1, l+k+c] += a1 * f[nqmi1, l]
 		

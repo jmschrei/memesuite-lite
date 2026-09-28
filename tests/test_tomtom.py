@@ -16,6 +16,8 @@ from memelite.tomtom import _p_value_backgrounds
 from memelite.tomtom import _p_values
 from memelite.tomtom import tomtom
 
+from ._golden_inputs import one_hot_pwms
+
 from numpy.testing import assert_raises
 from numpy.testing import assert_array_equal
 from numpy.testing import assert_array_almost_equal
@@ -1538,3 +1540,37 @@ def test_binned_median_block4_zero_range():
 	for r, lo, hi, value in zip(rows, mn, mx, m):
 		assert value == _binned_median_z(r, numpy.zeros((1000, 2)), lo, hi, 
 			counts, numpy.empty(n, dtype=numpy.int32), halfway)
+
+
+def test_p_value_backgrounds_lowest_bin():
+	# With an offset of 0, a column's lowest score falls in bin 0, and that
+	# bin's probability is part of the background: here S is 0 with
+	# probability 0.25 and 3 with probability 0.75.
+	f = numpy.zeros((1, 21))
+	f[0, 0], f[0, 3] = 0.25, 0.75
+
+	A = numpy.empty((1, 1, 40))
+	A_csum = numpy.empty((1, 1, 40))
+	B = numpy.empty((2, 40))
+	_p_value_backgrounds(f, A, B, A_csum, 1, 20, 1, numpy.uint64(0))
+
+	# B[1, j] is P(S >= j + 1).
+	assert_array_almost_equal(B[1, :4], [0.75, 0.75, 0.75, 0.0])
+
+
+def test_tomtom_one_hot_matches_meme():
+	# One-hot queries against one-hot targets put most of each column's
+	# probability in bin 0, which the background used to drop, and every
+	# p-value came out as 1. The expected values are MEME 5.5.9's tomtom
+	# (-dist ed -motif-pseudo 0) on the same motifs.
+	Qs = one_hot_pwms(5, 5, 15, 30)[:3]
+	Ts = one_hot_pwms(10, 5, 15, 31)
+
+	p = tomtom(Qs, Ts)[0]
+	assert_array_almost_equal(p, [
+		[0.97555, 0.938792, 0.924108, 0.51685, 0.826821, 0.708033, 0.924108,
+			0.708033, 0.897044, 0.215466],
+		[0.075622, 0.041661, 0.84858, 0.787208, 0.649353, 0.899403, 0.84858,
+			0.899403, 0.222739, 0.968174],
+		[0.859372, 0.984423, 0.199181, 0.984423, 0.953196, 0.021359, 0.756237,
+			0.997009, 0.548497, 0.398691]], 4)
