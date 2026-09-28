@@ -6,6 +6,7 @@ import numba
 import numpy
 import pandas
 import pyfaidx
+import threading
 import time
 
 from .io import read_meme
@@ -819,10 +820,10 @@ def _copy_hits(hits, o, seqs, starts, ends, scores, pvals):
 		pvals[o+h] = pval
 
 
-@numba.njit(parallel=True, fastmath=True, cache=True)
+@numba.njit(parallel=True, fastmath=True, cache=True, nogil=True)
 def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 	bin_size, smallest, score_to_pvals, score_to_pval_lengths, blk_off, blk_w,
-	blk_rest, blk_start, cuts, tops, order, wcodes, w_on, w_off, w_rest):
+	blk_rest, blk_start, cuts, tops, order, wcodes, w_on, w_off, w_rest, done):
 	"""Scan every motif over every sequence and return the hits as columns.
 
 	`codes` and `q` come from `_qmer_codes`: the bound that abandons a window
@@ -834,6 +835,9 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 	in the order given by `order`, so that the hits of motif `order[t]` are
 	rows `offsets[t]` to `offsets[t+1]` of the returned sequence index, start,
 	end, score and p-value arrays.
+
+	`done[k]` is set to 1 when motif k has been scanned. The GIL is released so
+	that a Python thread can read `done` during the scan to show progress.
 	"""
 
 	n_motifs = len(pwm_lengths) - 1
@@ -992,6 +996,8 @@ def _fast_hits(X, codes, q, chrom_lengths, pwm, pwm_lengths, score_threshold,
 							2.0 ** score_to_pvals[score_idx]))
 
 					x += numpy.uint64(1)
+
+		done[k] = 1
 
 	# `numpy.zeros` and a prange each start a parallel region, which costs
 	# about 20 us, so the offsets are filled serially and a small number of
@@ -1153,9 +1159,22 @@ def _one_hot_to_index(sequences):
 _CHUNK_ROWS = 32768
 
 
+def _scan_progress(done, step, pbar, stop):
+	"""Advance `pbar` to the number of motifs `_fast_hits` has marked done.
+
+	This runs in a thread of its own during the scan, and reads `done` every
+	0.1 seconds until `stop` is set. `done` has one entry per motif-strand and
+	the bar counts motifs, so the number done is divided by `step`, the number
+	of strands scanned per motif.
+	"""
+
+	while not stop.wait(0.1):
+		pbar.update(int(done.sum()) // step - pbar.n)
+
+
 def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1, 
 	eps=0.0001, threshold=0.0001, reverse_complement=True, return_counts=False, 
-	dim=0):
+	dim=0, verbose=False):
 	"""An implementation of the FIMO algorithm from the MEME suite.
 
 	This function implements the "Finding Individual Motif Instances" (FIMO)
@@ -1212,6 +1231,10 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		that motif across all examples (0, default) or one dataframe for each 
 		example containing all hits across all motifs to that example (1).
 		Default is 0.
+
+	verbose: bool, optional
+		Whether to display progress bars while reading the FASTA file, while
+		scanning, and while building the output DataFrames. Default is False.
 
 
 	Returns
@@ -1297,7 +1320,8 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		for i, idx in enumerate(alpha_idxs):
 			one_hot_mapping[idx] = i
 		
-		for name, chrom in fasta.items():
+		for name, chrom in tqdm(fasta.items(), desc="Reading FASTA",
+			disable=not verbose):
 			chrom = chrom[:].seq.upper()
 			lengths.append(lengths[-1] + len(chrom))
 			
@@ -1362,15 +1386,30 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 	# block per thread. The chunk size is set from Python
 	# because setting it inside a cached function disables its cache, and it
 	# is restored on every exit so that the caller's setting is unchanged.
-	previous = numba.set_parallel_chunksize(1)
-	try:
-		offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes, q,
-			X_lengths, pwms_n, motif_lengths, _score_thresholds, bin_size,
-			_smallest, _score_to_pvals, _score_to_pvals_lengths, _blk_off,
-			_blk_w, _blk_rest, _blk_start, _cuts, _tops, order, _wcodes, _w_on,
-			_w_off, _w_rest)
-	finally:
-		numba.set_parallel_chunksize(previous)
+	# With `verbose`, a thread shows the scan's progress while it runs.
+	done = numpy.zeros(n_motifs, dtype=numpy.uint8)
+	stop = threading.Event()
+
+	with tqdm(total=n_, desc="Scanning", disable=not verbose) as pbar:
+		if verbose:
+			thread = threading.Thread(target=_scan_progress, args=(done, step,
+				pbar, stop))
+			thread.start()
+
+		previous = numba.set_parallel_chunksize(1)
+		try:
+			offsets, seqs, starts, ends, scores, pvals = _fast_hits(X, codes,
+				q, X_lengths, pwms_n, motif_lengths, _score_thresholds,
+				bin_size, _smallest, _score_to_pvals, _score_to_pvals_lengths,
+				_blk_off, _blk_w, _blk_rest, _blk_start, _cuts, _tops, order,
+				_wcodes, _w_on, _w_off, _w_rest, done)
+		finally:
+			numba.set_parallel_chunksize(previous)
+			stop.set()
+
+		if verbose:
+			thread.join()
+			pbar.update(n_ - pbar.n)
 
 	if return_counts == True:
 		return numpy.diff(offsets[::step]).astype('int32')
@@ -1399,7 +1438,7 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 
 	hits, empty = [], None
 	c0 = c1 = 0
-	for i in range(n_):
+	for i in tqdm(range(n_), desc="Building DataFrames", disable=not verbose):
 		a, b = offsets[step*i], offsets[step*i + step]
 		n_fwd = offsets[step*i + 1] - a
 		n = b - a
@@ -1487,10 +1526,11 @@ def fimo(motifs, sequences, alphabet=['A', 'C', 'G', 'T'], bin_size=0.1,
 		if len(hits) == 0:
 			return []
 
+		# One DataFrame per sequence, sorted by name, each keeping its rows in
+		# motif order.
 		hits = pandas.concat(hits)
-		_names = numpy.unique(hits['sequence_name'])
-		hits = [hits[hits['sequence_name'] == name].reset_index(drop=True)
-			for name in _names]
+		hits = [df.reset_index(drop=True) for _, df in hits.groupby(
+			'sequence_name')]
 
 	return hits
 

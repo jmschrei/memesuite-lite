@@ -71,9 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequences read from a FASTA file with few motifs gain less (about 2-4x) and
   use 4 more bytes of memory per base while scanning. The first call in a
   fresh environment compiles for about 3 s longer.
+- `fimo(..., dim=1)` regroups the hits by sequence with one pandas `groupby`
+  instead of filtering every hit once per sequence, a cost that grew with the
+  number of hits times the number of sequences. The output is identical. On
+  400 JASPAR motifs against 2,000 1 kb hg38 sequences at `threshold=1e-5`
+  (1.2 million hits) the call takes 0.25 s instead of 43.8 s. Thanks
+  @54yyyu! (#2)
 
 ### Added
 
+- `fimo` takes `verbose=True` to show progress bars while reading a FASTA
+  file, while scanning, and while building the output DataFrames. The scan's
+  bar counts motifs as the numba kernel finishes them. The default,
+  `verbose=False`, prints nothing, as before. Thanks @54yyyu! (#2)
 - A much larger unit test suite: brute-force references for `fimo`, exact
   p-value enumeration for short motifs, invariance and shape-grid tests for
   `tomtom` and `symmetric_tomtom`, CLI flag coverage, `read_meme` format
