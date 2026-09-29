@@ -60,6 +60,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fimo` with a zero-width motif no longer intermittently raises
   `SystemError` ("returned a result with an exception set") on a later call
   in the same process.
+- `tomtom` and `symmetric_tomtom` no longer divide by zero when every target
+  column is the same distance from a query column, e.g. a uniform query
+  column against a single target whose columns hold the same entries in
+  different orders, or against a one-column target that is its own reverse
+  complement. The error was raised inside numba's parallel loop, so the first
+  such call in a process returned uninitialized memory (p-values of 0 or far
+  above 1) and later calls raised `SystemError`. The median of equal
+  distances is now that distance; a query with one uniform column then gets
+  the same p-value as with a column 1e-9 away from uniform. When every query
+  column's median was also its minimum, the score scale came from a
+  round-off-sized range, and a uniform query against a near-one-hot target,
+  where every alignment scores the same, got p-values anywhere from 0.11 to
+  1; the scale's divisor is now at least 1, and these give p = 1.
+  Thanks @moritzburghardt! (#7)
+- `tomtom` and `symmetric_tomtom` include the lowest score bin in the
+  background distributions. A query's lowest scores fall in that bin when
+  every query column's median score is also its lowest, e.g. one-hot queries
+  against one-hot targets. Their probability was dropped, and the p-values
+  of such queries came out as 1: for all 703,800 pairs of JASPAR consensus
+  sequences compared as one-hot motifs, and all 50 pairs of the one-hot
+  golden case. They now match MEME's tomtom to within 1e-6 (absolute) on
+  both. The golden p-values of the one-hot `tomtom` and `symmetric_tomtom`
+  cases were regenerated. Thanks @moritzburghardt! (#7)
+- `tomtom` and `symmetric_tomtom` compute the background survival function
+  as the sum of the probability above each score, instead of
+  `1 - cumsum(pdf)`, and merge the two strands with `p * (2 - p)`, instead of
+  `1 - (1 - p) ** 2`. Together these lost every p-value below about 1e-12
+  to round-off. On JASPAR against itself, `tomtom` returned 3,681 p-values
+  of exactly 0, including 2,225 of the 2,346 self-matches. The ties at 0
+  made the order of the best matches, and so `n_nearest`, follow the order
+  of the targets. The smallest p-value there is now 5.8e-136, and p-values
+  agree with an extended-precision computation to within 1e-12 (relative).
+  p-values above 1e-6 change by at most 3.2e-6 (relative) on JASPAR, and by
+  at most 1.4e-5 on synthetic motifs. `symmetric_tomtom` never received the
+  clamp added in 0.4.0 and still returned negative p-values (1,500 on
+  JASPAR); it no longer does. Thanks @ghuls and @moritzburghardt! (#7)
 
 ### Changed
 
@@ -86,6 +122,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tomtom` and `symmetric_tomtom` warn when given fewer than 25 target motifs
+  (reverse complements are not counted). Each query column's background
+  distribution is built from the target columns, so with few targets the
+  p-values depend on which targets are given: against a single JASPAR
+  target, the p-value of a query's best JASPAR match was a median of 3
+  orders of magnitude larger than against all of JASPAR. MEME's tomtom warns
+  below 50 motifs. Thanks @moritzburghardt! (#7)
 - `fimo` takes `verbose=True` to show progress bars while reading a FASTA
   file, while scanning, and while building the output DataFrames. The scan's
   bar counts motifs as the numba kernel finishes them. The default,

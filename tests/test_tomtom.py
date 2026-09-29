@@ -4,17 +4,23 @@
 import numba
 import numpy
 import pytest
+import warnings
 import pandas
 
 from memelite.io import read_meme
 from memelite.tomtom import _binned_median
+from memelite.tomtom import _binned_median_z
+from memelite.tomtom import _binned_median_block4
 from memelite.tomtom import _pairwise_max
 from memelite.tomtom import _merge_rc_results
 from memelite.tomtom import _p_value_backgrounds
 from memelite.tomtom import _p_values
 from memelite.tomtom import tomtom
 
+from ._golden_inputs import one_hot_pwms
+
 from numpy.testing import assert_raises
+from numpy.testing import assert_allclose
 from numpy.testing import assert_array_equal
 from numpy.testing import assert_array_almost_equal
 
@@ -723,22 +729,20 @@ def test_tomtom_reverse_complement_merge():
 
 def test_tomtom_p_values_non_negative():
 	# Regression test for the small, negative p-values that users reported on
-	# very good matches.
+	# very good matches (#7).
 	#
-	# The p-value of a hit is read straight out of the background survival
-	# function `B` built in `_p_value_backgrounds`, which is formed as
-	# `1 - cumsum(pdf)`. The cumsum accumulates floating-point round-off over
-	# thousands of bins and the underlying distribution does not sum to exactly
-	# 1, so for the very best (highest-scoring) matches -- which land in the
-	# extreme right tail where the CDF is ~1 -- the survival value could come
-	# out as a tiny negative number (~ -1e-14 single strand, roughly doubled by
-	# the `1 - (1 - p) ** 2` reverse-complement merge). A survival probability
-	# can never be negative, so `_p_value_backgrounds` now clamps it to zero.
+	# The p-value of a hit is read out of the background survival function
+	# `B` built in `_p_value_backgrounds`. When it was formed as
+	# `1 - cumsum(pdf)`, round-off in the cumsum over thousands of bins made
+	# the survival value of the very best matches, in the extreme right tail
+	# where the CDF is ~1, a tiny negative number (~ -1e-14). It is now the
+	# sum of the pdf above each score, which is never negative, and clamped
+	# to [0, 1].
 	#
 	# A self-comparison of `test.meme` exercises this: every motif's best hit
-	# is itself, sitting in that tail. Pre-fix the diagonal entries were
-	# negative (see the golden values in `test_tomtom_meme`); they must now be
-	# non-negative on both strands.
+	# is itself, sitting in that tail. The p-values must be non-negative on
+	# both strands; `test_tomtom_self_matches_positive` checks that they are
+	# also not rounded to 0.
 	pwms = list(read_meme("tests/data/test.meme").values())
 
 	for rc in (True, False):
@@ -1434,3 +1438,191 @@ def test_tomtom_torch():
 	pwms32 = [pwm.astype('float32') for pwm in pwms]
 	_assert_identical(tomtom(pwms32, pwms), 
 		tomtom([torch.from_numpy(pwm) for pwm in pwms32], pwms_t))
+
+
+##
+
+
+def _issue7_target(hi, lo):
+	# The single target of issue #7: one near-one-hot column per position.
+	t = numpy.full((4, 20), lo)
+	for j, c in enumerate("ACCTACTAGGGGCTGAACCC"):
+		t["ACGT".index(c), j] = hi
+
+	return t
+
+
+@pytest.mark.parametrize("hi, lo", [(0.997, 0.001), (0.9997, 0.0001)])
+@pytest.mark.parametrize("reverse_complement", [True, False])
+def test_tomtom_uniform_query_single_target(hi, lo, reverse_complement):
+	# Every column of this target is the same distance from a uniform query
+	# column, so every alignment scores the same and the p-value is 1. With
+	# 0.997 the distances are exactly equal and the binned median divided by
+	# a zero range. The second call checks that no error was left pending.
+	q = numpy.full((4, 20), 0.25)
+	T = _issue7_target(hi, lo)
+
+	for _ in range(2):
+		p = tomtom([q], [T], reverse_complement=reverse_complement)[0]
+		assert_array_equal(p, [[1.0]])
+
+
+@pytest.mark.parametrize("w", [6, 20])
+def test_tomtom_uniform_query_round_off(w):
+	# The same for 200 values of the dominant entry. When every column's
+	# median is its minimum the scale was chosen from the largest shifted
+	# score alone, which is round-off here, and p-values from 0.11 to 1 came
+	# out, or the scale divided by zero.
+	q = numpy.full((4, w), 0.25)
+
+	for hi in numpy.linspace(0.5, 0.999, 200):
+		T = _issue7_target(hi, (1 - hi) / 3)
+		assert tomtom([q], [T])[0][0, 0] == 1
+
+
+def test_tomtom_uniform_column_once():
+	# A uniform column that occurs once in the query is scored inside the
+	# parallel loop, where the division by zero returned uninitialized values
+	# on the first call in a process and raised SystemError on later calls.
+	q = numpy.random.RandomState(0).dirichlet(numpy.ones(4), size=12).T
+	q[:, 5] = 0.25
+	T = _issue7_target(0.997, 0.001)
+
+	p = tomtom([q], [T])[0]
+	assert_array_equal(p, tomtom([q], [T])[0])
+	assert_array_almost_equal(p, [[0.8449]], 4)
+
+	# A column 1e-9 from uniform never had a zero range, and scores the same.
+	q[:, 5] = [0.25 + 1e-9, 0.25 - 1e-9, 0.25, 0.25]
+	assert_array_almost_equal(p, tomtom([q], [T])[0], 4)
+
+
+def test_tomtom_palindromic_single_column_target():
+	# A one-column target that is its own reverse complement leaves a single
+	# unique target column, so each query column has one distance and every
+	# alignment scores the same.
+	q = numpy.random.RandomState(1).dirichlet(numpy.ones(4), size=10).T
+	T = numpy.array([[0.4], [0.1], [0.1], [0.4]])
+
+	assert_array_equal(tomtom([q], [T])[0], [[1.0]])
+
+
+@pytest.mark.parametrize("value", [-0.862561302169301, 0.0])
+def test_binned_median_zero_range(value):
+	# All values equal: the median is that value, with no division by the
+	# zero range.
+	X = numpy.full(7, value)
+	counts = numpy.arange(1, 8, dtype='int64')
+	bins = numpy.zeros((1000, 2), dtype='float64')
+	zb = numpy.empty(7, dtype=numpy.int32)
+
+	assert _binned_median(X, bins, value, value, counts) == value
+	assert _binned_median_z(X, bins, value, value, counts, zb, 
+		counts.sum() / 2) == value
+
+
+def test_binned_median_block4_zero_range():
+	# A constant row among three varied ones gets its value, and every row
+	# matches `_binned_median_z` on its own.
+	state = numpy.random.RandomState(2)
+	n = 130
+	rows = [numpy.full(n, -0.5)] + [state.uniform(-1.4, 0, n) for _ in range(3)]
+	counts = state.randint(1, 5, size=n).astype('int64')
+	halfway = counts.sum() / 2
+	mn, mx = [r.min() for r in rows], [r.max() for r in rows]
+
+	m = _binned_median_block4(rows[0], rows[1], rows[2], rows[3], mn[0], mx[0],
+		mn[1], mx[1], mn[2], mx[2], mn[3], mx[3], numpy.zeros((1000, 2)), 
+		counts, counts.astype(numpy.int32), numpy.empty((4, n), 
+		dtype=numpy.int32), halfway)
+
+	assert m[0] == -0.5
+	for r, lo, hi, value in zip(rows, mn, mx, m):
+		assert value == _binned_median_z(r, numpy.zeros((1000, 2)), lo, hi, 
+			counts, numpy.empty(n, dtype=numpy.int32), halfway)
+
+
+def test_p_value_backgrounds_lowest_bin():
+	# With an offset of 0, a column's lowest score falls in bin 0, and that
+	# bin's probability is part of the background: here S is 0 with
+	# probability 0.25 and 3 with probability 0.75.
+	f = numpy.zeros((1, 21))
+	f[0, 0], f[0, 3] = 0.25, 0.75
+
+	A = numpy.empty((1, 1, 40))
+	A_csum = numpy.empty((1, 1, 40))
+	B = numpy.empty((2, 40))
+	_p_value_backgrounds(f, A, B, A_csum, 1, 20, 1, numpy.uint64(0))
+
+	# B[1, j] is P(S >= j + 1).
+	assert_array_almost_equal(B[1, :4], [0.75, 0.75, 0.75, 0.0])
+
+
+def test_tomtom_one_hot_matches_meme():
+	# One-hot queries against one-hot targets put most of each column's
+	# probability in bin 0, which the background used to drop, and every
+	# p-value came out as 1. The expected values are MEME 5.5.9's tomtom
+	# (-dist ed -motif-pseudo 0) on the same motifs.
+	Qs = one_hot_pwms(5, 5, 15, 30)[:3]
+	Ts = one_hot_pwms(10, 5, 15, 31)
+
+	p = tomtom(Qs, Ts)[0]
+	assert_array_almost_equal(p, [
+		[0.97555, 0.938792, 0.924108, 0.51685, 0.826821, 0.708033, 0.924108,
+			0.708033, 0.897044, 0.215466],
+		[0.075622, 0.041661, 0.84858, 0.787208, 0.649353, 0.899403, 0.84858,
+			0.899403, 0.222739, 0.968174],
+		[0.859372, 0.984423, 0.199181, 0.984423, 0.953196, 0.021359, 0.756237,
+			0.997009, 0.548497, 0.398691]], 4)
+
+
+def test_tomtom_self_matches_positive():
+	# Each motif's match to itself lies in the far right tail of the
+	# background, below the round-off of a cumsum that reaches 1, and
+	# 1 - cumsum(pdf) gave 0 for every one of them.
+	pwms = list(read_meme("tests/data/test.meme").values())
+	p = tomtom(pwms, pwms)[0]
+
+	assert (p > 0).all()
+	assert (numpy.diag(p) < 1e-8).all()
+
+
+def test_merge_rc_results_small_p():
+	# 1 - (1 - p) ** 2 is 0 in float64 for p below about 1e-16.
+	results = numpy.array([[1e-20, 5, 0, 5, 0], [1e-10, 3, 0, 5, 0],
+		[1.0, 1, 0, 5, 0], [0.5, 2, 0, 5, 0]])
+	_merge_rc_results(results)
+
+	assert_allclose(results[:2, 0], [2e-20, 1e-10 * (2 - 1e-10)], rtol=1e-15)
+
+
+def test_p_value_backgrounds_right_tail():
+	# P(S >= s) is 1e-20 for s in [2, 19], which 1 - cumsum(pdf) returned as
+	# 0 because the cumsum had already reached 1.
+	f = numpy.zeros((1, 21))
+	f[0, 1], f[0, 19] = 1.0, 1e-20
+
+	A = numpy.empty((1, 1, 40))
+	A_csum = numpy.empty((1, 1, 40))
+	B = numpy.empty((2, 40))
+	_p_value_backgrounds(f, A, B, A_csum, 1, 20, 1, numpy.uint64(0))
+
+	# B[1, j] is P(S >= j + 1) for j < 20.
+	assert B[1, 0] == 1
+	assert_allclose(B[1, 1:19], 1e-20, rtol=1e-12)
+	assert B[1, 19] == 0
+
+
+@pytest.mark.parametrize("reverse_complement", [True, False])
+def test_tomtom_few_targets_warns(reverse_complement):
+	# The background comes from the targets' columns, so with few targets the
+	# p-values depend on which targets are given. Reverse complements are not
+	# counted.
+	pwms = generate_random_meme(n=25, random_state=3)
+
+	with pytest.warns(UserWarning, match="given 24 target motifs"):
+		tomtom(pwms[:2], pwms[:24], reverse_complement=reverse_complement)
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error")
+		tomtom(pwms[:2], pwms, reverse_complement=reverse_complement)

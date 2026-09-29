@@ -5,6 +5,7 @@ import time
 import math
 import numpy
 import numba
+import warnings
 
 from numba import njit
 from numba import prange
@@ -36,6 +37,11 @@ def _binned_median(x, bins, x_min, x_max, counts):
 
 	halfway = 0
 	x_max -= x_min
+
+	# Every value is x_min when the range is zero, so x_min is the median.
+	if x_max == 0:
+		return x_min
+
 	for i in range(n):
 		z = int((x[i] - x_min) / x_max * (n_bins - 1))
 		bins[z, 0] += counts[i]
@@ -50,6 +56,12 @@ def _binned_median(x, bins, x_min, x_max, counts):
 			return bins[i, 1] / bins[i, 0]
 			
 	return -99999
+
+
+# With fewer target motifs than this, tomtom and symmetric_tomtom warn that
+# their p-values depend strongly on which targets are given (MEME's tomtom
+# warns below 50).
+_MIN_TARGETS = 25
 
 
 # Bit position of a one-bit uint64 v: _DEBRUIJN[(v * 0x03f79d71b4cb0a89) >> 58].
@@ -83,6 +95,11 @@ def _binned_median_z(x, bins, x_min, x_max, counts, zb, halfway):
 
 	n, n_bins = len(x), len(bins)
 	x_max -= x_min
+
+	# Every value is x_min when the range is zero, so x_min is the median.
+	if x_max == 0:
+		return x_min
+
 	for i in range(n):
 		zb[i] = int((x[i] - x_min) / x_max * (n_bins - 1))
 
@@ -180,18 +197,33 @@ def _binned_median_block4(r0, r1, r2, r3, mn0, mx0, mn1, mx1, mn2, mx2, mn3,
 
 	n, n_bins = len(r0), len(bins)
 	z0, z1, z2, z3 = zb4[0], zb4[1], zb4[2], zb4[3]
+
+	# A row whose values are all equal has a zero range. Its elements all go
+	# in bin 0, and its median is its minimum, as in `_binned_median_z`.
 	mx0 -= mn0
-	for i in range(n):
-		z0[i] = int((r0[i] - mn0) / mx0 * (n_bins - 1))
+	if mx0 == 0:
+		z0[:n] = 0
+	else:
+		for i in range(n):
+			z0[i] = int((r0[i] - mn0) / mx0 * (n_bins - 1))
 	mx1 -= mn1
-	for i in range(n):
-		z1[i] = int((r1[i] - mn1) / mx1 * (n_bins - 1))
+	if mx1 == 0:
+		z1[:n] = 0
+	else:
+		for i in range(n):
+			z1[i] = int((r1[i] - mn1) / mx1 * (n_bins - 1))
 	mx2 -= mn2
-	for i in range(n):
-		z2[i] = int((r2[i] - mn2) / mx2 * (n_bins - 1))
+	if mx2 == 0:
+		z2[:n] = 0
+	else:
+		for i in range(n):
+			z2[i] = int((r2[i] - mn2) / mx2 * (n_bins - 1))
 	mx3 -= mn3
-	for i in range(n):
-		z3[i] = int((r3[i] - mn3) / mx3 * (n_bins - 1))
+	if mx3 == 0:
+		z3[:n] = 0
+	else:
+		for i in range(n):
+			z3[i] = int((r3[i] - mn3) / mx3 * (n_bins - 1))
 
 	c4 = bins.reshape(-1).view(numpy.int32)
 	c0 = c4[0:n_bins]
@@ -208,10 +240,12 @@ def _binned_median_block4(r0, r1, r2, r3, mn0, mx0, mn1, mx1, mn2, mx2, mn3,
 		c2[uint64(z2[i])] += ci
 		c3[uint64(z3[i])] += ci
 
-	return (_median_from_counts(r0, c0, z0, counts, halfway),
-		_median_from_counts(r1, c1, z1, counts, halfway),
-		_median_from_counts(r2, c2, z2, counts, halfway),
-		_median_from_counts(r3, c3, z3, counts, halfway))
+	m0 = _median_from_counts(r0, c0, z0, counts, halfway)
+	m1 = _median_from_counts(r1, c1, z1, counts, halfway)
+	m2 = _median_from_counts(r2, c2, z2, counts, halfway)
+	m3 = _median_from_counts(r3, c3, z3, counts, halfway)
+	return (mn0 if mx0 == 0 else m0, mn1 if mx1 == 0 else m1,
+		mn2 if mx2 == 0 else m2, mn3 if mx3 == 0 else m3)
 
 
 @njit(cache=True, inline='always')
@@ -808,9 +842,13 @@ def _distances_and_medians(X, Y, gamma, medians, median_bins, X_norm, Y_norm,
 		z_min = min(z_min, smin[i] - m)
 		z_max = max(z_max, smax[i] - m)
 			
-	# Find the minimum value and the number of bins needed to get there
+	# Find the minimum value and the number of bins needed to get there.
+	# z_max - i_min is below 1 only when z_min is 0, i.e. every column's
+	# median is its minimum, and z_max < 1. When every target column scores
+	# the same it is 0 or round-off, and dividing by it would stretch that
+	# round-off over all n_bins bins, so the divisor is at least 1.
 	i_min = int(math.floor(z_min)) #offset
-	bin_scale = int(math.floor(n_bins / (z_max - i_min))) #scale
+	bin_scale = int(math.floor(n_bins / max(z_max - i_min, 1.0))) #scale
 	offset = -i_min * bin_scale
 	return i_min, bin_scale, offset
 
@@ -1582,7 +1620,7 @@ def _backgrounds_dense(f, f_lo, f_hi, A, B, A_csum, nq, n_bins, t_max, offset,
 			A[i, j] = 0
 			
 			if i == j:
-				for l in range(1, n_bins+1):
+				for l in range(n_bins+1):
 					l = uint64(l)
 					A[i, j, l+c] = f[j, l]
 
@@ -1699,7 +1737,7 @@ def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
 	f_hi = numpy.empty(nq, dtype='int64')
 	for j in range(nq):
 		f_lo[j], f_hi[j] = n_bins+1, 0
-		for l in range(1, n_bins+1):
+		for l in range(n_bins+1):
 			if f[j, l] != 0:
 				f_hi[j] = l
 				if f_lo[j] > n_bins:
@@ -1800,7 +1838,7 @@ def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
 			c = int64(offset) * int64(nq - 1)
 			for i in range(nq):
 				A[i, i] = 0
-				for l in range(1, n_bins+1):
+				for l in range(n_bins+1):
 					A[i, i, l+c] = f[i, l]
 
 		# Column c of a row holds bin c + L - 1: the survival pass below runs
@@ -1812,14 +1850,13 @@ def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
 
 		lo, L, H = L, int64(1), n_col - 1
 
-	# `axis` is not implemented for cumsum. The pdf is zero below L, so the
-	# CDF is zero there and the survival 1, and it is flat from H on.
-	#
-	# The cumsum accumulates floating-point round-off across thousands of bins
-	# and the underlying distribution does not sum to exactly 1, so at the
-	# extreme right tail (the very best matches) the CDF can land just above
-	# 1.0. A survival probability cannot be negative, so clamp the round-off
-	# to zero to avoid returning tiny negative p-values.
+	# Each row's survival value at bin j is the sum of the pdf above j, added
+	# from the top of the window down. A sum from the right keeps the small
+	# tail probabilities of the best matches to full relative precision;
+	# 1 - cumsum(pdf) loses everything below the round-off of the cumsum,
+	# about 1e-12 with thousands of bins, and can go negative. The pdf is
+	# zero from H on, so the survival there is 0, and below L it is the
+	# total, which is 1 up to round-off; each value is clamped to [0, 1].
 	rows = numpy.empty(t_max+1, dtype=numpy.int64)
 	nr = 0
 	for i in range(1, t_max+1):
@@ -1827,55 +1864,43 @@ def _p_value_backgrounds_windowed(f, A, Bf, A_csum, nq, n_bins, t_max, offset,
 			rows[nr] = i
 			nr += 1
 
-	# Each row's running sum is its own serial chain of additions, in the same
-	# order as `B[i, j] += B[i, j-1]` (a + b == b + a bitwise). Four rows are
-	# summed at once so that four independent chains overlap their latency,
-	# and each survival value is computed from the sum as it is produced.
+	totals = numpy.zeros(t_max+1, dtype=numpy.float64)
+
+	# Four rows are summed at once so that four independent chains of
+	# additions overlap their latency.
 	r = 0
 	while r + 4 <= nr:
 		b0, b1, b2, b3 = B[rows[r+0]], B[rows[r+1]], B[rows[r+2]], B[rows[r+3]]
-		if H > L:
-			a0, a1, a2, a3 = b0[L], b1[L], b2[L], b3[L]
-			s = 1 - a0
-			b0[L] = s if s > 0 else 0.0
-			s = 1 - a1
-			b1[L] = s if s > 0 else 0.0
-			s = 1 - a2
-			b2[L] = s if s > 0 else 0.0
-			s = 1 - a3
-			b3[L] = s if s > 0 else 0.0
-			for j in range(L+1, H):
-				a0 = b0[j] + a0
-				a1 = b1[j] + a1
-				a2 = b2[j] + a2
-				a3 = b3[j] + a3
-				s0 = 1 - a0
-				b0[j] = s0 if s0 > 0 else 0.0
-				s1 = 1 - a1
-				b1[j] = s1 if s1 > 0 else 0.0
-				s2 = 1 - a2
-				b2[j] = s2 if s2 > 0 else 0.0
-				s3 = 1 - a3
-				b3[j] = s3 if s3 > 0 else 0.0
+		a0, a1, a2, a3 = 0.0, 0.0, 0.0, 0.0
+		for j in range(H-1, L-1, -1):
+			p0, p1, p2, p3 = b0[j], b1[j], b2[j], b3[j]
+			b0[j] = min(max(a0, 0.0), 1.0)
+			b1[j] = min(max(a1, 0.0), 1.0)
+			b2[j] = min(max(a2, 0.0), 1.0)
+			b3[j] = min(max(a3, 0.0), 1.0)
+			a0 += p0
+			a1 += p1
+			a2 += p2
+			a3 += p3
+		totals[r+0], totals[r+1], totals[r+2], totals[r+3] = a0, a1, a2, a3
 		r += 4
 
 	while r < nr:
 		b0 = B[rows[r]]
-		if H > L:
-			a0 = b0[L]
-			s = 1 - a0
-			b0[L] = s if s > 0 else 0.0
-			for j in range(L+1, H):
-				a0 = b0[j] + a0
-				s = 1 - a0
-				b0[j] = s if s > 0 else 0.0
+		a0 = 0.0
+		for j in range(H-1, L-1, -1):
+			p0 = b0[j]
+			b0[j] = min(max(a0, 0.0), 1.0)
+			a0 += p0
+		totals[r] = a0
 		r += 1
 
 	for r in range(nr):
 		i = rows[r]
+		total = min(max(totals[r], 0.0), 1.0) if H > L else 1.0
 		for j in range(L):
-			B[i, j] = 1.0
-		tail = B[i, H-1] if H > 0 else 1.0
+			B[i, j] = total
+		tail = B[i, H-1] if H > L else 1.0
 		for j in range(H, n_col):
 			B[i, j] = tail
 
@@ -2283,8 +2308,10 @@ def _merge_rc_results(results):
 	n = nt // 2
 	
 	for i in range(n):
+		# 1 - (1 - p) ** 2, written so that it does not round to 0 for
+		# p below 1e-16.
 		p = min(results[i, 0], results[i+n, 0])
-		p = 1 - (1 - p) ** 2
+		p = p * (2 - p)
 
 		results[i, 0] = p
 		results[i, 4] = 0
@@ -2307,8 +2334,10 @@ def _merge_rc_results_into(results, out):
 	n = out.shape[0]
 
 	for i in range(n):
+		# 1 - (1 - p) ** 2, written so that it does not round to 0 for
+		# p below 1e-16.
 		p = min(results[i, 0], results[i+n, 0])
-		p = 1 - (1 - p) ** 2
+		p = p * (2 - p)
 
 		out[i, 0] = p
 		
@@ -2752,6 +2781,12 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 	which is more robust to edge effects. The "incomplete score" is not a good
 	score and so is not implemented. 
 
+	The background distribution of each query column is built from its scores
+	against every column of the targets, so the p-values depend on which
+	targets are given. With fewer than 25 targets they can change by orders of
+	magnitude with the choice of targets, and a warning is raised; MEME's
+	tomtom warns below 50.
+
 
 	Parameters
 	----------
@@ -2835,6 +2870,13 @@ def tomtom(Qs, Ts, n_nearest=None, n_score_bins=100, n_median_bins=1000,
 		original ordering of the targets corresponding to each returned
 		neighbor. These will be sorted by p-value.
 	"""
+
+	if len(Ts) < _MIN_TARGETS:
+		warnings.warn("tomtom was given {} target motifs. Its p-values use the "
+			"target columns as the background, so with fewer than {} targets "
+			"they depend strongly on which targets are included. Use a larger "
+			"target set, such as a complete motif database, for reliable "
+			"p-values.".format(len(Ts), _MIN_TARGETS), stacklevel=2)
 
 	if n_jobs != -1:
 		_n_jobs = numba.get_num_threads()

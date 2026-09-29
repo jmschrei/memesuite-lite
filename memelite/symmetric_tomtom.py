@@ -5,6 +5,7 @@ import time
 import math
 import numpy
 import numba
+import warnings
 
 from numba import njit
 from numba import prange
@@ -17,6 +18,7 @@ from .tomtom import _merge_rc_results
 from .tomtom import _integer_distances_and_histogram
 from .tomtom import _p_values
 from .tomtom import tomtom
+from .tomtom import _MIN_TARGETS
 
  
 @njit(cache=True)
@@ -49,7 +51,7 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 		im1, nqmi, nqmi1 = uint64(i-1), uint64(nq-i), uint64(nq-i-1)
 
 		if i == 0:
-			for k in range(1, n_bins+1):
+			for k in range(n_bins+1):
 				k = uint64(k)
 				A[0, 0, k+c] = f[0, k]
 				A[1, nqm1, k+c] = f[nqm1, k]
@@ -60,12 +62,12 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 				a1 = A[1, nqmi, k+c+offset]
 
 				if a0 > 0:
-					for l in range(1, n_bins+1):
+					for l in range(n_bins+1):
 						l = uint64(l)
 						A[0, i, l+k+c] += a0 * f[i, l]
 
 				if a1 > 0:
-					for l in range(1, n_bins+1):
+					for l in range(n_bins+1):
 						l = uint64(l)
 						A[1, nqmi1, l+k+c] += a1 * f[nqmi1, l]
 		
@@ -92,13 +94,15 @@ def _p_value_backgrounds(f, A, B, A_csum, nq, n_bins, t_max, offset):
 	for i in range(nq, t_max+1):
 		_pairwise_max(B[i-1], A[0, nq-1], A_csum[0, nq-1], B[i], n)
 
-	# Again, `axis` is not implemented for cumsum
+	# The survival value at bin j is the sum of the pdf above j, added from
+	# the top down, clamped to [0, 1]; see `_p_value_backgrounds_windowed`
+	# in tomtom.py, whose values this matches.
 	for i in range(B.shape[0]):
-		for j in range(1, n):
-			B[i, j] += B[i, j-1]
-		
-		for j in range(n):
-			B[i, j] = 1 - B[i, j]
+		a = 0.0
+		for j in range(n-1, -1, -1):
+			p = B[i, j]
+			B[i, j] = min(max(a, 0.0), 1.0)
+			a += p
 			
 
 @njit(parallel=True, cache=True)
@@ -206,6 +210,11 @@ def symmetric_tomtom(Xs, n_score_bins=100, n_median_bins=1000,
 	which is more robust to edge effects. The "incomplete score" is not a good
 	score and so is not implemented. 
 
+	The background distribution of each motif column is built from its scores
+	against every column of the motifs, so the p-values depend on which motifs
+	are given. With fewer than 25 motifs they can change by orders of
+	magnitude with the choice of motifs, and a warning is raised.
+
 
 	Parameters
 	----------
@@ -288,6 +297,12 @@ def symmetric_tomtom(Xs, n_score_bins=100, n_median_bins=1000,
 		original ordering of the targets corresponding to each returned
 		neighbor. These will be sorted by p-value.
 	"""
+
+	if len(Xs) < _MIN_TARGETS:
+		warnings.warn("symmetric_tomtom was given {} motifs. Its p-values use "
+			"the motif columns as the background, so with fewer than {} motifs "
+			"they depend strongly on which motifs are included.".format(
+			len(Xs), _MIN_TARGETS), stacklevel=2)
 	
 	if n_jobs != -1:
 		_n_jobs = numba.get_num_threads()
