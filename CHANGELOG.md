@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0]
 
 ### Fixed
 
@@ -99,6 +99,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `tomtom` is about 7.8x faster: JASPAR against itself takes 0.70 s instead
+  of 5.46 s at one thread. The background build, the distance and histogram
+  stages and the p-value scan visit only the bins and rows that are read,
+  query columns are processed in blocks, and queries of the same width share
+  one pass over the targets. Batch workloads are 4.5x to 9.4x faster at 1 to
+  16 threads; a single query is unchanged, since its time goes to preparing
+  the targets. Peak memory is similar at one thread and up to 3 GB higher at
+  16 threads on 20,000-motif workloads, from per-thread workspaces. The
+  change itself left every output bit-identical; the p-value fixes above
+  were made afterwards. (#21)
 - `symmetric_tomtom`'s numba kernels are now cached to disk like `tomtom`'s,
   so they are no longer recompiled in every new process (about 4-6 s each).
   The thread count is passed into the kernel instead of read inside it, which
